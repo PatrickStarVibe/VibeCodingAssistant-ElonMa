@@ -1,0 +1,7 @@
+node_modules
+dist
+coverage
+logs
+project-docs
+manager.config.local.json
+*.log
