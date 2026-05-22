@@ -92,10 +92,13 @@ npm run manager -- status --task latest
 npm run manager -- summary --task latest
 npm run manager -- show --task latest --artifact revised-plan
 npm run manager -- show --task latest --artifact review
+npm run manager -- show --task latest --artifact agent-prompts
 npm run manager -- show --task latest --artifact final-report
 ```
 
 Artifacts are stored under `logs/ai-workflow/runs/<task-id>/` in this Manager repo.
+`agent-prompts.md` records the exact stdin prompt sent to each heavy agent call, with timestamp, workflow role, difficulty, profile name, and profile kind. It is intentionally not attached to every chat reply because it can be large; inspect it explicitly when you need to see what Manager sent to Codex or Claude.
+`agent-prompt-preview.md` is generated on demand from the same prompt builder used for the real Architect call. In task chat, the Manager LLM can request any allowed artifact by name, and it can carry user instructions such as "use my original prompt verbatim" through a legal workflow transition instead of treating every message as a fixed approve/reject command.
 
 ## Target Project Task Records
 
@@ -198,7 +201,7 @@ npm run manager -- reply --task latest "medium" --allow-agent-calls
 
 ## Configure And Swap Roles
 
-Profiles are mapped by fixed workflow role in `manager.config.local.json`. `roles.manager` chooses the Manager agent. `workflowRoles` chooses the heavy-agent profile for each difficulty and role:
+Profiles are mapped by fixed workflow role in `manager.config.local.json`. `roles.manager` chooses the Elon Ma profile. `workflowRoles` chooses the heavy-agent profile for each difficulty and role:
 
 ```json
 {
@@ -220,7 +223,7 @@ Profiles are mapped by fixed workflow role in `manager.config.local.json`. `role
     },
     "high": {
       "architect": "claude-architect",
-      "planReviewer": "claude-plan-reviewer",
+      "planReviewer": "codex-plan-reviewer",
       "developer": "codex-developer",
       "finalReviewer": "claude-final-reviewer"
     }

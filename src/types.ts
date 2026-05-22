@@ -27,6 +27,7 @@ export interface IntentResult {
   difficulty?: WorkflowDifficulty;
   instruction?: string;
   note?: string;
+  artifact?: ArtifactName;
   confidence: number;
   requiresClarification: boolean;
   userFacingInterpretation: string;
@@ -39,6 +40,16 @@ export interface ComposedReply {
 export type WorkflowRoleName = 'architect' | 'planReviewer' | 'developer' | 'finalReviewer';
 
 export type WorkflowRoleProfiles = Record<WorkflowDifficulty, Record<WorkflowRoleName, string>>;
+
+export interface AgentPromptRecord {
+  taskId: string;
+  role: WorkflowRoleName;
+  difficulty: WorkflowDifficulty;
+  profileName: string;
+  profileKind: AgentProfileKind;
+  createdAt: string;
+  prompt: string;
+}
 
 export type TaskCategory =
   | 'Reader Core'
@@ -164,37 +175,9 @@ export type ArtifactName =
   | 'git-post-diff'
   | 'test-build-log'
   | 'final-review'
+  | 'agent-prompts'
+  | 'agent-prompt-preview'
   | 'final-report';
-
-export type TaskChatRouteAction =
-  | 'reply_only'
-  | 'answer_question'
-  | 'status'
-  | 'summary'
-  | 'approve'
-  | 'reject'
-  | 'revise'
-  | 'choose_difficulty'
-  | 'stop'
-  | 'show_artifact'
-  | 'create_new_task'
-  | 'clarify';
-
-export interface TaskChatRouteResult {
-  action: TaskChatRouteAction;
-  confidence: number;
-  reason: string;
-  replyMarkdown?: string;
-  requiresConfirmation?: boolean;
-  actionArgs?: {
-    question?: string;
-    difficulty?: WorkflowDifficulty;
-    revision?: string;
-    artifact?: ArtifactName;
-    title?: string;
-    task?: string;
-  };
-}
 
 export interface TaskState {
   taskId: string;
@@ -227,15 +210,18 @@ export interface PlanResult {
   markdown: string;
   verificationCommands: string[];
   planPackDraft?: PlanPackDraft;
+  agentPrompt?: AgentPromptRecord;
 }
 
 export interface ReviewResult {
   markdown: string;
+  agentPrompt?: AgentPromptRecord;
 }
 
 export interface ImplementationResult {
   markdown: string;
   changedFiles: string[];
+  agentPrompt?: AgentPromptRecord;
 }
 
 export type FinalReviewRoute = 'complete' | 'route_to_implementer' | 'route_to_planner' | 'ask_user_direction';
@@ -243,6 +229,7 @@ export type FinalReviewRoute = 'complete' | 'route_to_implementer' | 'route_to_p
 export interface FinalReviewResult {
   markdown: string;
   passed: boolean;
+  agentPrompt?: AgentPromptRecord;
 }
 
 export interface ManagerTextResult {
@@ -263,6 +250,8 @@ export interface TaskProposal {
 export type ControlChatResult =
   | { kind: 'answer'; markdown: string }
   | { kind: 'proposal'; markdown?: string; proposal: TaskProposal }
+  | { kind: 'confirm_pending_proposal'; markdown?: string }
+  | { kind: 'cancel_pending_proposal'; markdown?: string }
   | { kind: 'clarify'; markdown: string };
 
 export interface ManagerRouteResult {

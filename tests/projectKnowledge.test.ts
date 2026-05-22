@@ -51,7 +51,7 @@ function makeConfig(root: string): ManagerConfig {
       },
       high: {
         architect: 'reviewer',
-        planReviewer: 'reviewer',
+        planReviewer: 'planner',
         developer: 'implementer',
         finalReviewer: 'finalReviewer',
       },

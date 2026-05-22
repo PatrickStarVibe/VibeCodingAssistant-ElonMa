@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { ArtifactStore } from './artifacts.js';
-import type { HeavyAgentAdapter, ManagerAdapter } from './adapters.js';
+import { buildInitialPlanPrompt, type HeavyAgentAdapter, type ManagerAdapter } from './adapters.js';
 import { diffStatusLines, readGitSnapshot } from './git.js';
 import { ProjectKnowledgeService } from './projectKnowledge.js';
 import { configForProject, getDefaultProjectId, requireProject } from './projects.js';
@@ -21,7 +21,7 @@ import {
   summarizeTaskUsageLedger,
   type TaskUsageBreakdownKey,
 } from './taskUsage.js';
-import type { ArtifactName, ExecutionUnitState, GitSnapshot, ManagerConfig, PlanResult, TaskState, VerificationCommandResult } from './types.js';
+import type { AgentPromptRecord, ArtifactName, ExecutionUnitState, GitSnapshot, ManagerConfig, PlanResult, TaskState, VerificationCommandResult, WorkflowDifficulty } from './types.js';
 import { renderVerificationLog, runVerificationCommands } from './verification.js';
 
 export interface WorkflowOptions {
@@ -143,6 +143,7 @@ export class WorkflowService {
       state,
       config: scopedConfig,
     });
+    state = await this.appendAgentPrompt(state, initialPlan.agentPrompt);
     state = await this.store.writeArtifact(state, 'initial-plan', initialPlan.markdown);
 
     if (difficulty === 'low') {
@@ -180,6 +181,7 @@ export class WorkflowService {
         config: scopedConfig,
       });
       reviewMarkdown = review.markdown;
+      state = await this.appendAgentPrompt(state, review.agentPrompt);
       state = {
         ...await this.store.writeArtifact(state, 'review', reviewMarkdown),
         reviewerRunCount: state.reviewerRunCount + 1,
@@ -213,6 +215,7 @@ export class WorkflowService {
       state,
       config: scopedConfig,
     });
+    state = await this.appendAgentPrompt(state, revisedPlan.agentPrompt);
     state = await this.store.writeArtifact(state, 'revised-plan', revisedPlan.markdown);
     state = await this.writePlanMetadata(state, revisedPlan);
 
@@ -304,6 +307,25 @@ export class WorkflowService {
     }
 
     if (parsed.kind === 'difficulty') {
+      if (state.status === 'awaiting_brief_confirmation') {
+        state = {
+          ...withoutPendingPrompt(state),
+          status: 'planning_requested',
+          briefConfirmed: true,
+          difficulty: parsed.level,
+          lastDecision: reply,
+          updatedAt: new Date().toISOString(),
+        };
+        state = appendWorkflowInstruction(state, parsed.instruction);
+        state = await this.store.appendArtifact(
+          state,
+          'decision-log',
+          [`brief approved with difficulty: ${parsed.level}`, parsed.instruction ? `Instruction: ${parsed.instruction}` : undefined].filter(Boolean).join('\n'),
+        );
+        await this.store.saveState(state);
+        await this.refreshParentTaskReadme(state, 'Brief approved with difficulty selected. Planning not finalized yet.');
+        return this.planTask(state.taskId);
+      }
       if (state.status !== 'awaiting_difficulty_selection') {
         throw new Error(`Cannot choose difficulty from state ${state.status}.`);
       }
@@ -314,7 +336,12 @@ export class WorkflowService {
         lastDecision: reply,
         updatedAt: new Date().toISOString(),
       };
-      state = await this.store.appendArtifact(state, 'decision-log', `difficulty: ${parsed.level}`);
+      state = appendWorkflowInstruction(state, parsed.instruction);
+      state = await this.store.appendArtifact(
+        state,
+        'decision-log',
+        [`difficulty: ${parsed.level}`, parsed.instruction ? `Instruction: ${parsed.instruction}` : undefined].filter(Boolean).join('\n'),
+      );
       await this.store.saveState(state);
       return this.planTask(state.taskId);
     }
@@ -422,8 +449,13 @@ export class WorkflowService {
           lastDecision: reply,
           updatedAt: new Date().toISOString(),
         };
+        state = appendWorkflowInstruction(state, parsed.instruction);
         state = withoutPendingPrompt(state);
-        state = await this.store.appendArtifact(state, 'decision-log', `approve A (brief): ${reply}`);
+        state = await this.store.appendArtifact(
+          state,
+          'decision-log',
+          [`approve A (brief): ${reply}`, parsed.instruction ? `Instruction: ${parsed.instruction}` : undefined].filter(Boolean).join('\n'),
+        );
         await this.store.saveState(state);
         await this.refreshParentTaskReadme(state, 'Brief approved. Planning not finalized yet.');
         return this.planTask(state.taskId);
@@ -434,6 +466,7 @@ export class WorkflowService {
       if (state.status !== 'ready_for_decision' && state.status !== 'waiting_user_direction') {
         throw new Error(`Cannot approve implementation from state ${state.status}.`);
       }
+      state = appendWorkflowInstruction(state, parsed.instruction);
       state = await this.persistApprovedTaskArtifacts(state);
       state = {
         ...withoutPendingPrompt(state),
@@ -487,6 +520,7 @@ export class WorkflowService {
         state,
         config: scopedConfig,
       });
+      state = await this.appendAgentPrompt(state, implementation.agentPrompt);
       const implementationSection = [
         `## Execution Unit ${String(activeUnit.index).padStart(2, '0')}: ${activeUnit.name}`,
         '',
@@ -554,6 +588,7 @@ export class WorkflowService {
       state,
       config: this.configForState(state),
     });
+    state = await this.appendAgentPrompt(state, finalReview.agentPrompt);
     state = await this.store.writeArtifact(state, 'final-review', finalReview.markdown);
     await this.taskRecords.writeFinalReview(this.projectForState(state), state, finalReview.markdown);
 
@@ -608,6 +643,11 @@ export class WorkflowService {
 
   async showArtifact(taskIdOrLatest: string, artifact: ArtifactName): Promise<string> {
     const state = await this.store.loadState(taskIdOrLatest);
+    if (artifact === 'agent-prompt-preview') {
+      const next = await this.writeAgentPromptPreview(state);
+      await this.store.saveState(next.state);
+      return next.content;
+    }
     return this.store.readArtifact(state, artifact);
   }
 
@@ -644,6 +684,41 @@ export class WorkflowService {
       }, null, 2),
       'manager-plan-metadata -->',
     ].join('\n'));
+  }
+
+  private async appendAgentPrompt(state: TaskState, promptRecord?: AgentPromptRecord): Promise<TaskState> {
+    if (!promptRecord) return state;
+    return this.store.appendArtifact(state, 'agent-prompts', renderAgentPromptRecord(promptRecord));
+  }
+
+  private async writeAgentPromptPreview(state: TaskState): Promise<{ state: TaskState; content: string }> {
+    const task = await this.store.readArtifact(state, 'original-task');
+    const brief = await this.store.readArtifact(state, 'manager-brief').catch(() => '(No manager brief artifact exists yet.)');
+    const projectContext = await this.buildProjectContext(state, [task, brief, state.requestedChanges.join('\n')].join('\n\n'));
+    const difficulties: WorkflowDifficulty[] = state.difficulty ? [state.difficulty] : ['low', 'medium', 'high'];
+    const sections = difficulties.flatMap((difficulty) => [
+      `## Architect Prompt - ${difficulty}`,
+      '',
+      buildInitialPlanPrompt({
+        task,
+        projectContext,
+        brief,
+        difficulty,
+        state,
+      }),
+      '',
+    ]);
+    const content = [
+      '# Agent Prompt Preview',
+      '',
+      state.difficulty
+        ? `Current difficulty: ${state.difficulty}. This uses the same prompt builder as the real Architect call.`
+        : 'Difficulty has not been selected yet. The exact Architect call depends on the chosen difficulty, so this preview shows all currently possible Architect prompts.',
+      '',
+      ...sections,
+    ].join('\n');
+    const next = await this.store.writeArtifact(state, 'agent-prompt-preview', content);
+    return { state: next, content };
   }
 
   private async requireArtifact(state: TaskState, artifact: ArtifactName, message: string): Promise<string> {
@@ -879,15 +954,40 @@ export class WorkflowService {
   }
 }
 
+function renderAgentPromptRecord(record: AgentPromptRecord): string {
+  const fence = markdownFence(record.prompt);
+  return [
+    `## ${record.createdAt} - ${record.role}`,
+    '',
+    `- Task ID: ${record.taskId}`,
+    `- Role: ${record.role}`,
+    `- Difficulty: ${record.difficulty}`,
+    `- Profile: ${record.profileName}`,
+    `- Profile kind: ${record.profileKind}`,
+    '',
+    'Prompt sent via stdin:',
+    '',
+    `${fence}text`,
+    record.prompt,
+    fence,
+  ].join('\n');
+}
+
+function markdownFence(content: string): string {
+  const runs = content.match(/`{3,}/g) ?? [];
+  const longest = runs.reduce((max, run) => Math.max(max, run.length), 2);
+  return '`'.repeat(longest + 1);
+}
+
 type ParsedWorkflowReply =
-  | { kind: 'approve' }
+  | { kind: 'approve'; instruction?: string }
   | { kind: 'reject' }
   | { kind: 'revise'; instruction: string }
-  | { kind: 'difficulty'; level: 'low' | 'medium' | 'high' }
+  | { kind: 'difficulty'; level: 'low' | 'medium' | 'high'; instruction?: string }
   | { kind: 'stop' }
   | { kind: 'status' }
   | { kind: 'summary' }
-  | { kind: 'accept' }
+  | { kind: 'accept'; instruction?: string }
   | { kind: 'note'; note: string }
   | { kind: 'ambiguous'; reason: string; useLlmFallback: boolean };
 
@@ -898,11 +998,18 @@ function parseWorkflowReply(input: string): ParsedWorkflowReply {
   if (/^status$/i.test(text)) return { kind: 'status' };
   if (/^summary$/i.test(text)) return { kind: 'summary' };
   if (/^stop$/i.test(text)) return { kind: 'stop' };
-  if (/^(?:accept|accepted)$/i.test(text)) return { kind: 'accept' };
-  if (/^low$/i.test(text)) return { kind: 'difficulty', level: 'low' };
-  if (/^medium$/i.test(text)) return { kind: 'difficulty', level: 'medium' };
-  if (/^high$/i.test(text)) return { kind: 'difficulty', level: 'high' };
-  if (/^(?:approve A|approve|approved|A|yes|y)$/i.test(text)) return { kind: 'approve' };
+  const acceptMatch = text.match(/^(?:accept|accepted)(?:\s*:\s*(.+))?$/i);
+  if (acceptMatch) return { kind: 'accept', ...(acceptMatch[1]?.trim() ? { instruction: acceptMatch[1].trim() } : {}) };
+  const difficultyMatch = text.match(/^(low|medium|high)(?:\s*:\s*(.+))?$/i);
+  if (difficultyMatch?.[1]) {
+    return {
+      kind: 'difficulty',
+      level: difficultyMatch[1].toLocaleLowerCase() as 'low' | 'medium' | 'high',
+      ...(difficultyMatch[2]?.trim() ? { instruction: difficultyMatch[2].trim() } : {}),
+    };
+  }
+  const approveMatch = text.match(/^(?:approve A|approve|approved|A|yes|y)(?:\s*:\s*(.+))?$/i);
+  if (approveMatch) return { kind: 'approve', ...(approveMatch[1]?.trim() ? { instruction: approveMatch[1].trim() } : {}) };
   if (/^(?:reject B|reject|B|no|n)$/i.test(text)) return { kind: 'reject' };
 
   const noteMatch = text.match(/^note\s*:\s*(.+)$/i);
@@ -963,6 +1070,15 @@ function renderOriginalTask(title: string, task: string): string {
 function withoutPendingPrompt(state: TaskState): TaskState {
   const { pendingUserPrompt: _pendingUserPrompt, ...rest } = state;
   return rest;
+}
+
+function appendWorkflowInstruction(state: TaskState, instruction?: string): TaskState {
+  const trimmed = instruction?.trim();
+  if (!trimmed) return state;
+  return {
+    ...state,
+    requestedChanges: [...state.requestedChanges, trimmed],
+  };
 }
 
 function readPlanMetadata(revisedPlan: string): { verificationCommands: string[]; planPackDraft?: PlanResult['planPackDraft'] } {

@@ -21,6 +21,8 @@ const ARTIFACT_FILES: Record<ArtifactName, string> = {
   'git-post-diff': 'git-post-diff.patch',
   'test-build-log': 'test-build-log.md',
   'final-review': 'final-review.md',
+  'agent-prompts': 'agent-prompts.md',
+  'agent-prompt-preview': 'agent-prompt-preview.md',
   'final-report': 'final-report.md',
 };
 

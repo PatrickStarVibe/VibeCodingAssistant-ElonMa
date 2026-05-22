@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import { getDefaultManagerRoot } from './config.js';
 import { sanitizeTextForArtifact } from './textSanitizer.js';
 import type {
+  AgentPromptRecord,
   AgentProfileConfig,
   AllowedAction,
   ArtifactName,
@@ -21,8 +22,6 @@ import type {
   PlanPackDraft,
   PlanResult,
   ReviewResult,
-  TaskChatRouteAction,
-  TaskChatRouteResult,
   TaskProposal,
   TaskState,
   WorkflowDifficulty,
@@ -66,7 +65,6 @@ export interface ManagerAdapter {
   }): Promise<ManagerTextResult>;
   answerQuestion(input: { question: string; context: string; projectContext: string; state: TaskState; config: ManagerConfig }): Promise<string>;
   interpretAmbiguousReply(input: { reply: string; context: string; state: TaskState; config: ManagerConfig }): Promise<string>;
-  routeTaskChat(input: { message: string; context: string; projectContext: string; state: TaskState; config: ManagerConfig }): Promise<TaskChatRouteResult>;
   handleControlChat(input: {
     message: string;
     pendingProposal?: TaskProposal;
@@ -193,6 +191,28 @@ const INTENT_NAMES = new Set<IntentName>([
   'unknown',
 ]);
 
+const ARTIFACT_NAMES = new Set<ArtifactName>([
+  'original-task',
+  'manager-brief',
+  'initial-plan',
+  'review',
+  'revision-instructions',
+  'revised-plan',
+  'manager-explanation',
+  'qa-log',
+  'decision-log',
+  'implementation-log',
+  'git-pre-status',
+  'git-post-status',
+  'git-pre-diff',
+  'git-post-diff',
+  'test-build-log',
+  'final-review',
+  'agent-prompts',
+  'agent-prompt-preview',
+  'final-report',
+]);
+
 function intentResultFromContent(content: string): IntentResult {
   const payload = record(parseMaybeJson(content));
   const rawIntent = stringValue(payload.intent);
@@ -212,6 +232,8 @@ function intentResultFromContent(content: string): IntentResult {
   if (instruction) result.instruction = instruction;
   const note = stringValue(payload.note);
   if (note) result.note = note;
+  const artifact = stringValue(payload.artifact);
+  if (artifact && ARTIFACT_NAMES.has(artifact as ArtifactName)) result.artifact = artifact as ArtifactName;
   return result;
 }
 
@@ -239,12 +261,12 @@ function controlChatFromContent(content: string): ControlChatResult {
         kind: 'proposal',
         ...(markdown ? { markdown } : {}),
         proposal: {
-          interpretedIntent: stringValue(proposal.interpretedIntent) ?? stringValue(proposal.intent) ?? title,
+          interpretedIntent: stringValue(proposal.interpretedIntent) ?? stringValue(proposal.intent) ?? `整理成一个可能的 Manager workflow 任务：${title}`,
           title,
           task,
-          wouldDo: stringArrayValue(proposal.wouldDo) ?? ['Use the suggested task prompt as the workflow input.'],
-          wouldNotDo: stringArrayValue(proposal.wouldNotDo) ?? ['Start implementation before you confirm task creation.'],
-          suggestedNextAction: stringValue(proposal.suggestedNextAction) ?? 'Reply create task, edit: <instruction>, or cancel.',
+          wouldDo: stringArrayValue(proposal.wouldDo) ?? ['在你确认后，把建议的任务内容作为 workflow 输入。'],
+          wouldNotDo: stringArrayValue(proposal.wouldNotDo) ?? ['不会在你确认前启动实现、规划或其他 agent 调用。'],
+          suggestedNextAction: stringValue(proposal.suggestedNextAction) ?? '可以说「创建任务」确认，或继续补充修改。',
         },
       };
     }
@@ -252,87 +274,15 @@ function controlChatFromContent(content: string): ControlChatResult {
   if (kind === 'clarify') {
     return { kind: 'clarify', markdown: stringValue(payload.markdown) ?? content };
   }
-  if (kind === 'create_task' || kind === 'confirm') {
-    return {
-      kind: 'clarify',
-      markdown: [
-        'I understood that as a task creation confirmation, but no task was created from the Manager JSON response.',
-        'Reply `create task` to confirm the pending proposal, or use `create task: <task>` to create a direct task.',
-      ].join('\n'),
-    };
+  if (kind === 'confirm_pending_proposal' || kind === 'create_task' || kind === 'confirm') {
+    const markdown = stringValue(payload.markdown);
+    return { kind: 'confirm_pending_proposal', ...(markdown ? { markdown } : {}) };
+  }
+  if (kind === 'cancel_pending_proposal' || kind === 'cancel') {
+    const markdown = stringValue(payload.markdown);
+    return { kind: 'cancel_pending_proposal', ...(markdown ? { markdown } : {}) };
   }
   return { kind: 'answer', markdown: stringValue(payload.markdown) ?? content };
-}
-
-const TASK_CHAT_ACTIONS = new Set<TaskChatRouteAction>([
-  'reply_only',
-  'answer_question',
-  'status',
-  'summary',
-  'approve',
-  'reject',
-  'revise',
-  'choose_difficulty',
-  'stop',
-  'show_artifact',
-  'create_new_task',
-  'clarify',
-]);
-
-export function taskChatRouteFromContent(content: string): TaskChatRouteResult {
-  const payload = record(parseMaybeJson(content));
-  const rawAction = stringValue(payload.action);
-  const action = rawAction && TASK_CHAT_ACTIONS.has(rawAction as TaskChatRouteAction)
-    ? rawAction as TaskChatRouteAction
-    : 'clarify';
-  const args = record(payload.actionArgs);
-  const difficulty = stringValue(args.difficulty);
-  const artifact = stringValue(args.artifact);
-  const actionArgs: NonNullable<TaskChatRouteResult['actionArgs']> = {};
-  const question = stringValue(args.question);
-  if (question) actionArgs.question = question;
-  if (difficulty === 'low' || difficulty === 'medium' || difficulty === 'high') actionArgs.difficulty = difficulty;
-  const revision = stringValue(args.revision);
-  if (revision) actionArgs.revision = revision;
-  if (isArtifactName(artifact)) actionArgs.artifact = artifact;
-  const title = stringValue(args.title);
-  if (title) actionArgs.title = title;
-  const task = stringValue(args.task);
-  if (task) actionArgs.task = task;
-
-  const result: TaskChatRouteResult = {
-    action,
-    confidence: Math.max(0, Math.min(1, numberValue(payload.confidence) ?? 0)),
-    reason: stringValue(payload.reason) ?? (rawAction ? `Invalid task chat route action: ${rawAction}` : 'Task chat route response was not valid JSON.'),
-  };
-  const replyMarkdown = stringValue(payload.replyMarkdown);
-  if (replyMarkdown) result.replyMarkdown = replyMarkdown;
-  const requiresConfirmation = booleanValue(payload.requiresConfirmation);
-  if (requiresConfirmation !== undefined) result.requiresConfirmation = requiresConfirmation;
-  if (Object.keys(actionArgs).length > 0) result.actionArgs = actionArgs;
-  return result;
-}
-
-function isArtifactName(value: string | undefined): value is ArtifactName {
-  return !!value && [
-    'original-task',
-    'manager-brief',
-    'initial-plan',
-    'review',
-    'revision-instructions',
-    'revised-plan',
-    'manager-explanation',
-    'qa-log',
-    'decision-log',
-    'implementation-log',
-    'git-pre-status',
-    'git-post-status',
-    'git-pre-diff',
-    'git-post-diff',
-    'test-build-log',
-    'final-review',
-    'final-report',
-  ].includes(value);
 }
 
 export async function loadManagerSkill(name: string): Promise<string> {
@@ -353,7 +303,7 @@ export class DeepSeekManagerAdapter implements ManagerAdapter {
     const apiKeyEnv = this.profile.apiKeyEnv ?? 'DEEPSEEK_API_KEY';
     const apiKey = this.env[apiKeyEnv]?.trim();
     if (!apiKey) {
-      throw new Error(`${apiKeyEnv} is required for Manager agent calls.`);
+      throw new Error(`${apiKeyEnv} is required for Elon Ma agent calls.`);
     }
 
     const body: Record<string, unknown> = {
@@ -375,7 +325,7 @@ export class DeepSeekManagerAdapter implements ManagerAdapter {
     });
     const responseText = await response.text();
     if (!response.ok) {
-      throw new Error(`DeepSeek Manager request failed: HTTP ${response.status} ${responseText.slice(0, 500)}`);
+      throw new Error(`DeepSeek Elon Ma request failed: HTTP ${response.status} ${responseText.slice(0, 500)}`);
     }
     const payload = record(parseMaybeJson(responseText));
     const choices = Array.isArray(payload.choices) ? payload.choices : [];
@@ -388,7 +338,8 @@ export class DeepSeekManagerAdapter implements ManagerAdapter {
       {
         role: 'system',
         content: [
-          'You are the Manager Agent for a local AI coding workflow.',
+          'You are Elon Ma, the agent for a local AI coding workflow.',
+          'Your display name is Elon Ma. If asked your name, answer that you are Elon Ma; do not use old Manager-prefixed display names or generic assistant names.',
           'Return JSON only with keys markdown, needsUserDecision, and optional userPrompt.',
           'Ask the user only for product, logic, cost, UX, scope, or direction decisions.',
           'Never ask for low-level file/helper/test implementation permission.',
@@ -413,11 +364,14 @@ export class DeepSeekManagerAdapter implements ManagerAdapter {
           '你是 Manager 工作流的对话意图分类器。',
           '状态机负责流程正确性；你只负责理解用户自然语言。',
           '只返回 JSON object，不要输出 markdown。',
-          'JSON keys: intent, difficulty, instruction, note, confidence, requiresClarification, userFacingInterpretation.',
+          'JSON keys: intent, difficulty, instruction, note, artifact, confidence, requiresClarification, userFacingInterpretation.',
           'intent 必须是 allowedActions 里的 id；如果无法判断，用 unknown。',
           'difficulty 只在 intent=difficulty 时填写 low、medium 或 high。',
-          'instruction 只在 intent=revise 时填写用户要改什么。',
+          'instruction 可以跟随任何会推动 workflow 的 intent，用来保留用户给后续 agent 的约束、原文使用要求、范围边界或修改要求；不要丢掉这些信息。',
           'note 只在 intent=note 时填写备注。',
+          'artifact 可在用户要求查看、发送、解释或使用某个产物时填写；可选值包括 original-task、manager-brief、revised-plan、agent-prompts、agent-prompt-preview、final-report 等。',
+          '如果用户想看“准备发给 Architect/Codex/Claude 的 prompt”，artifact 填 agent-prompt-preview，intent 通常填 ask。',
+          '如果用户要求“直接用我原来的 prompt / 原封不动交给 Architect / 不要重写 brief”，在 brief 确认阶段通常是 approve，并把这条要求原样写进 instruction。',
           'confidence 是 0 到 1。',
           'requiresClarification=true 表示需要先问清楚，不能推动 workflow。',
           'userFacingInterpretation 必须是简短自然中文，用来告诉用户你理解成了什么。',
@@ -560,7 +514,11 @@ export class DeepSeekManagerAdapter implements ManagerAdapter {
     return this.chat([
       {
         role: 'system',
-        content: 'Answer as the Manager Agent using only the provided project, task, plan, review, Q&A, and decision context. Keep the answer clear and practical.',
+        content: [
+          'Answer as Elon Ma using only the provided project, task, plan, review, Q&A, and decision context.',
+          'Your display name is Elon Ma. If asked your name, answer that you are Elon Ma; do not use old Manager-prefixed display names or generic assistant names.',
+          'Keep the answer clear and practical.',
+        ].join(' '),
       },
       {
         role: 'user',
@@ -582,47 +540,6 @@ export class DeepSeekManagerAdapter implements ManagerAdapter {
     ]);
   }
 
-  async routeTaskChat(input: { message: string; context: string; projectContext: string; state: TaskState; config: ManagerConfig }): Promise<TaskChatRouteResult> {
-    const content = await this.chat([
-      {
-        role: 'system',
-        content: [
-          'You are the Manager Agent inside a bound Lark task chat.',
-          'You are a normal chatbot first, but you may route user intent into workflow actions.',
-          'Return JSON only with keys: action, confidence, reason, optional replyMarkdown, optional requiresConfirmation, optional actionArgs.',
-          'Allowed action values: reply_only, answer_question, status, summary, approve, reject, revise, choose_difficulty, stop, show_artifact, create_new_task, clarify.',
-          'Use reply_only for greetings, acknowledgements, "did you receive this?", and normal chat that does not need task artifact Q&A.',
-          'Use answer_question for questions about the current task, plan, risks, progress, implementation, artifacts, or project context.',
-          'Use approve when the user clearly wants to continue/approve the current waiting decision.',
-          'Use choose_difficulty only with actionArgs.difficulty equal to low, medium, or high.',
-          'Use revise only with actionArgs.revision containing the requested change.',
-          'Use show_artifact only with actionArgs.artifact using one of the known artifact names.',
-          'For stop or create_new_task, set requiresConfirmation=true unless the user is explicit and unambiguous.',
-          'For low confidence or mixed intent, use clarify and ask one short question.',
-          'Do not claim that you executed anything; the local state machine will check permissions and execute.',
-        ].join(' '),
-      },
-      {
-        role: 'user',
-        content: [
-          `Current state:\n${JSON.stringify({
-            taskId: input.state.taskId,
-            title: input.state.title,
-            status: input.state.status,
-            difficulty: input.state.difficulty,
-            pendingUserPrompt: input.state.pendingUserPrompt,
-            revisionRound: input.state.revisionRound,
-            reviewerRunCount: input.state.reviewerRunCount,
-          }, null, 2)}`,
-          `Project context:\n${input.projectContext}`,
-          `Task context:\n${input.context}`,
-          `User message:\n${input.message}`,
-        ].join('\n\n'),
-      },
-    ], true);
-    return taskChatRouteFromContent(content);
-  }
-
   async handleControlChat(input: {
     message: string;
     pendingProposal?: TaskProposal;
@@ -634,16 +551,25 @@ export class DeepSeekManagerAdapter implements ManagerAdapter {
       {
         role: 'system',
         content: [
-          'You are the Manager Agent for an unbound Lark control chat.',
-          'Behave like a chatbot first: answer questions, explain concepts, help think, and generate prompts when asked.',
-          'Use the provided project context when the user mentions a configured project, asks to read project content, or asks project-specific questions.',
-          'If the provided project context does not contain the requested fact, say that the retrieved context was insufficient instead of claiming direct filesystem access.',
-          'Never create or start a real task. You may only propose a task for later confirmation.',
-          'Return JSON only.',
-          'For normal chat or prompt generation, return {"kind":"answer","markdown":"..."}; do not create a proposal unless the user clearly describes a future workflow task.',
-          'For possible workflow tasks, return {"kind":"proposal","markdown":"optional intro","proposal":{"interpretedIntent":"...","title":"...","task":"...","wouldDo":["..."],"wouldNotDo":["..."],"suggestedNextAction":"Reply create task, edit: <instruction>, or cancel."}}.',
-          'For unclear intent, return {"kind":"clarify","markdown":"..."} asking a short clarification question.',
-          'If the user says not to create a task, not to execute, or only asks for a prompt, return kind=answer.',
+          '你是未绑定 Lark control chat 里的 Elon Ma。',
+          '如果用户问你是谁，回答你是 Elon Ma；不要使用旧的 Manager 前缀名字或泛泛的 assistant 名称。',
+          '你首先是一个正常聊天助手：可以回答问题、解释概念、帮用户思考，也可以在用户要求时整理 prompt。',
+          '默认使用简体中文回复。即使用户消息、prompt 或规格文档是英文，所有用户可见的解释、标签、确认语、下一步提示都必须是中文。',
+          '可以保留必要的代码、命令、文件名、库名、产品名、英文原文片段；但不要用英文模板包装回复。',
+          '用户可见 JSON 字段包括 markdown、proposal.interpretedIntent、proposal.title、proposal.task、proposal.wouldDo、proposal.wouldNotDo、proposal.suggestedNextAction，全部优先写中文。',
+          '不要输出 "Based on your detailed specification"、"Intent"、"Suggested task prompt"、"Would do"、"Would not do"、"Suggested next action"、"Reply create task, edit, or cancel" 这类英文话术。',
+          '使用提供的 project context 回答项目相关问题；如果 context 不足，就说检索到的上下文不够，不要声称直接读过文件系统。',
+          '绝对不要创建或启动真实任务；你只能提出一份待确认的任务草案。',
+          '只返回 JSON。',
+          'Allowed kind values: answer, proposal, confirm_pending_proposal, cancel_pending_proposal, clarify.',
+          '普通聊天或 prompt 整理返回 {"kind":"answer","markdown":"中文回复"}；除非用户明确描述了要交给 workflow 做的未来任务，否则不要创建 proposal。',
+          '没有 pending proposal 时，不要把长 prompt 里的 confirm/create task/edit/cancel 当命令；正常回答，或仅在用户明确要 workflow 处理时创建 proposal。',
+          '有 pending proposal 且用户明确想创建/确认时，返回 {"kind":"confirm_pending_proposal","markdown":"简短中文确认"}。',
+          '有 pending proposal 且用户想取消时，返回 {"kind":"cancel_pending_proposal","markdown":"简短中文确认"}。',
+          '有 pending proposal 且用户要求修改时，返回修订后的 {"kind":"proposal",...}。',
+          '可能的 workflow 任务返回 {"kind":"proposal","markdown":"可选中文引导","proposal":{"interpretedIntent":"中文理解","title":"中文短标题","task":"中文任务内容；必要时保留英文技术名词或原文","wouldDo":["中文"],"wouldNotDo":["中文"],"suggestedNextAction":"可以说「创建任务」确认，或继续补充修改。"}}。',
+          '意图不清楚时返回 {"kind":"clarify","markdown":"一个简短中文澄清问题"}。',
+          '如果用户说不要创建任务、不要执行，或只是要 prompt，返回 kind=answer。',
         ].join(' '),
       },
       {
@@ -760,6 +686,28 @@ export class StubHeavyAgentAdapter implements HeavyAgentAdapter {
   }
 }
 
+export function buildInitialPlanPrompt(input: {
+  task: string;
+  projectContext: string;
+  brief: string;
+  difficulty: WorkflowDifficulty;
+  state: Pick<TaskState, 'requestedChanges'>;
+}): string {
+  return [
+    'Act as the Architect. Create an initial implementation plan. Do not edit files.',
+    'Every approved plan is one parent task. If decomposition is useful, describe execution units; otherwise treat it as one execution unit.',
+    'Suggest exactly one lightweight Category if obvious. Supported categories are: Reader Core, Selection / Popup, Vocabulary Algorithm, Translation / LLM, Feedback / User Model, Storage / Persistence, Backend / API, Data / Dictionary Pipeline, Evaluation / Benchmark, Manager / Workflow, Docs / Task Record, UI / Frontend, Other.',
+    'Do not create category folders or tags.',
+    `Workflow difficulty: ${input.difficulty}`,
+    `Project context:\n${input.projectContext}`,
+    `Task:\n${input.task}`,
+    `Manager brief:\n${input.brief}`,
+    `User workflow directives and requested changes:\n${input.state.requestedChanges.join('\n\n') || 'none'}`,
+    'When user workflow directives conflict with the Manager brief, follow the user workflow directives.',
+    'End with a "Verification Commands" section listing only commands to run.',
+  ].join('\n\n');
+}
+
 class CliHeavyAgentAdapter implements HeavyAgentAdapter {
   constructor(private readonly config: ManagerConfig) {}
 
@@ -819,31 +767,51 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
     throw new Error(`Workflow role ${difficulty}.${role} uses unsupported heavy agent profile kind ${profile.kind}.`);
   }
 
+  private agentPromptRecord(
+    prompt: string,
+    difficulty: WorkflowDifficulty,
+    role: WorkflowRoleName,
+    state: TaskState,
+    config: ManagerConfig,
+  ): AgentPromptRecord {
+    const profileName = config.workflowRoles[difficulty][role];
+    const profile = config.profiles[profileName];
+    if (!profile) {
+      throw new Error(`Workflow role ${difficulty}.${role} references missing profile ${profileName}.`);
+    }
+    return {
+      taskId: state.taskId,
+      role,
+      difficulty,
+      profileName,
+      profileKind: profile.kind,
+      createdAt: new Date().toISOString(),
+      prompt,
+    };
+  }
+
   async createInitialPlan(input: { task: string; projectContext: string; brief: string; difficulty: WorkflowDifficulty; state: TaskState; config: ManagerConfig }): Promise<PlanResult> {
-    const markdown = await this.runWorkflowRole([
-      'Act as the Architect. Create an initial implementation plan. Do not edit files.',
-      'Every approved plan is one parent task. If decomposition is useful, describe execution units; otherwise treat it as one execution unit.',
-      'Suggest exactly one lightweight Category if obvious. Supported categories are: Reader Core, Selection / Popup, Vocabulary Algorithm, Translation / LLM, Feedback / User Model, Storage / Persistence, Backend / API, Data / Dictionary Pipeline, Evaluation / Benchmark, Manager / Workflow, Docs / Task Record, UI / Frontend, Other.',
-      'Do not create category folders or tags.',
-      `Workflow difficulty: ${input.difficulty}`,
-      `Project context:\n${input.projectContext}`,
-      `Task:\n${input.task}`,
-      `Manager brief:\n${input.brief}`,
-      `User requested changes from previous planning rounds:\n${input.state.requestedChanges.join('\n\n') || 'none'}`,
-      'End with a "Verification Commands" section listing only commands to run.',
-    ].join('\n\n'), input.difficulty, 'architect', input.config);
-    return { markdown, verificationCommands: extractVerificationCommands(markdown), planPackDraft: extractPlanPackDraft(markdown) };
+    const prompt = buildInitialPlanPrompt(input);
+    const markdown = await this.runWorkflowRole(prompt, input.difficulty, 'architect', input.config);
+    return {
+      markdown,
+      verificationCommands: extractVerificationCommands(markdown),
+      planPackDraft: extractPlanPackDraft(markdown),
+      agentPrompt: this.agentPromptRecord(prompt, input.difficulty, 'architect', input.state, input.config),
+    };
   }
 
   async reviewPlan(input: { task: string; projectContext: string; initialPlan: string; difficulty: WorkflowDifficulty; state: TaskState; config: ManagerConfig }): Promise<ReviewResult> {
+    const prompt = [
+      'Act as the Plan Reviewer. Review this initial plan once. Focus on blocking bugs, risks, missing tests, product-impacting ambiguity, and whether any proposed execution-unit breakdown is coherent.',
+      `Workflow difficulty: ${input.difficulty}`,
+      `Project context:\n${input.projectContext}`,
+      `Task:\n${input.task}`,
+      `Initial plan:\n${input.initialPlan}`,
+    ].join('\n\n');
     return {
-      markdown: await this.runWorkflowRole([
-        'Act as the Plan Reviewer. Review this initial plan once. Focus on blocking bugs, risks, missing tests, product-impacting ambiguity, and whether any proposed execution-unit breakdown is coherent.',
-        `Workflow difficulty: ${input.difficulty}`,
-        `Project context:\n${input.projectContext}`,
-        `Task:\n${input.task}`,
-        `Initial plan:\n${input.initialPlan}`,
-      ].join('\n\n'), input.difficulty, 'planReviewer', input.config),
+      markdown: await this.runWorkflowRole(prompt, input.difficulty, 'planReviewer', input.config),
+      agentPrompt: this.agentPromptRecord(prompt, input.difficulty, 'planReviewer', input.state, input.config),
     };
   }
 
@@ -857,7 +825,7 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
     state: TaskState;
     config: ManagerConfig;
   }): Promise<PlanResult> {
-    const markdown = await this.runWorkflowRole([
+    const prompt = [
       'Act as the Architect. Create the revised plan. Do not edit files.',
       'Every approved plan is one parent task. If decomposition is useful, describe execution units; otherwise treat it as one execution unit.',
       'Suggest exactly one lightweight Category if obvious. Use Other when unsure. Do not create category folders or tags.',
@@ -868,8 +836,14 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
       `Reviewer feedback:\n${input.review}`,
       `Manager revision instructions:\n${input.revisionInstructions}`,
       'End with a "Verification Commands" section listing only commands to run.',
-    ].join('\n\n'), input.difficulty, 'architect', input.config);
-    return { markdown, verificationCommands: extractVerificationCommands(markdown), planPackDraft: extractPlanPackDraft(markdown) };
+    ].join('\n\n');
+    const markdown = await this.runWorkflowRole(prompt, input.difficulty, 'architect', input.config);
+    return {
+      markdown,
+      verificationCommands: extractVerificationCommands(markdown),
+      planPackDraft: extractPlanPackDraft(markdown),
+      agentPrompt: this.agentPromptRecord(prompt, input.difficulty, 'architect', input.state, input.config),
+    };
   }
 
   async implement(input: {
@@ -881,17 +855,23 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
     config: ManagerConfig;
   }): Promise<ImplementationResult> {
     const difficulty = input.state.difficulty ?? 'medium';
-    const markdown = await this.runWorkflowRole([
+    const prompt = [
       'Act as the Developer. Implement only the current execution unit from the approved parent-task plan.',
       `Project context:\n${input.projectContext}`,
       `Task:\n${input.task}`,
       `Approved revised plan:\n${input.revisedPlan}`,
+      `User workflow directives and requested changes:\n${input.state.requestedChanges.join('\n\n') || 'none'}`,
       `Current execution unit:\nTask ${String(input.executionUnit.index).padStart(2, '0')}: ${input.executionUnit.name}`,
       'Do not revert unrelated user changes. Report changed files at the end.',
       'Run focused tests when practical and include the Test Result details for this execution unit.',
       'When reading Markdown or other text files, preserve UTF-8 text. On Windows PowerShell, use Get-Content -Raw -Encoding utf8 for file content, and keep command output free of ANSI color codes.',
-    ].join('\n\n'), difficulty, 'developer', input.config);
-    return { markdown, changedFiles: [] };
+    ].join('\n\n');
+    const markdown = await this.runWorkflowRole(prompt, difficulty, 'developer', input.config);
+    return {
+      markdown,
+      changedFiles: [],
+      agentPrompt: this.agentPromptRecord(prompt, difficulty, 'developer', input.state, input.config),
+    };
   }
 
   async finalReview(input: {
@@ -904,17 +884,19 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
     config: ManagerConfig;
   }): Promise<FinalReviewResult> {
     const difficulty = input.state.difficulty ?? 'medium';
-    const markdown = await this.runWorkflowRole([
+    const prompt = [
       'Act as the Final Reviewer. Review the whole parent task after all execution units are implemented. Do not review every subtask separately by default. Report blocking issues first.',
       `Project context:\n${input.projectContext}`,
       `Task:\n${input.task}`,
       `Approved revised plan:\n${input.revisedPlan}`,
       `Implementation log:\n${input.implementationLog}`,
       `Verification:\n${input.verificationLog}`,
-    ].join('\n\n'), difficulty, 'finalReviewer', input.config);
+    ].join('\n\n');
+    const markdown = await this.runWorkflowRole(prompt, difficulty, 'finalReviewer', input.config);
     return {
       markdown,
       passed: !/\b(blocking|must fix|failed|regression)\b/i.test(markdown),
+      agentPrompt: this.agentPromptRecord(prompt, difficulty, 'finalReviewer', input.state, input.config),
     };
   }
 }

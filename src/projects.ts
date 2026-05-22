@@ -52,14 +52,14 @@ export function renderProjectList(config: ManagerConfig, activeProjectId?: strin
   return listProjects(config)
     .map((project) => {
       const flags = [
-        project.id === defaultProjectId ? 'default' : undefined,
-        project.id === activeProjectId ? 'active' : undefined,
+        project.id === defaultProjectId ? '默认' : undefined,
+        project.id === activeProjectId ? '当前' : undefined,
       ].filter(Boolean).join(', ');
       return [
         `- ${project.id}: ${project.name}${flags ? ` (${flags})` : ''}`,
-        `  target: ${project.targetDir}`,
-        `  docs: ${project.docsDir}`,
-        `  task records: ${project.taskRecordRoot ?? '<targetDir>/task'}`,
+        `  目标工作区：${project.targetDir}`,
+        `  文档目录：${project.docsDir}`,
+        `  task record：${project.taskRecordRoot ?? '<targetDir>/task'}`,
       ].join('\n');
     })
     .join('\n');

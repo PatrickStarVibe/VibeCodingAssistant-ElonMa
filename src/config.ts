@@ -36,7 +36,7 @@ const DEFAULT_WORKFLOW_ROLES: WorkflowRoleProfiles = {
   },
   high: {
     architect: 'claude-architect',
-    planReviewer: 'claude-plan-reviewer',
+    planReviewer: 'codex-plan-reviewer',
     developer: 'codex-developer',
     finalReviewer: 'claude-final-reviewer',
   },

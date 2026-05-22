@@ -9,7 +9,7 @@ import type { HeavyAgentAdapter, ManagerAdapter } from '../src/adapters.js';
 import { ManagerConversationService } from '../src/conversation.js';
 import { LarkBridge, type LarkClientPort, type LarkIncomingMessage } from '../src/larkBridge.js';
 import { LarkBridgeStateStore } from '../src/larkBridgeState.js';
-import type { ControlChatResult, IntentResult, ManagerConfig, ManagerRouteResult, ManagerTextResult, PlanResult, TaskChatRouteResult, TaskProposal, WorkflowDifficulty } from '../src/types.js';
+import type { ControlChatResult, IntentResult, ManagerConfig, ManagerRouteResult, ManagerTextResult, PlanResult, TaskProposal, WorkflowDifficulty } from '../src/types.js';
 import { WorkflowService } from '../src/workflow.js';
 
 class FakeLarkClient implements LarkClientPort {
@@ -41,7 +41,6 @@ class FakeLarkClient implements LarkClientPort {
 
 class FakeManager implements ManagerAdapter {
   intents: IntentResult[] = [];
-  taskRoutes: TaskChatRouteResult[] = [];
 
   async createTaskBrief(): Promise<ManagerTextResult> {
     return { markdown: 'brief ready', needsUserDecision: false };
@@ -83,46 +82,54 @@ class FakeManager implements ManagerAdapter {
     return { text: input.rawMessage };
   }
 
-  async routeTaskChat(input: { message: string; state: { status: string } }): Promise<TaskChatRouteResult> {
-    const route = this.taskRoutes.shift();
-    if (route) return route;
-    return {
-      action: 'reply_only',
-      confidence: 0.9,
-      reason: `test fallback for ${input.message}`,
-    };
-  }
-
   async handleControlChat(input: {
     message: string;
     pendingProposal?: TaskProposal;
     mode: 'message' | 'edit';
     projectContext: string;
   }): Promise<ControlChatResult> {
+    if (input.pendingProposal && /\b(confirm|create task|yes create)\b/i.test(input.message.trim())) {
+      return { kind: 'confirm_pending_proposal', markdown: '准备创建这份任务。' };
+    }
+    if (input.pendingProposal && /^(cancel|no)$/i.test(input.message.trim())) {
+      return { kind: 'cancel_pending_proposal', markdown: '已取消这份任务草案。' };
+    }
+    const editMessage = input.message.match(/^edit\s*:\s*([\s\S]+)$/i);
+    if (input.pendingProposal && editMessage?.[1]?.trim()) {
+      return {
+        kind: 'proposal',
+        proposal: {
+          ...input.pendingProposal,
+          title: `${input.pendingProposal.title}（已修改）`,
+          task: `${input.pendingProposal.task}\n修改：${editMessage[1].trim()}`,
+          suggestedNextAction: '可以说「创建任务」确认，或继续补充修改。',
+        },
+      };
+    }
     if (input.mode === 'edit' && input.pendingProposal) {
       return {
         kind: 'proposal',
         proposal: {
           ...input.pendingProposal,
-          title: `${input.pendingProposal.title} edited`,
-          task: `${input.pendingProposal.task}\nEdit: ${input.message}`,
-          suggestedNextAction: 'Reply create task, edit: <instruction>, or cancel.',
+          title: `${input.pendingProposal.title}（已修改）`,
+          task: `${input.pendingProposal.task}\n修改：${input.message}`,
+          suggestedNextAction: '可以说「创建任务」确认，或继续补充修改。',
         },
       };
     }
     if (/prompt|先帮我整理一下|先不要创建\s*task|不要执行/i.test(input.message)) {
-      return { kind: 'answer', markdown: `prompt draft: ${input.message}` };
+      return { kind: 'answer', markdown: `prompt 草稿：${input.message}` };
     }
     if (/^implement\b/i.test(input.message)) {
       return {
         kind: 'proposal',
         proposal: {
-          interpretedIntent: `intent: ${input.message}`,
+          interpretedIntent: `理解为：${input.message}`,
           title: input.message.slice(0, 40),
-          task: `Task prompt: ${input.message}`,
-          wouldDo: ['Create a workflow task after confirmation.'],
-          wouldNotDo: ['Start the workflow before confirmation.'],
-          suggestedNextAction: 'Reply create task, edit: <instruction>, or cancel.',
+          task: `任务内容：${input.message}`,
+          wouldDo: ['在你确认后创建 workflow 任务。'],
+          wouldNotDo: ['不会在你确认前启动 workflow。'],
+          suggestedNextAction: '可以说「创建任务」确认，或继续补充修改。',
         },
       };
     }
@@ -130,19 +137,19 @@ class FakeManager implements ManagerAdapter {
       return {
         kind: 'proposal',
         proposal: {
-          interpretedIntent: `intent: ${input.message}`,
+          interpretedIntent: `理解为：${input.message}`,
           title: input.message.slice(0, 40),
-          task: `Task prompt: ${input.message}`,
-          wouldDo: ['Create a workflow task after confirmation.'],
-          wouldNotDo: ['Start the workflow before confirmation.'],
-          suggestedNextAction: 'Reply create task, edit: <instruction>, or cancel.',
+          task: `任务内容：${input.message}`,
+          wouldDo: ['在你确认后创建 workflow 任务。'],
+          wouldNotDo: ['不会在你确认前启动 workflow。'],
+          suggestedNextAction: '可以说「创建任务」确认，或继续补充修改。',
         },
       };
     }
     if (/ireader/i.test(input.message)) {
-      return { kind: 'answer', markdown: `context answer: ${input.projectContext}` };
+      return { kind: 'answer', markdown: `项目上下文：${input.projectContext}` };
     }
-    return { kind: 'answer', markdown: `chat answer: ${input.message}` };
+    return { kind: 'answer', markdown: `聊天回复：${input.message}` };
   }
 
   async routeAfterFinalReview(): Promise<ManagerRouteResult> {
@@ -240,7 +247,7 @@ function makeConfig(targetDir: string): ManagerConfig {
       },
       high: {
         architect: 'reviewer',
-        planReviewer: 'reviewer',
+        planReviewer: 'planner',
         developer: 'implementer',
         finalReviewer: 'finalReviewer',
       },
@@ -386,6 +393,31 @@ describe('LarkBridge', () => {
     }
   });
 
+  it('does not send state notifications or files while a background job owns the task', async () => {
+    const { root, targetDir, bridge, client, stateStore, conversation } = await makeBridge();
+    try {
+      const taskId = await bindCreatedTask(stateStore, conversation);
+      await conversation.startBrief(taskId).run();
+      const state = await stateStore.load();
+      const startedAt = new Date().toISOString();
+      state.runningJobsByTaskId[taskId] = {
+        taskId,
+        label: 'brief generation',
+        startedAt,
+        lastNotifiedAt: startedAt,
+      };
+      await stateStore.save(state);
+
+      await bridge.watchTaskStatuses();
+
+      expect(client.sentTexts).toHaveLength(0);
+      expect(client.sentFiles).toHaveLength(0);
+      expect((await stateStore.load()).notifiedStatusByTaskId[taskId]).toBeUndefined();
+    } finally {
+      await cleanup([root, targetDir]);
+    }
+  });
+
   it('creates a task chat and binds future messages to the explicit task id', async () => {
     const { root, targetDir, bridge, client, stateStore } = await makeBridge();
     try {
@@ -412,7 +444,7 @@ describe('LarkBridge', () => {
         chatId: 'task-chat-1',
         text: 'status',
       }));
-      expect(client.sentTexts.at(-1)?.text).toContain(`Task ID: ${binding?.taskId}`);
+      expect(client.sentTexts.at(-1)?.text).toContain('等你确认 brief');
     } finally {
       await cleanup([root, targetDir]);
     }
@@ -438,7 +470,7 @@ describe('LarkBridge', () => {
       await bridge.handleMessage(message({ eventId: `help-${text}`, messageId: `msg-${text}`, text }));
 
       expect(client.createdChats).toHaveLength(0);
-      expect(client.sentTexts.at(-1)?.text).toContain('Manager Lark commands');
+      expect(client.sentTexts.at(-1)?.text).toContain('Elon Ma 飞书用法');
     } finally {
       await cleanup([root, targetDir]);
     }
@@ -451,7 +483,7 @@ describe('LarkBridge', () => {
       await bridge.handleMessage(message({ eventId: 'ambiguous', messageId: 'message-ambiguous', text: 'hello' }));
 
       expect(client.createdChats).toHaveLength(0);
-      expect(client.sentTexts.at(-1)?.text).toContain('chat answer: hello');
+      expect(client.sentTexts.at(-1)?.text).toContain('聊天回复：hello');
     } finally {
       await cleanup([root, targetDir]);
     }
@@ -498,7 +530,7 @@ describe('LarkBridge', () => {
     try {
       await pair(bridge);
       await bridge.handleMessage(message({ eventId: 'project-use', messageId: 'message-project-use', text: '/project use ireader' }));
-      expect(client.sentTexts.at(-1)?.text).toContain('Active project set to IReader');
+      expect(client.sentTexts.at(-1)?.text).toContain('当前项目已切换为 IReader');
 
       await bridge.handleMessage(message({ eventId: 'project-task', messageId: 'message-project-task', text: 'create task: Build project memory' }));
       await waitFor(() => {
@@ -521,7 +553,7 @@ describe('LarkBridge', () => {
       await bridge.handleMessage(message({ eventId: `proposal-${text}`, messageId: `message-${text}`, text }));
 
       expect(client.createdChats).toHaveLength(0);
-      expect(client.sentTexts.at(-1)?.text).toContain('task proposal');
+      expect(client.sentTexts.at(-1)?.text).toContain('任务草案');
       expect((await stateStore.load()).pendingProposalsByChatId['control-chat']?.task).toContain(text);
     } finally {
       await cleanup([root, targetDir]);
@@ -535,7 +567,7 @@ describe('LarkBridge', () => {
       await bridge.handleMessage(message({ eventId: `prompt-${text}`, messageId: `message-${text}`, text }));
 
       expect(client.createdChats).toHaveLength(0);
-      expect(client.sentTexts.at(-1)?.text).toContain('prompt draft:');
+      expect(client.sentTexts.at(-1)?.text).toContain('prompt 草稿：');
       expect((await stateStore.load()).pendingProposalsByChatId['control-chat']).toBeUndefined();
     } finally {
       await cleanup([root, targetDir]);
@@ -587,21 +619,21 @@ describe('LarkBridge', () => {
 
       expect(client.createdChats).toHaveLength(0);
       const pending = (await stateStore.load()).pendingProposalsByChatId['control-chat'];
-      expect(pending?.title).toContain('edited');
+      expect(pending?.title).toContain('已修改');
       expect(pending?.task).toContain('keep it small');
     } finally {
       await cleanup([root, targetDir]);
     }
   });
 
-  it.each(['edit: keep it small', 'confirm', 'create task', 'yes create', '\u53ef\u4ee5\uff0ccreate task'])('clarifies %s without a pending proposal', async (text) => {
+  it.each(['edit: keep it small', 'confirm', 'create task', 'yes create', '\u53ef\u4ee5\uff0ccreate task'])('routes %s through control chat without a pending proposal', async (text) => {
     const { root, targetDir, bridge, client } = await makeBridge();
     try {
       await pair(bridge);
       await bridge.handleMessage(message({ eventId: `no-pending-${text}`, messageId: `message-no-pending-${text}`, text }));
 
       expect(client.createdChats).toHaveLength(0);
-      expect(client.sentTexts.at(-1)?.text).toContain('There is no pending proposal');
+      expect(client.sentTexts.at(-1)?.text).not.toContain('There is no pending proposal');
     } finally {
       await cleanup([root, targetDir]);
     }
@@ -616,7 +648,7 @@ describe('LarkBridge', () => {
 
       expect(client.createdChats).toHaveLength(0);
       expect((await stateStore.load()).pendingProposalsByChatId['control-chat']).toBeUndefined();
-      expect(client.sentTexts.at(-1)?.text).toContain('Canceled');
+      expect(client.sentTexts.at(-1)?.text).toContain('已取消');
     } finally {
       await cleanup([root, targetDir]);
     }
@@ -630,11 +662,11 @@ describe('LarkBridge', () => {
 
       await bridge.handleMessage(message({ eventId: 'status-with-proposal', messageId: 'message-status-with-proposal', text: 'status' }));
       expect(client.createdChats).toHaveLength(0);
-      expect(client.sentTexts.at(-1)?.text).toContain('Pending task proposal');
-      expect(client.sentTexts.at(-1)?.text).toContain('edit: <instruction>');
+      expect(client.sentTexts.at(-1)?.text).toContain('待确认的任务草案');
+      expect(client.sentTexts.at(-1)?.text).toContain('修改：<说明>');
 
       await bridge.handleMessage(message({ eventId: 'summary-with-proposal', messageId: 'message-summary-with-proposal', text: 'summary' }));
-      expect(client.sentTexts.at(-1)?.text).toContain('Pending task proposal');
+      expect(client.sentTexts.at(-1)?.text).toContain('待确认的任务草案');
     } finally {
       await cleanup([root, targetDir]);
     }
@@ -647,11 +679,11 @@ describe('LarkBridge', () => {
 
       await bridge.handleMessage(message({ eventId: 'bound-status', messageId: 'message-status', chatId: 'task-chat-existing', text: '/status' }));
       expect(client.createdChats).toHaveLength(0);
-      expect(client.sentTexts.at(-1)?.text).toContain(`Task ID: ${taskId}`);
+      expect(client.sentTexts.at(-1)?.text).toContain('任务已创建');
 
       await bridge.handleMessage(message({ eventId: 'bound-summary', messageId: 'message-summary', chatId: 'task-chat-existing', text: '/summary' }));
       expect(client.createdChats).toHaveLength(0);
-      expect(client.sentTexts.at(-1)?.text).toContain('Revision round');
+      expect(client.sentTexts.at(-1)?.text).toContain('任务已创建');
 
       await bridge.handleMessage(message({ eventId: 'bound-help', messageId: 'message-help', chatId: 'task-chat-existing', text: 'help' }));
       expect(client.createdChats).toHaveLength(0);

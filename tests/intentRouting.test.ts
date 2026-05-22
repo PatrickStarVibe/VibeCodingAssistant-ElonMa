@@ -16,7 +16,6 @@ import type {
   ManagerRouteResult,
   ManagerTextResult,
   PlanResult,
-  TaskChatRouteResult,
   TaskProposal,
   WorkflowDifficulty,
 } from '../src/types.js';
@@ -56,10 +55,6 @@ class FakeManager implements ManagerAdapter {
 
   async interpretAmbiguousReply(): Promise<string> {
     return 'clarify';
-  }
-
-  async routeTaskChat(): Promise<TaskChatRouteResult> {
-    return { action: 'clarify', confidence: 0, reason: 'unused' };
   }
 
   async handleControlChat(input: { message: string; pendingProposal?: TaskProposal; mode: 'message' | 'edit' }): Promise<ControlChatResult> {
@@ -160,7 +155,7 @@ function makeConfig(targetDir: string): ManagerConfig {
     workflowRoles: {
       low: { architect: 'planner', planReviewer: 'planner', developer: 'implementer', finalReviewer: 'implementer' },
       medium: { architect: 'planner', planReviewer: 'reviewer', developer: 'implementer', finalReviewer: 'finalReviewer' },
-      high: { architect: 'reviewer', planReviewer: 'reviewer', developer: 'implementer', finalReviewer: 'finalReviewer' },
+      high: { architect: 'reviewer', planReviewer: 'planner', developer: 'implementer', finalReviewer: 'finalReviewer' },
     },
     profiles: {
       manager: { kind: 'deepseek' },

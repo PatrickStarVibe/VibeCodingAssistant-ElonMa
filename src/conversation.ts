@@ -33,8 +33,12 @@ const ARTIFACT_NAMES: ArtifactName[] = [
   'git-post-diff',
   'test-build-log',
   'final-review',
+  'agent-prompts',
+  'agent-prompt-preview',
   'final-report',
 ];
+
+const TASK_CONTEXT_ARTIFACT_NAMES = ARTIFACT_NAMES.filter((name) => name !== 'agent-prompts' && name !== 'agent-prompt-preview');
 
 export const CLARIFY_INTENT_MESSAGE = [
   '我还没完全确定你的意思，所以没有推进 workflow。',
@@ -69,7 +73,9 @@ export type BackgroundConversationTurn = Extract<ConversationTurn, { kind: 'back
 
 export type ControlConversationTurn =
   | { kind: 'reply'; message: OutboundMessage }
-  | { kind: 'proposal'; message: OutboundMessage; proposal: TaskProposal };
+  | { kind: 'proposal'; message: OutboundMessage; proposal: TaskProposal }
+  | { kind: 'confirm_pending_proposal'; message?: OutboundMessage }
+  | { kind: 'cancel_pending_proposal'; message?: OutboundMessage };
 
 export class ManagerConversationService {
   private readonly projectKnowledge: ProjectKnowledgeService;
@@ -229,6 +235,15 @@ export class ManagerConversationService {
     state: TaskState,
     intent: IntentResult,
   ): Promise<ConversationTurn> {
+    if (intent.intent === 'ask' && intent.artifact) {
+      return {
+        kind: 'reply',
+        auditAction: `intent:ask:artifact:${intent.artifact}`,
+        auditMetadata: intentAuditMetadata(intent),
+        messages: [await this.renderArtifact(taskId, intent.artifact)],
+      };
+    }
+
     if (intent.intent === 'ask') {
       const result = await this.workflow.askQuestion(taskId, originalMessage);
       return {
@@ -266,16 +281,20 @@ export class ManagerConversationService {
       kind: 'background',
       auditAction: `intent:${intent.intent}`,
       auditMetadata: intentAuditMetadata(intent),
-      startedMessage: {
-        text: intent.userFacingInterpretation || `收到，我会按「${intent.intent}」处理。`,
-      },
+      startedMessage: await this.composeMessage({
+        rawMessage: [
+          intent.userFacingInterpretation || `收到，我会按「${intent.intent}」处理。`,
+          '这个动作已通过当前 workflow gate，我现在开始执行；跑完会把下一步发到这里。',
+        ].join('\n'),
+        state,
+      }),
       run: () => this.workflow.reply(taskId, reply),
     };
   }
 
   private async renderArtifact(taskId: string, artifact: ArtifactName): Promise<OutboundMessage> {
-    const state = await this.store.loadState(taskId);
     const content = await this.workflow.showArtifact(taskId, artifact);
+    const state = await this.store.loadState(taskId);
     const path = state.artifacts[artifact];
     return {
       text: [`${artifact}:`, '', shorten(content, 1200)].join('\n'),
@@ -315,7 +334,7 @@ export class ManagerConversationService {
     const context: string[] = [
       `State:\n${JSON.stringify({ ...state, artifacts: undefined }, null, 2)}`,
     ];
-    for (const name of ARTIFACT_NAMES) {
+    for (const name of TASK_CONTEXT_ARTIFACT_NAMES) {
       if (!state.artifacts[name]) continue;
       const content = await this.store.readArtifact(state, name).catch(() => '');
       if (content.trim()) context.push(`## ${name}\n${shorten(content, 3000)}`);
@@ -343,7 +362,8 @@ export class ManagerConversationService {
         ...(input.userQuestion ? { userQuestion: input.userQuestion } : {}),
         config: this.config,
       });
-      return { text: composed.text.trim() || fallback, ...(input.files ? { files: input.files } : {}) };
+      const text = sanitizeUserFacingText(composed.text.trim()) || fallback;
+      return { text, ...(input.files ? { files: input.files } : {}) };
     } catch {
       return { text: fallback, ...(input.files ? { files: input.files } : {}) };
     }
@@ -412,24 +432,23 @@ export function looksLikePromptGeneration(text: string): boolean {
 
 export function renderTaskProposal(proposal: TaskProposal): string {
   return [
-    'I think this could become a Manager task proposal:',
+    '我把它整理成了一份任务草案：',
     '',
-    `Intent: ${proposal.interpretedIntent}`,
-    `Title: ${proposal.title}`,
+    `理解到的意图：${localizeKnownProposalText(proposal.interpretedIntent)}`,
+    `标题：${localizeKnownProposalText(proposal.title)}`,
     '',
-    'Suggested task prompt:',
-    proposal.task,
+    '建议任务内容：',
+    localizeKnownProposalText(proposal.task),
     '',
-    'Would do:',
-    ...proposal.wouldDo.map((item) => `- ${item}`),
+    '会做：',
+    ...proposal.wouldDo.map((item) => `- ${localizeKnownProposalText(item)}`),
     '',
-    'Would not do:',
-    ...proposal.wouldNotDo.map((item) => `- ${item}`),
+    '不会做：',
+    ...proposal.wouldNotDo.map((item) => `- ${localizeKnownProposalText(item)}`),
     '',
-    `Suggested next action: ${proposal.suggestedNextAction}`,
+    `下一步：${localizeKnownProposalText(proposal.suggestedNextAction)}`,
     '',
-    'Do you want me to create a task from this?',
-    'Reply: create task, edit: <instruction>, or cancel.',
+    '要我按这份草案创建任务的话，直接说「创建任务」。也可以继续补充要改的地方。',
   ].join('\n');
 }
 
@@ -442,7 +461,19 @@ function controlResultToTurn(result: ControlChatResult): ControlConversationTurn
     return {
       kind: 'proposal',
       proposal: result.proposal,
-      message: { text: [result.markdown, renderTaskProposal(result.proposal)].filter(Boolean).join('\n\n') },
+      message: { text: renderTaskProposal(result.proposal) },
+    };
+  }
+  if (result.kind === 'confirm_pending_proposal') {
+    return {
+      kind: 'confirm_pending_proposal',
+      ...(result.markdown ? { message: { text: result.markdown } } : {}),
+    };
+  }
+  if (result.kind === 'cancel_pending_proposal') {
+    return {
+      kind: 'cancel_pending_proposal',
+      ...(result.markdown ? { message: { text: result.markdown } } : {}),
     };
   }
   return { kind: 'reply', message: { text: result.markdown } };
@@ -455,13 +486,13 @@ function fallbackControlChat(
 ): ControlChatResult {
   const trimmed = message.trim();
   if (mode === 'edit' && pendingProposal) {
-    const task = `${pendingProposal.task}\n\nRevision request:\n${trimmed}`;
+    const task = `${pendingProposal.task}\n\n修改要求：\n${trimmed}`;
     return {
       kind: 'proposal',
       proposal: {
         ...pendingProposal,
         task,
-        suggestedNextAction: 'Reply create task, edit: <instruction>, or cancel.',
+        suggestedNextAction: '可以说「创建任务」确认，或继续补充修改。',
       },
     };
   }
@@ -469,11 +500,11 @@ function fallbackControlChat(
     return {
       kind: 'answer',
       markdown: [
-        'Here is a prompt draft you can refine before creating any task:',
+        '我先把它当作 prompt 草稿整理给你，不会创建任务：',
         '',
         trimmed,
         '',
-        'No task has been created.',
+        '目前没有创建任务。',
       ].join('\n'),
     };
   }
@@ -481,25 +512,49 @@ function fallbackControlChat(
     return {
       kind: 'proposal',
       proposal: {
-        interpretedIntent: `Turn this request into a possible Manager workflow task: ${shorten(trimmed, 120)}`,
+        interpretedIntent: `把这条请求整理成一个可能的 Manager workflow 任务：${shorten(trimmed, 120)}`,
         title: makeTitle(trimmed),
         task: trimmed,
-        wouldDo: ['Create a Manager workflow task from this prompt after you confirm.'],
-        wouldNotDo: ['Start planning, implementation, or agent calls before confirmation.'],
-        suggestedNextAction: 'Reply create task, edit: <instruction>, or cancel.',
+        wouldDo: ['在你确认后，把这段内容创建成一个 Manager workflow 任务。'],
+        wouldNotDo: ['不会在你确认前启动规划、实现或 agent 调用。'],
+        suggestedNextAction: '可以说「创建任务」确认，或继续补充修改。',
       },
     };
   }
   return {
     kind: 'answer',
     markdown: [
-      'I can help think this through.',
+      '我可以继续帮你梳理。',
       '',
       trimmed,
       '',
-      'No task has been created. If you want one, say: create task: <task>.',
+      '目前没有创建任务。如果要直接创建任务，可以用命令：create task: <任务内容>。',
     ].join('\n'),
   };
+}
+
+function localizeKnownProposalText(text: string): string {
+  const trimmed = text.trim();
+  if (/^Use the suggested task prompt as the workflow input\.?$/i.test(trimmed)) {
+    return '在你确认后，把建议的任务内容作为 workflow 输入。';
+  }
+  if (/^Start implementation before you confirm task creation\.?$/i.test(trimmed)) {
+    return '不会在你确认前启动实现。';
+  }
+  if (/^Create a workflow task after confirmation\.?$/i.test(trimmed)) {
+    return '在你确认后创建 workflow 任务。';
+  }
+  if (/^Start the workflow before confirmation\.?$/i.test(trimmed)) {
+    return '不会在你确认前启动 workflow。';
+  }
+  if (/^Reply create task, edit: <instruction>, or cancel\.?$/i.test(trimmed)) {
+    return '可以说「创建任务」确认，或继续补充修改。';
+  }
+  return text
+    .replace(/^Turn this request into a possible Manager workflow task:\s*/i, '把这条请求整理成一个可能的 Manager workflow 任务：')
+    .replace(/^intent:\s*/i, '理解为：')
+    .replace(/^Task prompt:\s*/i, '')
+    .replace(/\n\nRevision request:\n/gi, '\n\n修改要求：\n');
 }
 
 function normalizeIntentForState(intent: IntentResult, state: TaskState): IntentResult {
@@ -512,13 +567,14 @@ function normalizeIntentForState(intent: IntentResult, state: TaskState): Intent
 function workflowReplyForIntent(intent: IntentResult, originalMessage: string, state: TaskState): string | undefined {
   switch (intent.intent) {
     case 'approve':
-      return state.status === 'awaiting_user_acceptance' ? 'accept' : 'approve A';
+      if (state.status === 'awaiting_user_acceptance') return instructionReply('accept', intent.instruction);
+      return instructionReply('approve A', intent.instruction);
     case 'reject':
       return 'reject B';
     case 'revise':
       return `revise C: ${intent.instruction ?? originalMessage}`;
     case 'difficulty':
-      return intent.difficulty;
+      return intent.difficulty ? instructionReply(intent.difficulty, intent.instruction) : undefined;
     case 'stop':
       return 'stop';
     case 'accept':
@@ -542,7 +598,12 @@ function intentAuditMetadata(intent: IntentResult): Record<string, unknown> {
     ...(intent.difficulty ? { difficulty: intent.difficulty } : {}),
     ...(intent.instruction ? { instruction: intent.instruction } : {}),
     ...(intent.note ? { note: intent.note } : {}),
+    ...(intent.artifact ? { artifact: intent.artifact } : {}),
   };
+}
+
+function instructionReply(base: string, instruction?: string): string {
+  return instruction ? `${base}: ${instruction}` : base;
 }
 
 function formatAllowedActions(actions: AllowedAction[]): string {
@@ -552,16 +613,51 @@ function formatAllowedActions(actions: AllowedAction[]): string {
 function renderStateNotificationText(state: TaskState): string {
   return [
     `现在是「${humanStageName(state.status)}」。`,
-    state.pendingUserPrompt ? `等你处理：${state.pendingUserPrompt}` : undefined,
+    state.pendingUserPrompt ? `等你处理：${localizePendingPrompt(state.pendingUserPrompt)}` : undefined,
   ].filter(Boolean).join('\n');
 }
 
 function fallbackComposeReply(rawMessage: string, state: TaskState, pendingPrompt?: string): string {
   const prompt = pendingPrompt ?? state.pendingUserPrompt;
+  const cleaned = sanitizeUserFacingText(rawMessage);
+  const base = isWorkflowBoilerplate(rawMessage) || !cleaned
+    ? renderStateNotificationText(state)
+    : cleaned;
   return [
-    rawMessage,
-    prompt ? `现在需要你处理：${prompt}` : undefined,
+    base,
+    prompt && !base.includes(localizePendingPrompt(prompt)) ? `现在需要你处理：${localizePendingPrompt(prompt)}` : undefined,
   ].filter(Boolean).join('\n');
+}
+
+function sanitizeUserFacingText(text: string): string {
+  return text
+    .split(/\r?\n/)
+    .filter((line) => !/^(?:Task|Task ID|Title|Status|Category|Execution mode|Difficulty|Revision round|Reviewer runs|Pending|Pending user prompt):\s*/i.test(line.trim()))
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function isWorkflowBoilerplate(text: string): boolean {
+  const trimmed = text.trim();
+  if (/^(?:Task|Task ID|Status|Pending):\s*/im.test(trimmed)) return true;
+  return /^(?:Brief is ready|Brief approved|Revised plan is ready|Final review passed|Task accepted|Task stopped|Choose workflow difficulty|Plan revision limit reached|Revised plan rejected)/i.test(trimmed);
+}
+
+function localizePendingPrompt(prompt: string): string {
+  if (/Review the brief:/i.test(prompt)) {
+    return '请确认 brief：可以说「同意」进入难度选择；也可以说明要修哪里，或说「拒绝/停止」。';
+  }
+  if (/Choose workflow difficulty/i.test(prompt)) {
+    return '请选择难度：低/中/高。也可以直接说「默认难度」或「高难度」。';
+  }
+  if (/Approve A to implement/i.test(prompt) || /ready for your decision/i.test(prompt)) {
+    return '请确认修订后的计划：可以说「批准/开始实现」，或说明还要改哪里。';
+  }
+  if (/Final review passed/i.test(prompt) || /Reply accept to finalize/i.test(prompt)) {
+    return '等你验收：可以说「验收通过」生成 task-record，也可以补充备注或要求修改。';
+  }
+  return prompt;
 }
 
 function makeTitle(text: string): string {

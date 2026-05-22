@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { DeepSeekManagerAdapter, taskChatRouteFromContent } from '../src/adapters.js';
+import { DeepSeekManagerAdapter, buildInitialPlanPrompt } from '../src/adapters.js';
 import type { ManagerConfig } from '../src/types.js';
 
 function makeConfig(): ManagerConfig {
@@ -39,7 +39,7 @@ function makeConfig(): ManagerConfig {
       },
       high: {
         architect: 'reviewer',
-        planReviewer: 'reviewer',
+        planReviewer: 'planner',
         developer: 'implementer',
         finalReviewer: 'finalReviewer',
       },
@@ -66,7 +66,7 @@ describe('DeepSeekManagerAdapter', () => {
     vi.unstubAllGlobals();
   });
 
-  it('does not leak create_task control JSON as a chat answer', async () => {
+  it('normalizes create_task control JSON into a proposal confirmation action', async () => {
     stubDeepSeekContent(JSON.stringify({ kind: 'create_task' }));
     const adapter = new DeepSeekManagerAdapter({ kind: 'deepseek' }, { DEEPSEEK_API_KEY: 'test-key' });
 
@@ -77,34 +77,72 @@ describe('DeepSeekManagerAdapter', () => {
       config: makeConfig(),
     });
 
-    expect(result.kind).toBe('clarify');
-    expect(result.markdown).toContain('Reply `create task`');
-    expect(result.markdown).not.toContain('"kind"');
+    expect(result.kind).toBe('confirm_pending_proposal');
   });
 
-  it('normalizes malformed task chat route JSON into a clarify route', () => {
-    const result = taskChatRouteFromContent('not json');
-
-    expect(result.action).toBe('clarify');
-    expect(result.confidence).toBe(0);
-    expect(result.reason).toContain('not valid JSON');
-  });
-
-  it('normalizes invalid task chat actions while preserving safe fields', () => {
-    const result = taskChatRouteFromContent(JSON.stringify({
-      action: 'launch_missiles',
-      confidence: 99,
-      reason: 'bad action',
-      replyMarkdown: 'please clarify',
-      actionArgs: {
-        difficulty: 'medium',
-        artifact: 'revised-plan',
+  it('uses Chinese fallback fields for incomplete control-chat proposals', async () => {
+    stubDeepSeekContent(JSON.stringify({
+      kind: 'proposal',
+      proposal: {
+        title: 'Lark proposal flow',
+        task: 'Implement the proposal flow.',
       },
     }));
+    const adapter = new DeepSeekManagerAdapter({ kind: 'deepseek' }, { DEEPSEEK_API_KEY: 'test-key' });
 
-    expect(result.action).toBe('clarify');
-    expect(result.confidence).toBe(1);
-    expect(result.replyMarkdown).toBe('please clarify');
-    expect(result.actionArgs).toEqual({ difficulty: 'medium', artifact: 'revised-plan' });
+    const result = await adapter.handleControlChat({
+      message: 'Implement the proposal flow',
+      mode: 'message',
+      projectContext: '',
+      config: makeConfig(),
+    });
+
+    expect(result.kind).toBe('proposal');
+    if (result.kind !== 'proposal') return;
+    expect(result.proposal.interpretedIntent).toContain('整理成一个可能的 Manager workflow 任务');
+    expect(result.proposal.wouldDo.join('\n')).toContain('在你确认后');
+    expect(result.proposal.wouldNotDo.join('\n')).toContain('不会在你确认前');
+    expect(result.proposal.suggestedNextAction).toContain('创建任务');
   });
+
+  it('instructs control chat to keep user-facing output Chinese even for English prompts', async () => {
+    let requestBody: Record<string, unknown> | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      requestBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({ kind: 'answer', markdown: '好的。' }) } }],
+      }), { status: 200 });
+    }));
+    const adapter = new DeepSeekManagerAdapter({ kind: 'deepseek' }, { DEEPSEEK_API_KEY: 'test-key' });
+
+    await adapter.handleControlChat({
+      message: 'Based on this spec, create a task proposal',
+      mode: 'message',
+      projectContext: '',
+      config: makeConfig(),
+    });
+
+    const messages = requestBody?.messages as Array<{ role: string; content: string }> | undefined;
+    const system = messages?.[0]?.content ?? '';
+    expect(system).toContain('默认使用简体中文回复');
+    expect(system).toContain('即使用户消息、prompt 或规格文档是英文');
+    expect(system).toContain('不要输出 "Based on your detailed specification"');
+  });
+
+  it('keeps workflow directives in the Architect prompt builder', () => {
+    const prompt = buildInitialPlanPrompt({
+      task: '# Task\n\nOriginal user prompt.',
+      projectContext: 'Project context.',
+      brief: 'Manager brief.',
+      difficulty: 'high',
+      state: {
+        requestedChanges: ['Use the original user prompt verbatim as the source of truth.'],
+      },
+    });
+
+    expect(prompt).toContain('User workflow directives and requested changes');
+    expect(prompt).toContain('Use the original user prompt verbatim');
+    expect(prompt).toContain('follow the user workflow directives');
+  });
+
 });

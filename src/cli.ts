@@ -35,6 +35,8 @@ const ARTIFACT_NAMES: ArtifactName[] = [
   'git-post-diff',
   'test-build-log',
   'final-review',
+  'agent-prompts',
+  'agent-prompt-preview',
   'final-report',
 ];
 

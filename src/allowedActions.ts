@@ -3,7 +3,7 @@ import type { AllowedAction, WorkflowStatus } from './types.js';
 const ASK_STATUS_SUMMARY: AllowedAction[] = [
   { id: 'status', description: '查看当前任务状态。' },
   { id: 'summary', description: '总结当前任务和最近产物。' },
-  { id: 'ask', description: '询问当前任务、计划、风险、实现或产物。' },
+  { id: 'ask', description: '询问当前任务、计划、风险、实现、产物，或请求查看/发送某个 artifact。' },
 ];
 
 const STOP: AllowedAction = { id: 'stop', description: '停止当前任务。' };
@@ -12,7 +12,8 @@ export function getAllowedActions(state: { status: WorkflowStatus }): AllowedAct
   switch (state.status) {
     case 'awaiting_brief_confirmation':
       return [
-        { id: 'approve', description: '确认 brief，进入难度选择。' },
+        { id: 'approve', description: '确认 brief，进入难度选择；可以附带给后续 agent 的执行约束或原文使用要求。' },
+        { id: 'difficulty', description: '确认 brief 并直接选择 low、medium 或 high 难度；可以附带给后续 agent 的执行约束。' },
         { id: 'revise', description: '指出 brief 中需要修正的地方。' },
         { id: 'reject', description: '拒绝 brief 并停止任务。' },
         STOP,
@@ -20,14 +21,14 @@ export function getAllowedActions(state: { status: WorkflowStatus }): AllowedAct
       ];
     case 'awaiting_difficulty_selection':
       return [
-        { id: 'difficulty', description: '选择 low、medium 或 high 难度。' },
+        { id: 'difficulty', description: '选择 low、medium 或 high 难度；可以附带给后续 agent 的执行约束。' },
         STOP,
         ...ASK_STATUS_SUMMARY,
       ];
     case 'ready_for_decision':
     case 'waiting_user_direction':
       return [
-        { id: 'approve', description: '批准当前方案并继续推进。' },
+        { id: 'approve', description: '批准当前方案并继续推进；可以附带后续实现约束。' },
         { id: 'revise', description: '提出修改意见，回到规划阶段。' },
         { id: 'reject', description: '拒绝当前方案并停止任务。' },
         STOP,

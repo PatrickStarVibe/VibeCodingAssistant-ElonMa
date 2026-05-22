@@ -7,13 +7,14 @@ import { describe, expect, it } from 'vitest';
 import { ArtifactStore } from '../src/artifacts.js';
 import type { HeavyAgentAdapter, ManagerAdapter } from '../src/adapters.js';
 import { ManagerConversationService, parseTaskRequest } from '../src/conversation.js';
-import type { ControlChatResult, IntentResult, ManagerConfig, ManagerRouteResult, ManagerTextResult, PlanResult, TaskChatRouteResult, TaskProposal, WorkflowDifficulty } from '../src/types.js';
+import type { ControlChatResult, IntentResult, ManagerConfig, ManagerRouteResult, ManagerTextResult, PlanResult, TaskProposal, WorkflowDifficulty } from '../src/types.js';
 import { WorkflowService } from '../src/workflow.js';
 
 class FakeManager implements ManagerAdapter {
   controlProjectContexts: string[] = [];
+  composeInputs: string[] = [];
+  prefixComposedReplies = false;
   intents: IntentResult[] = [];
-  taskRoutes: TaskChatRouteResult[] = [];
 
   async createTaskBrief(): Promise<ManagerTextResult> {
     return { markdown: 'brief', needsUserDecision: false };
@@ -49,18 +50,8 @@ class FakeManager implements ManagerAdapter {
   }
 
   async composeReply(input: { rawMessage: string }): Promise<{ text: string }> {
-    return { text: input.rawMessage };
-  }
-
-  async routeTaskChat(input: { message: string; state: { status: string } }): Promise<TaskChatRouteResult> {
-    const route = this.taskRoutes.shift();
-    if (route) return route;
-    return {
-      action: 'reply_only',
-      confidence: 0.9,
-      reason: `test fallback for ${input.message}`,
-      replyMarkdown: `我在。当前状态：${input.state.status}`,
-    };
+    this.composeInputs.push(input.rawMessage);
+    return { text: this.prefixComposedReplies ? `COMPOSED: ${input.rawMessage}` : input.rawMessage };
   }
 
   async handleControlChat(input: {
@@ -80,22 +71,22 @@ class FakeManager implements ManagerAdapter {
       };
     }
     if (/prompt|不要执行|先不要创建\s*task/.test(input.message)) {
-      return { kind: 'answer', markdown: `prompt draft: ${input.message}` };
+      return { kind: 'answer', markdown: `prompt 草稿：${input.message}` };
     }
     if (/^(帮我|请|实现|检查|修复)/.test(input.message)) {
       return {
         kind: 'proposal',
         proposal: {
-          interpretedIntent: `intent: ${input.message}`,
+          interpretedIntent: `理解为：${input.message}`,
           title: input.message.slice(0, 40),
-          task: `Task prompt: ${input.message}`,
-          wouldDo: ['Create a workflow task after confirmation.'],
-          wouldNotDo: ['Start the workflow before confirmation.'],
-          suggestedNextAction: 'Reply create task, edit: <instruction>, or cancel.',
+          task: `任务内容：${input.message}`,
+          wouldDo: ['在你确认后创建 workflow 任务。'],
+          wouldNotDo: ['不会在你确认前启动 workflow。'],
+          suggestedNextAction: '可以说「创建任务」确认，或继续补充修改。',
         },
       };
     }
-    return { kind: 'answer', markdown: `chat answer: ${input.message}` };
+    return { kind: 'answer', markdown: `聊天回复：${input.message}` };
   }
 
   async routeAfterFinalReview(): Promise<ManagerRouteResult> {
@@ -175,7 +166,7 @@ function makeConfig(targetDir: string): ManagerConfig {
       },
       high: {
         architect: 'reviewer',
-        planReviewer: 'reviewer',
+        planReviewer: 'planner',
         developer: 'implementer',
         finalReviewer: 'finalReviewer',
       },
@@ -241,7 +232,7 @@ describe('ManagerConversationService', () => {
 
       const status = await service.routeTaskMessage(created.state.taskId, 'status');
       expect(status.kind).toBe('reply');
-      if (status.kind === 'reply') expect(status.messages[0]?.text).toContain('Status: created');
+      if (status.kind === 'reply') expect(status.messages[0]?.text).toContain('任务已创建');
 
       const question = await service.routeTaskMessage(created.state.taskId, '这个方案风险最大在哪里？');
       expect(question.kind).toBe('reply');
@@ -292,6 +283,113 @@ describe('ManagerConversationService', () => {
         const result = await turn.run();
         expect(result.state.status).toBe('awaiting_difficulty_selection');
       }
+    } finally {
+      await cleanup([root, targetDir]);
+    }
+  });
+
+  it('lets the classifier request any task artifact from natural language', async () => {
+    const { root, targetDir, service, manager } = await makeConversation();
+    try {
+      const created = await service.createTask({ title: 'Prompt preview task', task: 'Original user prompt.' });
+      await service.startBrief(created.state.taskId).run();
+      manager.intents.push({
+        intent: 'ask',
+        artifact: 'agent-prompt-preview',
+        confidence: 0.95,
+        requiresClarification: false,
+        userFacingInterpretation: '用户想查看准备发给 Architect 的 prompt。',
+      });
+
+      const turn = await service.routeTaskMessage(created.state.taskId, '把准备发给 Architect 的 prompt 发给我');
+
+      expect(turn.kind).toBe('reply');
+      if (turn.kind === 'reply') {
+        expect(turn.messages[0]?.files?.[0]?.name).toBe('agent-prompt-preview.md');
+        expect(turn.messages[0]?.text).toContain('Agent Prompt Preview');
+      }
+    } finally {
+      await cleanup([root, targetDir]);
+    }
+  });
+
+  it('preserves generic workflow instructions when approving through the brief gate', async () => {
+    const { root, targetDir, service, manager, store } = await makeConversation();
+    try {
+      const created = await service.createTask({ title: 'Original prompt task', task: 'Original user prompt.' });
+      await service.startBrief(created.state.taskId).run();
+      manager.intents.push({
+        intent: 'approve',
+        instruction: 'Use the original user prompt verbatim as the Architect source of truth.',
+        confidence: 0.95,
+        requiresClarification: false,
+        userFacingInterpretation: '按你的要求，后续 agent 以原始 prompt 为准。',
+      });
+
+      const turn = await service.routeTaskMessage(created.state.taskId, '直接把我的 prompt 原封不动给 Architect');
+
+      expect(turn.kind).toBe('background');
+      if (turn.kind === 'background') {
+        const result = await turn.run();
+        expect(result.state.status).toBe('awaiting_difficulty_selection');
+      }
+      const state = await store.loadState(created.state.taskId);
+      expect(state.requestedChanges).toContain('Use the original user prompt verbatim as the Architect source of truth.');
+    } finally {
+      await cleanup([root, targetDir]);
+    }
+  });
+
+  it('can confirm the brief, choose difficulty, and carry instructions in one classified action', async () => {
+    const { root, targetDir, service, manager, store } = await makeConversation();
+    try {
+      const created = await service.createTask({ title: 'Combined gate task', task: 'Original user prompt.' });
+      await service.startBrief(created.state.taskId).run();
+      manager.intents.push({
+        intent: 'difficulty',
+        difficulty: 'high',
+        instruction: 'Do not rewrite the original prompt; use it as the planning input.',
+        confidence: 0.95,
+        requiresClarification: false,
+        userFacingInterpretation: '确认 brief，并选择高难度继续。',
+      });
+
+      const turn = await service.routeTaskMessage(created.state.taskId, '高难度，直接用我的原 prompt');
+
+      expect(turn.kind).toBe('background');
+      if (turn.kind === 'background') {
+        const result = await turn.run();
+        expect(result.state.status).toBe('ready_for_decision');
+        expect(result.state.difficulty).toBe('high');
+      }
+      const state = await store.loadState(created.state.taskId);
+      expect(state.requestedChanges).toContain('Do not rewrite the original prompt; use it as the planning input.');
+    } finally {
+      await cleanup([root, targetDir]);
+    }
+  });
+
+  it('composes task background acknowledgements instead of sending raw classifier text', async () => {
+    const { root, targetDir, service, manager } = await makeConversation();
+    try {
+      const created = await service.createTask({ title: 'Composed acknowledgement task', task: 'Build the chat bridge.' });
+      await service.startBrief(created.state.taskId).run();
+      manager.prefixComposedReplies = true;
+      manager.intents.push({
+        intent: 'approve',
+        confidence: 0.95,
+        requiresClarification: false,
+        userFacingInterpretation: 'User explicitly selected approve.',
+      });
+
+      const turn = await service.routeTaskMessage(created.state.taskId, '同意继续');
+
+      expect(turn.kind).toBe('background');
+      if (turn.kind === 'background') {
+        expect(turn.startedMessage.text).toContain('COMPOSED:');
+        expect(turn.startedMessage.text).toContain('workflow gate');
+      }
+      expect(manager.composeInputs.at(-1)).toContain('User explicitly selected approve.');
     } finally {
       await cleanup([root, targetDir]);
     }

@@ -20,10 +20,12 @@ describe('workflow role config', () => {
     });
     expect(config.workflowRoles.high).toEqual({
       architect: 'claude-architect',
-      planReviewer: 'claude-plan-reviewer',
+      planReviewer: 'codex-plan-reviewer',
       developer: 'codex-developer',
       finalReviewer: 'claude-final-reviewer',
     });
+    expect(config.profiles[config.workflowRoles.high.architect]?.kind).toBe('claude');
+    expect(config.profiles[config.workflowRoles.high.planReviewer]?.kind).toBe('codex');
   });
 
   it('lets each difficulty role point at a different profile', () => {

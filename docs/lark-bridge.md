@@ -13,6 +13,12 @@ The bridge keeps two responsibilities separate:
 
 Every bound task-chat message is stripped of Lark mention tokens first, so `@bot 同意` and `同意` are equivalent. The classifier receives the current state and the allowed actions for that state; if the interpreted intent is not allowed, the bridge asks for clarification and does not mutate workflow state.
 
+Mentioning the bot is optional inside Manager code. If a non-mention group
+message does not appear in `logs/ai-workflow/lark-inbound.jsonl`, Lark did not
+deliver that message event to the local bridge. In that case, check the Lark app
+event subscription and message-read permissions for group chats; until Lark
+delivers those events, using `@bot` is the platform-side fallback.
+
 Workflow gates remain unchanged: brief confirmation, difficulty selection, plan approval, final review routing, and user acceptance.
 
 ## Setup
@@ -126,9 +132,12 @@ Inside the task chat, reply naturally:
 这个方案最大的风险在哪里？
 验收通过
 /show revised-plan
+/show agent-prompts
 ```
 
 `/show <artifact>` remains an explicit command because it retrieves a file. Other task-chat messages, including status checks, summaries, stop requests, approvals, revisions, difficulty choices, notes, and acceptance, go through LLM intent classification.
+Use `/show agent-prompts` when you need to inspect the exact prompt Manager sent to Codex or Claude. The bridge does not auto-send that artifact on every state notification, and it is not included in the normal intent-classification context.
+The classifier is allowed to request artifacts and attach workflow instructions to legal state transitions. For example, a user can ask naturally to see the pending Architect prompt, or approve while saying that the original prompt must be used verbatim; the state machine still verifies whether the current stage can move forward.
 
 Task chats are conversational by default. Natural-language questions such as
 `这个 plan 是什么意思？`, `A 和 B 有什么区别？`, `帮我解释这个 plan`, or
@@ -165,6 +174,6 @@ Manager task artifacts still live at:
 logs/ai-workflow/runs/<task-id>/
 ```
 
-When a task reaches brief, decision, user-direction, user-acceptance, completed, or stopped states, the bridge sends a short Chinese-first message and attaches the relevant Markdown artifact.
+When a task reaches brief, decision, user-direction, user-acceptance, completed, or stopped states, the bridge sends a short Chinese-first message and attaches the relevant Markdown artifact. While a background job is running, the watcher does not send separate state notifications or duplicate artifacts; the job completion path is the single user-visible result for that state change.
 
 The bridge records a reminder hash per task. If the status and pending prompt have already been sent, the watcher suppresses the duplicate full pending notification instead of repeating the same block.

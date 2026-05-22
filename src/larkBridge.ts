@@ -11,7 +11,8 @@ import {
   renderTaskProposal,
   type OutboundMessage,
 } from './conversation.js';
-import type { ManagerConfig, TaskProposal } from './types.js';
+import { humanStageName } from './allowedActions.js';
+import type { ManagerConfig, TaskProposal, TaskState } from './types.js';
 import { findProject, getDefaultProjectId, renderProjectList, requireProject } from './projects.js';
 import type { WorkflowResult } from './workflow.js';
 import {
@@ -141,23 +142,6 @@ export class LarkBridge {
       return;
     }
 
-    const proposalReply = parseProposalReply(message.text);
-    if (proposalReply?.kind === 'confirm') {
-      await this.auditInbound(message, { action: 'confirm_pending_proposal', outcome: 'proposal_reply' });
-      await this.confirmPendingProposal(message, pendingProposal);
-      return;
-    }
-    if (proposalReply?.kind === 'edit') {
-      await this.auditInbound(message, { action: 'edit_pending_proposal', outcome: 'proposal_reply' });
-      await this.editPendingProposal(message, pendingProposal, proposalReply.instruction);
-      return;
-    }
-    if (proposalReply?.kind === 'cancel') {
-      await this.auditInbound(message, { action: 'cancel_pending_proposal', outcome: 'proposal_reply' });
-      await this.cancelPendingProposal(message.chatId, pendingProposal);
-      return;
-    }
-
     await this.auditInbound(message, { action: 'control_chat', outcome: 'control_chat' });
     await this.handleControlChatMessage(message, pendingProposal, current.activeProjectIdByChatId[message.chatId]);
   }
@@ -174,6 +158,8 @@ export class LarkBridge {
         state.runningJobsByTaskId[binding.taskId] = { ...running, lastNotifiedAt: now.toISOString() };
         await this.saveState(state);
       }
+      if (running) continue;
+
       const alreadyNotified = state.notifiedStatusByTaskId[binding.taskId] === taskState.status;
       const reminderHash = pendingReminderHash(taskState);
       const sameReminder = reminderHash && state.lastReminderHashByTaskId[binding.taskId] === reminderHash;
@@ -266,11 +252,9 @@ export class LarkBridge {
       return;
     }
     await this.sendText(chatId, [
-      `There is no active task in this chat for ${command}.`,
-      `这个聊天里没有当前 task，无法执行 ${command}。`,
+      `这个聊天里没有正在绑定的 task，无法执行 ${command}。`,
       '',
-      'To create a task directly, use: create task: <task>',
-      '直接创建任务：create task: <任务>',
+      '如果要直接创建任务，可以用命令：create task: <任务内容>',
     ].join('\n'), { action: command });
   }
 
@@ -285,6 +269,14 @@ export class LarkBridge {
       await this.sendOutbound(message.chatId, turn.message);
       return;
     }
+    if (turn.kind === 'confirm_pending_proposal') {
+      await this.confirmPendingProposal(message, pendingProposal, turn.message);
+      return;
+    }
+    if (turn.kind === 'cancel_pending_proposal') {
+      await this.cancelPendingProposal(message.chatId, pendingProposal, turn.message);
+      return;
+    }
 
     const state = await this.loadState();
     state.pendingProposalsByChatId[message.chatId] = makePendingProposal(turn.proposal, message);
@@ -295,9 +287,10 @@ export class LarkBridge {
   private async confirmPendingProposal(
     message: LarkIncomingMessage,
     pendingProposal: LarkPendingTaskProposal | undefined,
+    fallbackMessage?: OutboundMessage,
   ): Promise<void> {
     if (!pendingProposal) {
-      await this.sendText(message.chatId, noPendingProposalMessage('There is no pending proposal to create.'), { action: 'confirm_pending_proposal_missing' });
+      await this.sendOutbound(message.chatId, fallbackMessage ?? { text: noPendingProposalMessage('我这边没有正在等待确认的任务草案，所以没有创建任务。') });
       return;
     }
 
@@ -307,45 +300,20 @@ export class LarkBridge {
     await this.createTaskFromMessage(message, { title: pendingProposal.title, task: pendingProposal.task });
   }
 
-  private async editPendingProposal(
-    message: LarkIncomingMessage,
-    pendingProposal: LarkPendingTaskProposal | undefined,
-    instruction: string,
-  ): Promise<void> {
-    if (!pendingProposal) {
-      await this.sendText(message.chatId, noPendingProposalMessage('There is no pending proposal to edit.'), { action: 'edit_pending_proposal_missing' });
-      return;
-    }
-
-    const state = await this.loadState();
-    const projectId = detectMentionedProjectId(this.config, instruction)
-      ?? state.activeProjectIdByChatId[message.chatId]
-      ?? getDefaultProjectId(this.config);
-    const turn = await this.conversation.reviseControlProposal(instruction, pendingProposal, projectId);
-    if (turn.kind === 'reply') {
-      await this.sendOutbound(message.chatId, turn.message);
-      return;
-    }
-
-    const nextState = await this.loadState();
-    nextState.pendingProposalsByChatId[message.chatId] = makePendingProposal(turn.proposal, message, pendingProposal.originalMessage);
-    await this.saveState(nextState);
-    await this.sendOutbound(message.chatId, turn.message);
-  }
-
   private async cancelPendingProposal(
     chatId: string,
     pendingProposal: LarkPendingTaskProposal | undefined,
+    fallbackMessage?: OutboundMessage,
   ): Promise<void> {
     if (!pendingProposal) {
-      await this.sendText(chatId, noPendingProposalMessage('There is no pending proposal to cancel.'), { action: 'cancel_pending_proposal_missing' });
+      await this.sendOutbound(chatId, fallbackMessage ?? { text: noPendingProposalMessage('我这边没有正在等待处理的任务草案。') });
       return;
     }
 
     const state = await this.loadState();
     delete state.pendingProposalsByChatId[chatId];
     await this.saveState(state);
-    await this.sendText(chatId, 'Canceled the pending task proposal. No task was created.', { action: 'cancel_pending_proposal' });
+    await this.sendOutbound(chatId, fallbackMessage ?? { text: '已取消这份任务草案，没有创建任务。' });
   }
 
   private async createTaskFromMessage(
@@ -367,8 +335,8 @@ export class LarkBridge {
     } catch (error) {
       if (!allowFallbackToCurrentChat) {
         await this.sendText(message.chatId, [
-          'Task created, but creating a separate Lark chat failed. This chat remains bound to the current task.',
-          `Task ID: ${created.state.taskId}`,
+          '任务已创建，但单独创建 Lark 群失败；当前聊天会继续绑定这个 task。',
+          `任务 ID：${created.state.taskId}`,
           error instanceof Error ? error.message : String(error),
         ].join('\n'), { action: 'create_task_chat_failed' });
         return;
@@ -388,8 +356,8 @@ export class LarkBridge {
     await this.saveState(state);
 
     await this.sendText(taskChatId, [
-      `已创建 task: ${created.state.title}`,
-      `Task ID: ${created.state.taskId}`,
+      `任务已创建：${created.state.title}`,
+      `任务 ID：${created.state.taskId}`,
       '我开始生成 brief，跑完通知你。',
     ].join('\n'), { taskId: created.state.taskId, action: 'task_created' });
 
@@ -452,11 +420,11 @@ export class LarkBridge {
     if (command.kind === 'status') {
       const activeProjectId = state.activeProjectIdByChatId[message.chatId] ?? getDefaultProjectId(this.config);
       const active = requireProject(this.config, activeProjectId);
-      const taskLine = boundTaskId ? `Bound task: ${boundTaskId}` : 'Bound task: none';
+      const taskLine = boundTaskId ? `已绑定 task：${boundTaskId}` : '已绑定 task：无';
       await this.sendText(message.chatId, [
-        `Active project: ${active.name} (${active.id})`,
-        `Target workspace: ${active.targetDir}`,
-        `Docs folder: ${active.docsDir}`,
+        `当前项目：${active.name} (${active.id})`,
+        `目标工作区：${active.targetDir}`,
+        `文档目录：${active.docsDir}`,
         taskLine,
       ].join('\n'), { action: 'project_status' });
       return;
@@ -464,22 +432,22 @@ export class LarkBridge {
     if (command.kind === 'none') {
       delete state.activeProjectIdByChatId[message.chatId];
       await this.saveState(state);
-      await this.sendText(message.chatId, `Project selection cleared. New tasks will use default project: ${getDefaultProjectId(this.config)}`, { action: 'project_none' });
+      await this.sendText(message.chatId, `已清除项目选择。新任务会使用默认项目：${getDefaultProjectId(this.config)}`, { action: 'project_none' });
       return;
     }
 
     const project = findProject(this.config, command.projectId);
     if (!project) {
       await this.sendText(message.chatId, [
-        `Unknown project: ${command.projectId}`,
-        'Available projects:',
+        `未知项目：${command.projectId}`,
+        '可用项目：',
         renderProjectList(this.config, state.activeProjectIdByChatId[message.chatId]),
       ].join('\n'), { action: 'project_unknown' });
       return;
     }
     state.activeProjectIdByChatId[message.chatId] = project.id;
     await this.saveState(state);
-    await this.sendText(message.chatId, `Active project set to ${project.name} (${project.id}).`, { action: 'project_use' });
+    await this.sendText(message.chatId, `当前项目已切换为 ${project.name} (${project.id})。`, { action: 'project_use' });
   }
 
   private async sendOutbound(chatId: string, outbound: OutboundMessage): Promise<void> {
@@ -588,7 +556,7 @@ function errorMessage(error: unknown): string {
 }
 
 function renderRunningReminder(
-  taskState: { title: string; taskId: string; status: string },
+  taskState: Pick<TaskState, 'title' | 'taskId' | 'status'>,
   job: { label: string; startedAt: string },
   now: Date,
 ): string {
@@ -596,22 +564,17 @@ function renderRunningReminder(
   const elapsedMinutes = Number.isNaN(started) ? undefined : Math.max(1, Math.floor((now.getTime() - started) / 60000));
   return [
     `我还在处理这个 task：${taskState.title}`,
-    `Task ID: ${taskState.taskId}`,
+    `任务 ID：${taskState.taskId}`,
     `当前步骤：${job.label}`,
-    `当前状态：${taskState.status}`,
+    `当前阶段：${humanStageName(taskState.status)}`,
     elapsedMinutes ? `已经运行约 ${elapsedMinutes} 分钟。` : undefined,
-    '跑完这一阶段我会继续发结果。你也可以发 status / summary / ask: <问题>。',
+    '跑完这一阶段我会继续发结果。你也可以直接问我进度或问题。',
   ].filter(Boolean).join('\n');
 }
 
 function unique(values: string[]): string[] {
   return [...new Set(values.filter((value) => value.trim().length > 0))];
 }
-
-type ProposalReply =
-  | { kind: 'confirm' }
-  | { kind: 'edit'; instruction: string }
-  | { kind: 'cancel' };
 
 type ProjectCommand =
   | { kind: 'list' }
@@ -640,28 +603,6 @@ function detectMentionedProjectId(config: ManagerConfig, text: string): string |
   })?.id;
 }
 
-function parseProposalReply(text: string): ProposalReply | undefined {
-  const trimmed = text.trim();
-  const normalized = trimmed.toLocaleLowerCase();
-  if (isProposalConfirmReply(normalized)) {
-    return { kind: 'confirm' };
-  }
-  const edit = trimmed.match(/^edit\s*:\s*([\s\S]+)$/i);
-  if (edit?.[1]?.trim()) return { kind: 'edit', instruction: edit[1].trim() };
-  if (normalized === 'cancel' || normalized === 'no') return { kind: 'cancel' };
-  return undefined;
-}
-
-function isProposalConfirmReply(normalized: string): boolean {
-  if (normalized === 'create task' || normalized === 'yes create' || normalized === 'confirm') return true;
-  if (/^create\s+task\s*[:：]/i.test(normalized)) return false;
-  return [
-    /(^|[^\p{L}\p{N}_])create\s+task(?=$|[^\p{L}\p{N}_:：])/u,
-    /(^|[^\p{L}\p{N}_])yes\s+create(?=$|[^\p{L}\p{N}_:：])/u,
-    /(^|[^\p{L}\p{N}_])confirm(?=$|[^\p{L}\p{N}_:：])/u,
-  ].some((pattern) => pattern.test(normalized));
-}
-
 function makePendingProposal(
   proposal: TaskProposal,
   message: LarkIncomingMessage,
@@ -678,51 +619,41 @@ function makePendingProposal(
 function noPendingProposalMessage(reason: string): string {
   return [
     reason,
-    'No task was created.',
+    '没有创建任务。',
     '',
-    'You can ask normally, or start a direct task with: create task: <task>',
+    '你可以继续正常提问；如果要直接创建任务，请用：create task: <任务内容>',
   ].join('\n');
 }
 
 function renderControlStatus(command: 'status' | 'summary', proposal: LarkPendingTaskProposal): string {
-  const prefix = command === 'summary' ? 'Control chat summary:' : 'Control chat status:';
+  const prefix = command === 'summary' ? '控制聊天总结：' : '控制聊天状态：';
   return [
     prefix,
-    'No workflow task is active in this chat.',
+    '当前聊天没有绑定正在运行的 workflow task。',
     '',
-    'Pending task proposal:',
+    '待确认的任务草案：',
     renderTaskProposal(proposal),
     '',
-    'Available replies:',
-    '- create task',
-    '- edit: <instruction>',
-    '- cancel',
+    '可继续这样说：',
+    '- 创建任务',
+    '- 修改：<说明>',
+    '- 取消',
   ].join('\n');
 }
 
 function renderControlHelp(pendingProposal?: LarkPendingTaskProposal): string {
   return [
-    'Manager Lark commands:',
-    '- create task: <task>: directly create a new task',
-    '- /create <task>: directly create a new task',
-    '- new task: <task>: directly create a new task',
-    '- create task / yes create / confirm: create from the pending proposal',
-    '- edit: <instruction>: revise the pending proposal',
-    '- cancel: clear the pending proposal',
-    '- status / summary: available inside a task chat',
-    '- stop: stops a bound task; this chat has no task to stop',
-    pendingProposal ? '' : undefined,
-    pendingProposal ? 'Current pending proposal:' : undefined,
-    pendingProposal ? `- ${pendingProposal.title}` : undefined,
-    '',
-    'Manager 飞书命令：',
-    '- create task: <任务>：直接创建新 task',
-    '- /create <任务>：直接创建新 task',
-    '- new task: <任务>：直接创建新 task',
-    '- create task / yes create / confirm：确认当前 proposal 并创建 task',
-    '- edit: <说明>：修改当前 proposal',
-    '- cancel：取消当前 proposal',
+    'Elon Ma 飞书用法：',
+    '- create task: <任务内容>：直接创建新 task',
+    '- /create <任务内容>：直接创建新 task',
+    '- new task: <任务内容>：直接创建新 task',
+    '- 创建任务 / create task / confirm：确认当前任务草案',
+    '- 修改：<说明> / edit: <instruction>：修改当前任务草案',
+    '- 取消 / cancel：取消当前任务草案',
     '- status / summary：在 task 聊天里查看当前 task',
     '- stop：停止已绑定的 task；当前聊天没有可停止的 task',
+    pendingProposal ? '' : undefined,
+    pendingProposal ? '当前待确认的任务草案：' : undefined,
+    pendingProposal ? `- ${pendingProposal.title}` : undefined,
   ].filter(Boolean).join('\n');
 }

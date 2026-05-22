@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vitest';
 import { ArtifactStore } from '../src/artifacts.js';
 import type { HeavyAgentAdapter, ManagerAdapter } from '../src/adapters.js';
 import type {
+  AgentPromptRecord,
   ControlChatResult,
   FinalReviewResult,
   IntentResult,
@@ -16,9 +17,9 @@ import type {
   ManagerRouteResult,
   ManagerTextResult,
   PlanResult,
-  TaskChatRouteResult,
   TaskProposal,
   WorkflowDifficulty,
+  WorkflowRoleName,
 } from '../src/types.js';
 import { createHeavyAgentAdapter } from '../src/adapters.js';
 import { WorkflowService, type WorkflowResult } from '../src/workflow.js';
@@ -75,15 +76,6 @@ class FakeManager implements ManagerAdapter {
     return { text: input.rawMessage };
   }
 
-  async routeTaskChat(input: { message: string }): Promise<TaskChatRouteResult> {
-    return {
-      action: 'reply_only',
-      confidence: 0.9,
-      reason: `test fallback for ${input.message}`,
-      replyMarkdown: this.fallbackReply,
-    };
-  }
-
   async handleControlChat(input: { message: string; pendingProposal?: TaskProposal; mode: 'message' | 'edit' }): Promise<ControlChatResult> {
     if (input.mode === 'edit' && input.pendingProposal) {
       return {
@@ -114,43 +106,67 @@ class FakeHeavyAgents implements HeavyAgentAdapter {
   implementationWritePath?: string;
   planPackDraft?: PlanResult['planPackDraft'];
 
-  async createInitialPlan(input: { difficulty: WorkflowDifficulty; projectContext: string }): Promise<PlanResult> {
+  private makePromptRecord(input: { state?: { taskId?: string; difficulty?: WorkflowDifficulty }; difficulty?: WorkflowDifficulty }, role: WorkflowRoleName, prompt: string): AgentPromptRecord {
+    return {
+      taskId: input.state?.taskId ?? 'fake-task',
+      role,
+      difficulty: input.difficulty ?? input.state?.difficulty ?? 'medium',
+      profileName: role === 'developer' ? 'implementer' : role === 'finalReviewer' ? 'finalReviewer' : role === 'planReviewer' ? 'reviewer' : 'planner',
+      profileKind: role === 'finalReviewer' || role === 'planReviewer' ? 'claude' : 'codex',
+      createdAt: '2026-05-22T00:00:00.000Z',
+      prompt,
+    };
+  }
+
+  async createInitialPlan(input: { difficulty: WorkflowDifficulty; projectContext: string; state: { taskId: string } }): Promise<PlanResult> {
     this.difficultyCalls.push(input.difficulty);
     this.initialPlanProjectContexts.push(input.projectContext);
     return {
       markdown: '# Initial Plan\n\n- Build the workflow.\n\n## Verification Commands\n- npm test',
       verificationCommands: ['npm test'],
       ...(this.planPackDraft ? { planPackDraft: this.planPackDraft } : {}),
+      agentPrompt: this.makePromptRecord(input, 'architect', 'fake architect prompt'),
     };
   }
 
-  async reviewPlan(input: { difficulty: WorkflowDifficulty }): Promise<{ markdown: string }> {
+  async reviewPlan(input: { difficulty: WorkflowDifficulty; state: { taskId: string } }): Promise<{ markdown: string; agentPrompt: AgentPromptRecord }> {
     this.reviewerRuns += 1;
     this.difficultyCalls.push(input.difficulty);
-    return { markdown: 'Reviewer says the plan should clarify artifact boundaries.' };
+    return {
+      markdown: 'Reviewer says the plan should clarify artifact boundaries.',
+      agentPrompt: this.makePromptRecord(input, 'planReviewer', 'fake plan reviewer prompt'),
+    };
   }
 
-  async revisePlan(input: { difficulty: WorkflowDifficulty }): Promise<PlanResult> {
+  async revisePlan(input: { difficulty: WorkflowDifficulty; state: { taskId: string } }): Promise<PlanResult> {
     this.difficultyCalls.push(input.difficulty);
     return {
       markdown: '# Revised Plan\n\n- Build the workflow with explicit artifact boundaries.\n\n## Verification Commands\n- npm test\n- node unsafe.js',
       verificationCommands: ['npm test', 'node unsafe.js'],
       ...(this.planPackDraft ? { planPackDraft: this.planPackDraft } : {}),
+      agentPrompt: this.makePromptRecord(input, 'architect', 'fake revised architect prompt'),
     };
   }
 
-  async implement(input: { projectContext: string }): Promise<{ markdown: string; changedFiles: string[] }> {
+  async implement(input: { projectContext: string; state: { taskId: string; difficulty?: WorkflowDifficulty } }): Promise<{ markdown: string; changedFiles: string[]; agentPrompt: AgentPromptRecord }> {
     this.implementRuns += 1;
     this.implementationProjectContexts.push(input.projectContext);
     if (this.implementationWritePath) {
       await writeFile(this.implementationWritePath, 'implementation output\n', 'utf8');
     }
-    return { markdown: this.implementationMarkdown, changedFiles: ['implementation.txt'] };
+    return {
+      markdown: this.implementationMarkdown,
+      changedFiles: ['implementation.txt'],
+      agentPrompt: this.makePromptRecord(input, 'developer', 'fake developer prompt'),
+    };
   }
 
-  async finalReview(): Promise<FinalReviewResult> {
+  async finalReview(input: { state: { taskId: string; difficulty?: WorkflowDifficulty } }): Promise<FinalReviewResult> {
     this.finalReviewRuns += 1;
-    return this.finalReviewResult;
+    return {
+      ...this.finalReviewResult,
+      agentPrompt: this.makePromptRecord(input, 'finalReviewer', 'fake final reviewer prompt'),
+    };
   }
 }
 
@@ -195,7 +211,7 @@ function makeConfig(targetDir: string): ManagerConfig {
       },
       high: {
         architect: 'reviewer',
-        planReviewer: 'reviewer',
+        planReviewer: 'planner',
         developer: 'implementer',
         finalReviewer: 'finalReviewer',
       },
@@ -296,6 +312,11 @@ describe('WorkflowService', () => {
       expect(planned.state.reviewerRunCount).toBe(1);
       expect(heavy.reviewerRuns).toBe(1);
       expect(await service.showArtifact(planned.state.taskId, 'revised-plan')).toContain('manager-plan-metadata');
+      const prompts = await service.showArtifact(planned.state.taskId, 'agent-prompts');
+      expect(prompts).toContain('fake architect prompt');
+      expect(prompts).toContain('fake plan reviewer prompt');
+      expect(prompts).toContain('fake revised architect prompt');
+      expect(prompts).toContain('- Role: planReviewer');
     } finally {
       await cleanup([root, targetDir]);
     }
@@ -362,6 +383,11 @@ describe('WorkflowService', () => {
       expect(report).toContain('preexisting.txt');
       expect(await service.showArtifact(accepted.state.taskId, 'test-build-log')).toContain('node unsafe.js');
       expect(await service.showArtifact(accepted.state.taskId, 'test-build-log')).toContain('blocked');
+      const prompts = await service.showArtifact(accepted.state.taskId, 'agent-prompts');
+      expect(prompts).toContain('fake developer prompt');
+      expect(prompts).toContain('fake final reviewer prompt');
+      expect(prompts).toContain('- Role: developer');
+      expect(prompts).toContain('- Role: finalReviewer');
       const taskRecord = await readFile(join(targetDir, 'task', accepted.state.taskId, 'task-record.md'), 'utf8');
       expect(taskRecord).toContain('中文文件读取');
       expect(taskRecord).not.toContain('\u001b[');
