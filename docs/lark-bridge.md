@@ -4,6 +4,17 @@ The Lark bridge turns Manager into a chat-first workflow agent. You chat with
 Manager in Lark; Manager still owns the state machine, artifacts, DeepSeek
 manager calls, and Codex/Claude handoffs.
 
+## Conversation Contract
+
+The bridge keeps two responsibilities separate:
+
+- The workflow state machine owns correctness and gate enforcement.
+- The Manager LLM owns semantic intent classification and Chinese-first reply composition.
+
+Every bound task-chat message is stripped of Lark mention tokens first, so `@bot 同意` and `同意` are equivalent. The classifier receives the current state and the allowed actions for that state; if the interpreted intent is not allowed, the bridge asks for clarification and does not mutate workflow state.
+
+Workflow gates remain unchanged: brief confirmation, difficulty selection, plan approval, final review routing, and user acceptance.
+
 ## Setup
 
 1. Install the official Lark desktop or mobile app.
@@ -64,6 +75,10 @@ In an unbound/control chat, Manager behaves like a chatbot first. Normal
 messages can ask questions, explore an idea, generate a prompt, or refine a
 possible workflow. They do not create real tasks automatically.
 
+General control chat receives retrieved project Markdown context too. If a
+message mentions a configured project id or name, such as `ireader` or
+`IReader`, Manager uses that project when it searches `project-docs/<project>/`.
+
 Task-like messages create a pending proposal instead of a task:
 
 ```text
@@ -104,21 +119,16 @@ creation or proposal confirmation.
 Inside the task chat, reply naturally:
 
 ```text
-A
 同意
-medium
-revise C: keep the MVP smaller
-status
-summary
-/ask 这个方案最大的风险是什么？
+走默认难度
+高难度吧
+这里先别扩大范围
+这个方案最大的风险在哪里？
+验收通过
 /show revised-plan
 ```
 
-`status`, `/status`, `summary`, `/summary`, `help`, `/help`, `stop`, and
-`/stop` are global commands and never create tasks. In a task chat, `status`
-and `summary` use the bound task ID, `help` shows task-specific commands, and
-`stop` routes to Manager's workflow stop handling. In an unbound chat, `stop`
-replies that there is no task to stop.
+`/show <artifact>` remains an explicit command because it retrieves a file. Other task-chat messages, including status checks, summaries, stop requests, approvals, revisions, difficulty choices, notes, and acceptance, go through LLM intent classification.
 
 Task chats are conversational by default. Natural-language questions such as
 `这个 plan 是什么意思？`, `A 和 B 有什么区别？`, `帮我解释这个 plan`, or
@@ -126,9 +136,7 @@ Task chats are conversational by default. Natural-language questions such as
 context. To create a separate task from inside a task chat, use an explicit
 command: `create task: ...`, `new task: ...`, or `/create ...`.
 
-Single-letter replies `A`, `B`, and `C` are treated as decisions only while the
-current task is waiting for an A/B/C-style user decision. In other states, the
-bridge asks for clarification instead of mutating the workflow.
+Single-letter replies are no longer special in production task chats. If the classifier cannot confidently understand a message, or if the intent is not legal for the current gate, the bridge asks for clarification instead of mutating the workflow.
 
 In an unbound chat, `status` and `summary` also show a pending proposal when one
 exists, including the available replies: `create task`, `edit: <instruction>`,
@@ -138,21 +146,7 @@ If there is no pending proposal and you reply `confirm`, `create task`, or
 `edit: ...`, Manager asks for clarification instead of creating or changing
 anything.
 
-If the bridge cannot classify a task-chat message, it asks:
-
-```text
-I'm not sure whether you want to create a new task or ask about the current one. Reply:
-- create task: <task>
-- status
-- summary
-- ask: <question>
-
-我不确定你是想创建新任务，还是想继续问当前任务。请回复：
-- create task: <任务>
-- status
-- summary
-- ask: <问题>
-```
+If the bridge cannot classify a task-chat message, it replies in Chinese and asks for a clearer natural-language decision or question. It does not advance the task until classification is confident and allowed by the current gate.
 
 Every task chat is bound to one explicit task ID. The bridge never uses
 `latest`, so multiple tasks can run in parallel without cross-routing.
@@ -171,6 +165,6 @@ Manager task artifacts still live at:
 logs/ai-workflow/runs/<task-id>/
 ```
 
-When a task reaches brief, decision, user-direction, completed, or stopped
-states, the bridge sends a short message and attaches the relevant Markdown
-artifact.
+When a task reaches brief, decision, user-direction, user-acceptance, completed, or stopped states, the bridge sends a short Chinese-first message and attaches the relevant Markdown artifact.
+
+The bridge records a reminder hash per task. If the status and pending prompt have already been sent, the watcher suppresses the duplicate full pending notification instead of repeating the same block.

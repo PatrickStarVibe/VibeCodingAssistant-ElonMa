@@ -1,0 +1,302 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ireader.local/schemas/task-token-usage.schema.json",
+  "title": "Manager Task Token Usage Ledger",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "taskId",
+    "taskTitle",
+    "createdAt",
+    "updatedAt",
+    "currency",
+    "totals",
+    "rollups",
+    "entries"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "taskId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "taskTitle": {
+      "type": "string",
+      "minLength": 1
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updatedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "currency": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 3,
+      "default": "USD"
+    },
+    "totals": {
+      "$ref": "#/$defs/rollup"
+    },
+    "rollups": {
+      "type": "object",
+      "properties": {
+        "byRole": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/rollup"
+          }
+        },
+        "bySubtask": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/rollup"
+          }
+        },
+        "byStep": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/rollup"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/entry"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "accuracy": {
+      "enum": [
+        "actual",
+        "estimated",
+        "unknown"
+      ]
+    },
+    "role": {
+      "enum": [
+        "manager_planning",
+        "implementation",
+        "review_debug",
+        "verification",
+        "documentation",
+        "delegated_worker",
+        "delegated_explorer",
+        "tooling_api"
+      ]
+    },
+    "tokenCounts": {
+      "type": "object",
+      "properties": {
+        "inputTokens": {
+          "type": "number",
+          "minimum": 0
+        },
+        "outputTokens": {
+          "type": "number",
+          "minimum": 0
+        },
+        "reasoningTokens": {
+          "type": "number",
+          "minimum": 0
+        },
+        "cachedInputTokens": {
+          "type": "number",
+          "minimum": 0
+        },
+        "totalTokens": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "pricingSnapshot": {
+      "type": "object",
+      "properties": {
+        "inputTokenCostPer1K": {
+          "type": "number",
+          "minimum": 0
+        },
+        "outputTokenCostPer1K": {
+          "type": "number",
+          "minimum": 0
+        },
+        "requestBaseCost": {
+          "type": "number",
+          "minimum": 0
+        },
+        "currency": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 3
+        },
+        "source": {
+          "type": "string"
+        },
+        "capturedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false
+    },
+    "cost": {
+      "type": "object",
+      "properties": {
+        "inputCost": {
+          "type": "number",
+          "minimum": 0
+        },
+        "outputCost": {
+          "type": "number",
+          "minimum": 0
+        },
+        "requestCost": {
+          "type": "number",
+          "minimum": 0
+        },
+        "totalCost": {
+          "type": "number",
+          "minimum": 0
+        },
+        "currency": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 3
+        },
+        "source": {
+          "enum": [
+            "provider_billing",
+            "pricing_snapshot",
+            "manual",
+            "unknown"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "rollup": {
+      "type": "object",
+      "properties": {
+        "totalTokens": {
+          "type": "number",
+          "minimum": 0
+        },
+        "inputTokens": {
+          "type": "number",
+          "minimum": 0
+        },
+        "outputTokens": {
+          "type": "number",
+          "minimum": 0
+        },
+        "reasoningTokens": {
+          "type": "number",
+          "minimum": 0
+        },
+        "cachedInputTokens": {
+          "type": "number",
+          "minimum": 0
+        },
+        "knownCost": {
+          "type": "number",
+          "minimum": 0
+        },
+        "costUnknownEntries": {
+          "type": "number",
+          "minimum": 0
+        },
+        "entries": {
+          "type": "number",
+          "minimum": 0
+        },
+        "actualEntries": {
+          "type": "number",
+          "minimum": 0
+        },
+        "estimatedEntries": {
+          "type": "number",
+          "minimum": 0
+        },
+        "unknownEntries": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "entry": {
+      "type": "object",
+      "required": [
+        "subtaskId",
+        "role",
+        "stepId",
+        "stepTitle",
+        "source",
+        "accuracy"
+      ],
+      "properties": {
+        "subtaskId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "$ref": "#/$defs/role"
+        },
+        "stepId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "stepTitle": {
+          "type": "string",
+          "minLength": 1
+        },
+        "provider": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "accuracy": {
+          "$ref": "#/$defs/accuracy"
+        },
+        "startedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "endedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "tokens": {
+          "$ref": "#/$defs/tokenCounts"
+        },
+        "pricingSnapshot": {
+          "$ref": "#/$defs/pricingSnapshot"
+        },
+        "cost": {
+          "$ref": "#/$defs/cost"
+        },
+        "notes": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

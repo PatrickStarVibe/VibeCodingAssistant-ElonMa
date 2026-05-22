@@ -1,5 +1,6 @@
 import { exec } from 'node:child_process';
 
+import { sanitizeTextForArtifact } from './textSanitizer.js';
 import type { VerificationCommandResult } from './types.js';
 
 export function isCommandAllowed(command: string, allowlist: string[]): boolean {
@@ -9,11 +10,20 @@ export function isCommandAllowed(command: string, allowlist: string[]): boolean 
 
 function runAllowedCommand(command: string, cwd: string): Promise<VerificationCommandResult> {
   return new Promise((resolve) => {
-    exec(command, { cwd, maxBuffer: 20 * 1024 * 1024 }, (error, stdout, stderr) => {
+    exec(command, {
+      cwd,
+      env: {
+        ...process.env,
+        FORCE_COLOR: '0',
+        NO_COLOR: '1',
+        PYTHONIOENCODING: 'utf-8',
+      },
+      maxBuffer: 20 * 1024 * 1024,
+    }, (error, stdout, stderr) => {
       resolve({
         command,
         status: error ? 'failed' : 'passed',
-        output: [stdout, stderr].filter(Boolean).join('\n'),
+        output: sanitizeTextForArtifact([stdout, stderr].filter(Boolean).join('\n')),
       });
     });
   });

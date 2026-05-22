@@ -9,6 +9,7 @@
       "name": "IReader",
       "targetDir": "E:/GameDeveloping/IReader/my-reader",
       "docsDir": "project-docs/ireader",
+      "taskRecordRoot": "E:/GameDeveloping/IReader/my-reader/task",
       "alwaysRead": []
     }
   ],

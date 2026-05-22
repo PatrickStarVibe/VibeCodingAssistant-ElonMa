@@ -6,6 +6,7 @@ import { createHeavyAgentAdapter, createManagerAdapter } from './adapters.js';
 import { getDefaultManagerRoot, loadConfig } from './config.js';
 import { getDefaultProjectId, renderProjectList, requireProject } from './projects.js';
 import type { ArtifactName } from './types.js';
+import type { TaskUsageBreakdownKey } from './taskUsage.js';
 import { taskTextFromFile, WorkflowService } from './workflow.js';
 
 interface CliOptions {
@@ -101,6 +102,7 @@ function printHelp(): void {
     '  plan --task latest',
     '  status --task latest',
     '  summary --task latest',
+    '  usage --task latest --by role|subtask|step',
     '  show --task latest --artifact revised-plan',
     '  ask --task latest "question"',
     '  reply --task latest "approve A|A|yes|同意|reject B|B|revise C: ...|stop|status|summary"',
@@ -110,6 +112,12 @@ function printHelp(): void {
     '  --config manager.config.local.json',
     '  --allow-agent-calls',
   ].join('\n'));
+}
+
+function parseUsageBreakdown(value: string | undefined): TaskUsageBreakdownKey | undefined {
+  if (value === undefined) return undefined;
+  if (value === 'role' || value === 'subtask' || value === 'step') return value;
+  throw new Error('usage --by must be one of: role, subtask, step.');
 }
 
 async function makeWorkflow(options: CliOptions): Promise<WorkflowService> {
@@ -172,6 +180,9 @@ async function main(): Promise<void> {
       break;
     case 'summary':
       console.log(await workflow.summary(options.task));
+      break;
+    case 'usage':
+      console.log(await workflow.usage(options.task, parseUsageBreakdown(valueAfter(options.args, '--by'))));
       break;
     case 'show': {
       const artifact = valueAfter(options.args, '--artifact');

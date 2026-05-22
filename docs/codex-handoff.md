@@ -260,3 +260,43 @@ npm run manager -- show --task <task-id> --artifact final-report
 - 不要在 reader 项目里做 `git restore`、`rm -rf` 等破坏操作，除非用户明确指令——本会话已经踩过一次坑（之前 Claude 误删了用户手动加的 obsidian-vault）
 - 不要为了赶进度跳过 brief gate 直接 approve A——brief gate 就是省 token 的关键
 - 不要假设 Codex/Claude/DeepSeek 总返回合法 JSON。如果 artifact 看起来空或乱，先看 state.json 和 background task 的 stdout/stderr
+ 
+## 12. Universal Task Records
+
+Manager writes internal run artifacts under `logs/ai-workflow/runs/<task-id>/`, but human-facing project task docs belong under the configured target project task record root.
+
+Default:
+
+```text
+TASK_RECORD_ROOT = <project.targetDir>/task
+```
+
+IReader:
+
+```text
+E:/GameDeveloping/IReader/my-reader/task
+```
+
+Every task uses:
+
+```text
+task/<task-id>/
+  README.md
+  token-usage.json
+  brief.md
+  plan.md
+  plan-review.md
+  implementation-log.md
+  final-review.md
+  task-record.md
+  subtasks/
+    01-main.md
+```
+
+Single and decomposed tasks use the same parent folder shape. A single task has `subtasks/01-main.md`; a decomposed task has multiple `subtasks/NN-*.md` files. Do not create category folders or put subtasks directly under `task/`.
+
+Category is one metadata field only. Missing or unknown Category becomes `Other`; it never controls folder paths, tests, execution order, or review policy.
+
+Final review success now moves to `awaiting_user_acceptance`. The user must reply `accept` before Manager finalizes `task-record.md` and marks the task `completed`. The user may also reply `note: <observation>` or `revise: <instruction>`.
+
+Token usage questions must be answered from `task/<task-id>/token-usage.json` when present. Use `npm run manager -- usage --task latest --by role` or `npm run task-usage:summarize -- --latest --by step`; do not answer from memory or backfill unverified historical numbers.

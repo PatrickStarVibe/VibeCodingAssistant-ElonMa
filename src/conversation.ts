@@ -2,8 +2,18 @@ import { basename } from 'node:path';
 
 import { ArtifactStore } from './artifacts.js';
 import type { ManagerAdapter } from './adapters.js';
-import { parseDeterministicReply } from './replyParser.js';
-import type { ArtifactName, ControlChatResult, ManagerConfig, TaskProposal, TaskState } from './types.js';
+import { getAllowedActions, humanStageName } from './allowedActions.js';
+import { ProjectKnowledgeService } from './projectKnowledge.js';
+import { getDefaultProjectId } from './projects.js';
+import type {
+  AllowedAction,
+  ArtifactName,
+  ControlChatResult,
+  IntentResult,
+  ManagerConfig,
+  TaskProposal,
+  TaskState,
+} from './types.js';
 import type { WorkflowResult, WorkflowService } from './workflow.js';
 
 const ARTIFACT_NAMES: ArtifactName[] = [
@@ -26,32 +36,12 @@ const ARTIFACT_NAMES: ArtifactName[] = [
   'final-report',
 ];
 
-const QUESTION_PATTERNS = [
-  /[?？]\s*$/,
-  /^(?:why|what|how|where|when|can you|could you)\b/i,
-  /(?:为什么|怎么|如何|哪里|哪儿|风险|解释|说明|讲讲|是什么意思)/,
-  /(?:有什么区别|大概怎么写)/,
-  /^(?:帮我|请)\s*(?:解释|说明|讲讲|分析|看一下)/,
-];
-
 export const CLARIFY_INTENT_MESSAGE = [
-  "I'm not sure whether you want to create a new task or ask about the current one. Reply:",
-  '- new: <task>',
-  '- status',
-  '- summary',
-  '- ask: <question>',
-  '',
-  '我不确定你是想创建新任务，还是想继续问当前任务。请回复：',
-  '- new: <任务>',
-  '- status',
-  '- summary',
-  '- ask: <问题>',
+  '我还没完全确定你的意思，所以没有推进 workflow。',
+  '你可以直接用自然语言说：同意、需要改哪里、高难度、现在到哪了、验收通过。',
 ].join('\n');
 
-export const NO_TASK_TO_STOP_MESSAGE = [
-  'There is no active task in this chat to stop.',
-  '这个聊天里没有可停止的当前 task。',
-].join('\n');
+export const NO_TASK_TO_STOP_MESSAGE = '这个聊天里没有正在绑定的任务可以停止。';
 
 type GlobalCommand = 'status' | 'summary' | 'help' | 'stop';
 
@@ -72,8 +62,8 @@ export interface OutboundMessage {
 }
 
 export type ConversationTurn =
-  | { kind: 'reply'; messages: OutboundMessage[] }
-  | { kind: 'background'; startedMessage: OutboundMessage; run: () => Promise<WorkflowResult> };
+  | { kind: 'reply'; messages: OutboundMessage[]; auditAction?: string; auditMetadata?: Record<string, unknown> }
+  | { kind: 'background'; startedMessage: OutboundMessage; run: () => Promise<WorkflowResult>; auditAction?: string; auditMetadata?: Record<string, unknown> };
 
 export type BackgroundConversationTurn = Extract<ConversationTurn, { kind: 'background' }>;
 
@@ -82,12 +72,16 @@ export type ControlConversationTurn =
   | { kind: 'proposal'; message: OutboundMessage; proposal: TaskProposal };
 
 export class ManagerConversationService {
+  private readonly projectKnowledge: ProjectKnowledgeService;
+
   constructor(
     private readonly workflow: WorkflowService,
     private readonly store: ArtifactStore,
     private readonly manager?: ManagerAdapter,
     private readonly config?: ManagerConfig,
-  ) {}
+  ) {
+    this.projectKnowledge = new ProjectKnowledgeService(store.managerRoot);
+  }
 
   async createTask(input: TaskRequest): Promise<WorkflowResult> {
     return this.workflow.createTask(input);
@@ -96,75 +90,187 @@ export class ManagerConversationService {
   startBrief(taskId: string): BackgroundConversationTurn {
     return {
       kind: 'background',
-      startedMessage: { text: '已创建 task，开始生成 brief。跑完我会在这个群里通知你。' },
+      startedMessage: { text: '任务已创建，我开始整理 brief。跑完会把需要你确认的内容发到这里。' },
       run: () => this.workflow.planTask(taskId),
     };
   }
 
   async routeTaskMessage(taskId: string, text: string): Promise<ConversationTurn> {
-    const trimmed = text.trim();
+    const trimmed = stripMentions(text).trim();
     if (!trimmed) {
-      return { kind: 'reply', messages: [{ text: '我收到的是空消息。请直接说需求，或者回复 A / revise C: ... / status。' }] };
-    }
-
-    const command = parseGlobalCommand(trimmed);
-    if (command === 'help') {
-      return { kind: 'reply', messages: [{ text: renderTaskHelp() }] };
-    }
-    if (command === 'status' || command === 'summary') {
-      const result = await this.workflow.reply(taskId, command);
-      return { kind: 'reply', messages: [renderWorkflowResult(result)] };
-    }
-    if (command === 'stop') {
-      return {
-        kind: 'background',
-        startedMessage: { text: 'Stopping the current task. / 正在停止当前 task。' },
-        run: () => this.workflow.reply(taskId, 'stop'),
-      };
+      return { kind: 'reply', messages: [{ text: '我收到的是空消息。直接说你的决定或问题就行。' }] };
     }
 
     const showArtifact = parseShowArtifact(trimmed);
     if (showArtifact) {
-      return { kind: 'reply', messages: [await this.renderArtifact(taskId, showArtifact)] };
-    }
-
-    const askQuestion = parseAskQuestion(trimmed);
-    if (askQuestion || looksLikeQuestion(trimmed)) {
-      const result = await this.workflow.askQuestion(taskId, askQuestion ?? trimmed);
-      return { kind: 'reply', messages: [renderWorkflowResult(result)] };
+      return { kind: 'reply', auditAction: 'show_artifact', messages: [await this.renderArtifact(taskId, showArtifact)] };
     }
 
     const state = await this.store.loadState(taskId);
-    if (isSingleLetterDecision(trimmed) && !isAwaitingAbcDecision(state.status)) {
-      return { kind: 'reply', messages: [{ text: CLARIFY_INTENT_MESSAGE }] };
+    const classified = await this.classifyTaskIntent(trimmed, state);
+    if ('turn' in classified) return classified.turn;
+
+    const intent = normalizeIntentForState(classified.intent, state);
+    const allowedActions = getAllowedActions(state);
+    const allowed = allowedActions.some((action) => action.id === intent.intent);
+    if (!allowed) {
+      return {
+        kind: 'reply',
+        auditAction: `intent:${intent.intent}:blocked`,
+        auditMetadata: intentAuditMetadata(intent),
+        messages: [await this.composeMessage({
+          rawMessage: [
+            intent.userFacingInterpretation,
+            `不过当前阶段是「${humanStageName(state.status)}」，这个动作还不能执行。`,
+            `现在可以：${formatAllowedActions(allowedActions)}`,
+          ].join('\n'),
+          state,
+        })],
+      };
     }
 
-    const parsed = parseDeterministicReply(trimmed);
-    if (parsed.kind === 'status' || parsed.kind === 'summary' || parsed.kind === 'ambiguous') {
-      const result = await this.workflow.reply(taskId, trimmed);
-      return { kind: 'reply', messages: [renderWorkflowResult(result)] };
+    if (intent.requiresClarification || intent.confidence < 0.6) {
+      return {
+        kind: 'reply',
+        auditAction: `intent:${intent.intent}:clarify`,
+        auditMetadata: intentAuditMetadata(intent),
+        messages: [await this.composeMessage({
+          rawMessage: [
+            intent.userFacingInterpretation || CLARIFY_INTENT_MESSAGE,
+            `为了不误推进 workflow，请你再明确说一次。当前可以：${formatAllowedActions(allowedActions)}`,
+          ].join('\n'),
+          state,
+        })],
+      };
+    }
+
+    return this.executeIntent(taskId, trimmed, state, intent);
+  }
+
+  async notifyForState(taskId: string): Promise<OutboundMessage> {
+    return this.composeStateNotification(await this.store.loadState(taskId));
+  }
+
+  async composeWorkflowResult(result: WorkflowResult, userQuestion?: string): Promise<OutboundMessage> {
+    const files = filesForState(result.state);
+    return this.composeMessage({
+      rawMessage: result.message,
+      state: result.state,
+      ...(userQuestion ? { userQuestion } : {}),
+      ...(files ? { files } : {}),
+    });
+  }
+
+  async composeStateNotification(state: TaskState): Promise<OutboundMessage> {
+    const files = filesForState(state);
+    return this.composeMessage({
+      rawMessage: renderStateNotificationText(state),
+      state,
+      ...(files ? { files } : {}),
+    });
+  }
+
+  async routeControlMessage(text: string, pendingProposal?: TaskProposal, projectId?: string): Promise<ControlConversationTurn> {
+    const result = await this.runControlChat(text, pendingProposal, 'message', projectId);
+    return controlResultToTurn(result);
+  }
+
+  async reviseControlProposal(instruction: string, pendingProposal: TaskProposal, projectId?: string): Promise<ControlConversationTurn> {
+    const result = await this.runControlChat(instruction, pendingProposal, 'edit', projectId);
+    return controlResultToTurn(result);
+  }
+
+  private async classifyTaskIntent(message: string, state: TaskState): Promise<{ intent: IntentResult } | { turn: ConversationTurn }> {
+    if (!this.manager || !this.config) {
+      return {
+        turn: {
+          kind: 'reply',
+          auditAction: 'intent:missing_manager',
+          messages: [{ text: '当前没有配置 Manager 对话分类器，所以我没有推进 workflow。' }],
+        },
+      };
+    }
+
+    const allowedActions = getAllowedActions(state);
+    try {
+      const recentContext = await this.buildTaskChatContext(state);
+      return {
+        intent: await this.manager.classifyIntent({
+          userMessage: message,
+          state,
+          allowedActions,
+          recentContext,
+          config: this.config,
+        }),
+      };
+    } catch (error) {
+      return {
+        turn: {
+          kind: 'reply',
+          auditAction: 'intent:error',
+          auditMetadata: { routeError: errorMessage(error) },
+          messages: [await this.composeMessage({
+            rawMessage: [
+              '我收到你的消息了，但刚才调用意图分类失败，所以没有推进 workflow。',
+              `当前阶段：${humanStageName(state.status)}`,
+              state.pendingUserPrompt ? `现在等你处理：${state.pendingUserPrompt}` : undefined,
+              `错误：${errorMessage(error)}`,
+            ].filter(Boolean).join('\n'),
+            state,
+          })],
+        },
+      };
+    }
+  }
+
+  private async executeIntent(
+    taskId: string,
+    originalMessage: string,
+    state: TaskState,
+    intent: IntentResult,
+  ): Promise<ConversationTurn> {
+    if (intent.intent === 'ask') {
+      const result = await this.workflow.askQuestion(taskId, originalMessage);
+      return {
+        kind: 'reply',
+        auditAction: 'intent:ask',
+        auditMetadata: intentAuditMetadata(intent),
+        messages: [await this.composeWorkflowResult(result, originalMessage)],
+      };
+    }
+
+    if (intent.intent === 'status' || intent.intent === 'summary') {
+      const result = await this.workflow.reply(taskId, intent.intent);
+      return {
+        kind: 'reply',
+        auditAction: `intent:${intent.intent}`,
+        auditMetadata: intentAuditMetadata(intent),
+        messages: [await this.composeWorkflowResult(result)],
+      };
+    }
+
+    const reply = workflowReplyForIntent(intent, originalMessage, state);
+    if (!reply) {
+      return {
+        kind: 'reply',
+        auditAction: `intent:${intent.intent}:clarify`,
+        auditMetadata: intentAuditMetadata(intent),
+        messages: [await this.composeMessage({
+          rawMessage: '我理解你想继续推进，但缺少必要信息。比如选择难度时需要明确 low、medium 或 high。',
+          state,
+        })],
+      };
     }
 
     return {
       kind: 'background',
-      startedMessage: { text: `已收到：${shorten(trimmed, 80)}\n我开始处理，跑完通知你。` },
-      run: () => this.workflow.reply(taskId, trimmed),
+      auditAction: `intent:${intent.intent}`,
+      auditMetadata: intentAuditMetadata(intent),
+      startedMessage: {
+        text: intent.userFacingInterpretation || `收到，我会按「${intent.intent}」处理。`,
+      },
+      run: () => this.workflow.reply(taskId, reply),
     };
-  }
-
-  async notifyForState(taskId: string): Promise<OutboundMessage> {
-    const state = await this.store.loadState(taskId);
-    return renderStateNotification(state);
-  }
-
-  async routeControlMessage(text: string, pendingProposal?: TaskProposal): Promise<ControlConversationTurn> {
-    const result = await this.runControlChat(text, pendingProposal, 'message');
-    return controlResultToTurn(result);
-  }
-
-  async reviseControlProposal(instruction: string, pendingProposal: TaskProposal): Promise<ControlConversationTurn> {
-    const result = await this.runControlChat(instruction, pendingProposal, 'edit');
-    return controlResultToTurn(result);
   }
 
   private async renderArtifact(taskId: string, artifact: ArtifactName): Promise<OutboundMessage> {
@@ -181,16 +287,66 @@ export class ManagerConversationService {
     message: string,
     pendingProposal: TaskProposal | undefined,
     mode: 'message' | 'edit',
+    projectId: string | undefined,
   ): Promise<ControlChatResult> {
     if (this.manager && this.config) {
+      const query = [
+        message,
+        pendingProposal?.title,
+        pendingProposal?.interpretedIntent,
+        pendingProposal?.task,
+      ].filter(Boolean).join('\n\n');
+      const projectContext = await this.projectKnowledge.buildContextPacket(this.config, {
+        projectId: projectId ?? getDefaultProjectId(this.config),
+        query,
+      });
       return this.manager.handleControlChat({
         message,
         mode,
         config: this.config,
+        projectContext,
         ...(pendingProposal ? { pendingProposal } : {}),
       });
     }
     return fallbackControlChat(message, pendingProposal, mode);
+  }
+
+  private async buildTaskChatContext(state: TaskState): Promise<string> {
+    const context: string[] = [
+      `State:\n${JSON.stringify({ ...state, artifacts: undefined }, null, 2)}`,
+    ];
+    for (const name of ARTIFACT_NAMES) {
+      if (!state.artifacts[name]) continue;
+      const content = await this.store.readArtifact(state, name).catch(() => '');
+      if (content.trim()) context.push(`## ${name}\n${shorten(content, 3000)}`);
+    }
+    return context.join('\n\n');
+  }
+
+  private async composeMessage(input: {
+    rawMessage: string;
+    state: TaskState;
+    pendingPrompt?: string;
+    userQuestion?: string;
+    files?: OutboundFile[];
+  }): Promise<OutboundMessage> {
+    const fallback = fallbackComposeReply(input.rawMessage, input.state, input.pendingPrompt);
+    if (!this.manager || !this.config) {
+      return { text: fallback, ...(input.files ? { files: input.files } : {}) };
+    }
+    try {
+      const pendingPrompt = input.pendingPrompt ?? input.state.pendingUserPrompt;
+      const composed = await this.manager.composeReply({
+        rawMessage: input.rawMessage,
+        state: input.state,
+        ...(pendingPrompt ? { pendingPrompt } : {}),
+        ...(input.userQuestion ? { userQuestion: input.userQuestion } : {}),
+        config: this.config,
+      });
+      return { text: composed.text.trim() || fallback, ...(input.files ? { files: input.files } : {}) };
+    } catch {
+      return { text: fallback, ...(input.files ? { files: input.files } : {}) };
+    }
   }
 }
 
@@ -215,34 +371,6 @@ export function parseTaskRequest(text: string): TaskRequest | undefined {
   return parseExplicitTaskRequest(text);
 }
 
-export function renderWorkflowResult(result: WorkflowResult): OutboundMessage {
-  const files = filesForState(result.state);
-  return {
-    text: [
-      result.message,
-      '',
-      `Task: ${result.state.title}`,
-      `Task ID: ${result.state.taskId}`,
-      `Status: ${result.state.status}`,
-      result.state.pendingUserPrompt ? `Pending: ${result.state.pendingUserPrompt}` : undefined,
-    ].filter(Boolean).join('\n'),
-    ...(files ? { files } : {}),
-  };
-}
-
-export function renderStateNotification(state: TaskState): OutboundMessage {
-  const files = filesForState(state);
-  const prompt = state.pendingUserPrompt ? `\n\n${state.pendingUserPrompt}` : '';
-  return {
-    text: [
-      `Task: ${state.title}`,
-      `Task ID: ${state.taskId}`,
-      `Status: ${state.status}${prompt}`,
-    ].join('\n'),
-    ...(files ? { files } : {}),
-  };
-}
-
 export function filesForState(state: TaskState): OutboundFile[] | undefined {
   const names = artifactsForStatus(state.status);
   const files = names
@@ -255,14 +383,9 @@ export function filesForState(state: TaskState): OutboundFile[] | undefined {
 function artifactsForStatus(status: TaskState['status']): ArtifactName[] {
   if (status === 'awaiting_brief_confirmation') return ['manager-brief'];
   if (status === 'ready_for_decision') return ['manager-explanation', 'revised-plan'];
+  if (status === 'awaiting_user_acceptance') return ['final-review', 'test-build-log'];
   if (status === 'completed') return ['final-report'];
   return [];
-}
-
-function parseAskQuestion(text: string): string | undefined {
-  const match = text.match(/^(?:\/ask\b|ask\s*:)\s*([\s\S]*)$/i);
-  const question = match?.[1]?.trim();
-  return question || undefined;
 }
 
 function parseShowArtifact(text: string): ArtifactName | undefined {
@@ -279,16 +402,12 @@ export function parseGlobalCommand(text: string): GlobalCommand | undefined {
   return undefined;
 }
 
-export function looksLikeQuestion(text: string): boolean {
-  return QUESTION_PATTERNS.some((pattern) => pattern.test(text));
-}
-
 export function looksTaskLikeRequest(text: string): boolean {
-  return /^(?:帮我|请|实现|检查|修复)\S*/.test(text.trim());
+  return /^(?:帮我|请|实现|检查|修复|implement\b|fix\b|build\b)/i.test(text.trim());
 }
 
 export function looksLikePromptGeneration(text: string): boolean {
-  return /(?:prompt|提示词|整理一下|先不要创建\s*task|不要创建\s*task|不要执行|先帮我整理)/i.test(text.trim());
+  return /(?:prompt|提示词|整理一个|先不要创建\s*task|不要创建\s*task|不要执行|先帮我整理)/i.test(text.trim());
 }
 
 export function renderTaskProposal(proposal: TaskProposal): string {
@@ -312,6 +431,10 @@ export function renderTaskProposal(proposal: TaskProposal): string {
     'Do you want me to create a task from this?',
     'Reply: create task, edit: <instruction>, or cancel.',
   ].join('\n');
+}
+
+export function stripMentions(text: string): string {
+  return text.replace(/@_user_\d+|<at[^>]*>.*?<\/at>|@\S+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 function controlResultToTurn(result: ControlChatResult): ControlConversationTurn {
@@ -379,38 +502,66 @@ function fallbackControlChat(
   };
 }
 
-function isSingleLetterDecision(text: string): boolean {
-  return /^[abc]$/i.test(text.trim());
+function normalizeIntentForState(intent: IntentResult, state: TaskState): IntentResult {
+  if (state.status === 'awaiting_user_acceptance' && intent.intent === 'approve') {
+    return { ...intent, intent: 'accept' };
+  }
+  return intent;
 }
 
-function isAwaitingAbcDecision(status: TaskState['status']): boolean {
-  return status === 'awaiting_brief_confirmation' || status === 'ready_for_decision' || status === 'waiting_user_direction';
+function workflowReplyForIntent(intent: IntentResult, originalMessage: string, state: TaskState): string | undefined {
+  switch (intent.intent) {
+    case 'approve':
+      return state.status === 'awaiting_user_acceptance' ? 'accept' : 'approve A';
+    case 'reject':
+      return 'reject B';
+    case 'revise':
+      return `revise C: ${intent.instruction ?? originalMessage}`;
+    case 'difficulty':
+      return intent.difficulty;
+    case 'stop':
+      return 'stop';
+    case 'accept':
+      return 'accept';
+    case 'note':
+      return `note: ${intent.note ?? originalMessage}`;
+    case 'status':
+    case 'summary':
+    case 'ask':
+    case 'unknown':
+      return undefined;
+  }
 }
 
-function renderTaskHelp(): string {
+function intentAuditMetadata(intent: IntentResult): Record<string, unknown> {
+  return {
+    intent: intent.intent,
+    confidence: intent.confidence,
+    requiresClarification: intent.requiresClarification,
+    userFacingInterpretation: intent.userFacingInterpretation,
+    ...(intent.difficulty ? { difficulty: intent.difficulty } : {}),
+    ...(intent.instruction ? { instruction: intent.instruction } : {}),
+    ...(intent.note ? { note: intent.note } : {}),
+  };
+}
+
+function formatAllowedActions(actions: AllowedAction[]): string {
+  return actions.map((action) => action.description).join('；');
+}
+
+function renderStateNotificationText(state: TaskState): string {
   return [
-    'Current task commands:',
-    '- status: show this task status',
-    '- summary: summarize this task',
-    '- ask: <question>: ask about this task',
-    '- /show <artifact>: show a task artifact',
-    '- approve A / reject B / revise C: <instruction>: make a decision when requested',
-    '- stop: stop this task',
-    '- create task: <task>: create a separate new task',
-    '- /create <task>: create a separate new task',
-    '- new task: <task>: create a separate new task',
-    '',
-    '当前 task 可用命令：',
-    '- status：查看当前 task 状态',
-    '- summary：总结当前 task',
-    '- ask: <问题>：询问当前 task',
-    '- /show <artifact>：查看 task artifact',
-    '- approve A / reject B / revise C: <说明>：在需要决策时回复',
-    '- stop：停止当前 task',
-    '- create task: <任务>：创建一个新的独立 task',
-    '- /create <任务>：创建一个新的独立 task',
-    '- new task: <任务>：创建一个新的独立 task',
-  ].join('\n');
+    `现在是「${humanStageName(state.status)}」。`,
+    state.pendingUserPrompt ? `等你处理：${state.pendingUserPrompt}` : undefined,
+  ].filter(Boolean).join('\n');
+}
+
+function fallbackComposeReply(rawMessage: string, state: TaskState, pendingPrompt?: string): string {
+  const prompt = pendingPrompt ?? state.pendingUserPrompt;
+  return [
+    rawMessage,
+    prompt ? `现在需要你处理：${prompt}` : undefined,
+  ].filter(Boolean).join('\n');
 }
 
 function makeTitle(text: string): string {
@@ -419,4 +570,8 @@ function makeTitle(text: string): string {
 
 function shorten(text: string, maxLength: number): string {
   return text.length <= maxLength ? text : `${text.slice(0, maxLength - 1)}...`;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

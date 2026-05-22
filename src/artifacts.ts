@@ -1,6 +1,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
+import { sanitizeTextForArtifact } from './textSanitizer.js';
 import type { ArtifactName, ManagerConfig, TaskState } from './types.js';
 
 const ARTIFACT_FILES: Record<ArtifactName, string> = {
@@ -75,7 +76,7 @@ export class ArtifactStore {
   async writeArtifact(state: TaskState, artifact: ArtifactName, content: string): Promise<TaskState> {
     const path = this.artifactPath(state.taskId, artifact);
     await mkdir(this.taskDir(state.taskId), { recursive: true });
-    await writeFile(path, content, 'utf8');
+    await writeFile(path, sanitizeTextForArtifact(content), 'utf8');
     return {
       ...state,
       updatedAt: new Date().toISOString(),

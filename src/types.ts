@@ -4,6 +4,38 @@ export type AgentProfileKind = 'deepseek' | 'codex' | 'claude' | 'stub';
 
 export type WorkflowDifficulty = 'low' | 'medium' | 'high';
 
+export type IntentName =
+  | 'approve'
+  | 'reject'
+  | 'revise'
+  | 'difficulty'
+  | 'stop'
+  | 'status'
+  | 'summary'
+  | 'accept'
+  | 'note'
+  | 'ask'
+  | 'unknown';
+
+export interface AllowedAction {
+  id: IntentName;
+  description: string;
+}
+
+export interface IntentResult {
+  intent: IntentName;
+  difficulty?: WorkflowDifficulty;
+  instruction?: string;
+  note?: string;
+  confidence: number;
+  requiresClarification: boolean;
+  userFacingInterpretation: string;
+}
+
+export interface ComposedReply {
+  text: string;
+}
+
 export type WorkflowRoleName = 'architect' | 'planReviewer' | 'developer' | 'finalReviewer';
 
 export type WorkflowRoleProfiles = Record<WorkflowDifficulty, Record<WorkflowRoleName, string>>;
@@ -133,6 +165,36 @@ export type ArtifactName =
   | 'test-build-log'
   | 'final-review'
   | 'final-report';
+
+export type TaskChatRouteAction =
+  | 'reply_only'
+  | 'answer_question'
+  | 'status'
+  | 'summary'
+  | 'approve'
+  | 'reject'
+  | 'revise'
+  | 'choose_difficulty'
+  | 'stop'
+  | 'show_artifact'
+  | 'create_new_task'
+  | 'clarify';
+
+export interface TaskChatRouteResult {
+  action: TaskChatRouteAction;
+  confidence: number;
+  reason: string;
+  replyMarkdown?: string;
+  requiresConfirmation?: boolean;
+  actionArgs?: {
+    question?: string;
+    difficulty?: WorkflowDifficulty;
+    revision?: string;
+    artifact?: ArtifactName;
+    title?: string;
+    task?: string;
+  };
+}
 
 export interface TaskState {
   taskId: string;

@@ -52,10 +52,9 @@ The first `plan` invocation stops at the brief gate. You confirm or correct the 
 
 ```powershell
 npm run manager -- show --task latest --artifact manager-brief
-npm run manager -- reply --task latest "approve A"
 ```
 
-`approve A` from the brief gate continues the pipeline:
+In Lark, say `同意` to continue from the brief gate. In the CLI developer surface, send the equivalent exact reply command.
 
 ```text
 -> awaiting_difficulty_selection
@@ -73,9 +72,18 @@ After difficulty selection, the planning pipeline continues:
 -> initial plan -> optional plan review/revision -> Manager explanation -> ready_for_decision
 ```
 
-If the brief misunderstood you, send `revise C: <correction>` and the Manager regenerates the brief, accumulating all your corrections across rounds. `reject B` from the brief gate stops the task.
+If the brief misunderstood you, say what needs to change and the Manager regenerates the brief, accumulating all your corrections across rounds. If the task should not continue, say that clearly and the state machine stops it only from a legal gate.
 
 Manager does not do a separate high-level review of the revised plan.
+
+## Conversation Layer Boundary
+
+Manager now keeps the workflow state machine and the chat layer separate:
+
+- The workflow state machine owns correctness. It decides which transitions are legal and keeps the gates intact: brief confirmation, difficulty selection, plan approval, final review routing, and user acceptance.
+- The Lark conversation layer owns semantic understanding and voice. Each task-chat message is classified by the Manager LLM against the actions allowed by the current state, then the raw workflow result is composed into short Chinese-first chat text.
+
+In Lark, users can reply naturally: `同意`, `走高难度`, `这个方案风险最大在哪里？`, `这里先别扩大范围`, or `验收通过`. The state machine still rejects unsafe jumps; if the current stage is not waiting for approval, an approval-like message will not start implementation.
 
 ## Inspect State And Artifacts
 
@@ -89,6 +97,70 @@ npm run manager -- show --task latest --artifact final-report
 
 Artifacts are stored under `logs/ai-workflow/runs/<task-id>/` in this Manager repo.
 
+## Target Project Task Records
+
+Manager also writes human-facing task documentation into the target project task record root.
+
+`TASK_RECORD_ROOT` is configurable per project with `taskRecordRoot`. If it is not configured, Manager uses:
+
+```text
+<project.targetDir>/task
+```
+
+For IReader, that resolves to:
+
+```text
+E:/GameDeveloping/IReader/my-reader/task
+```
+
+Every workflow task gets one parent folder:
+
+```text
+task/<task-id>/
+  README.md
+  brief.md
+  plan.md
+  plan-review.md
+  implementation-log.md
+  final-review.md
+  task-record.md
+  subtasks/
+  artifacts/
+```
+
+A single task is one execution unit:
+
+```text
+task/<task-id>/subtasks/01-main.md
+```
+
+A decomposed task uses the same parent folder with multiple execution units:
+
+```text
+task/<task-id>/subtasks/01-*.md
+task/<task-id>/subtasks/02-*.md
+```
+
+Do not place subtask markdown files directly under `task/`.
+
+The global `task/README.md` uses:
+
+```text
+| Task | Category | Status | Execution Mode | Summary | Updated |
+```
+
+Category is one metadata field only. Supported values are `Reader Core`, `Selection / Popup`, `Vocabulary Algorithm`, `Translation / LLM`, `Feedback / User Model`, `Storage / Persistence`, `Backend / API`, `Data / Dictionary Pipeline`, `Evaluation / Benchmark`, `Manager / Workflow`, `Docs / Task Record`, `UI / Frontend`, and `Other`. Missing or unknown values become `Other`. Category never creates folders, changes execution behavior, or changes review policy.
+
+Lifecycle timing:
+
+- task creation initializes the parent folder with placeholder files;
+- brief generation fills `brief.md`;
+- user-approved plans fill `plan.md`, `plan-review.md`, and `subtasks/*.md`;
+- execution updates `implementation-log.md` and each subtask `Test Result`;
+- final review updates `final-review.md`;
+- user acceptance finalizes `task-record.md`;
+- `completed` is blocked until `task-record.md` is valid.
+
 ## Ask Questions Before Implementation
 
 ```powershell
@@ -97,47 +169,11 @@ npm run manager -- ask --task latest "Why is this approach better for latency?"
 
 `ask` always uses the real Manager adapter. With the default DeepSeek Manager profile, `DEEPSEEK_API_KEY` must be set before the first Manager call.
 
-## Reply Commands
+## Reply Surfaces
 
-Approve:
+Lark task chats are the user-facing reply surface. Mentioning the bot is optional; `@bot 同意` and `同意` are treated the same. The bridge strips Lark mention tokens before classification, asks DeepSeek for intent, checks the intent against the current workflow gate, executes only legal transitions, and then rewrites the raw result without dumping `Task ID / Status / Pending` blocks.
 
-```powershell
-npm run manager -- reply --task latest "approve A"
-npm run manager -- reply --task latest "A"
-npm run manager -- reply --task latest "yes"
-npm run manager -- reply --task latest "同意"
-```
-
-Reject:
-
-```powershell
-npm run manager -- reply --task latest "reject B"
-npm run manager -- reply --task latest "B"
-```
-
-Request changes:
-
-```powershell
-npm run manager -- reply --task latest "revise C: keep this as an MVP and avoid UI redesign"
-```
-
-Other local replies:
-
-```powershell
-npm run manager -- reply --task latest "status"
-npm run manager -- reply --task latest "summary"
-npm run manager -- reply --task latest "stop"
-```
-
-Difficulty replies are accepted only at `awaiting_difficulty_selection`:
-
-```powershell
-npm run manager -- reply --task latest "low"
-npm run manager -- reply --task latest "medium"
-npm run manager -- reply --task latest "high"
-```
-
-The first parser layer is a deterministic whitelist. If a reply is not whitelisted, Manager asks for confirmation and does not execute the interpreted action. Mixed replies such as `approve A but change the UX` are treated as ambiguous.
+The local CLI remains a developer/debug surface. `npm run manager -- reply` sends exact text directly to the workflow service, which is useful for repeatable smoke tests and scripted runs. Natural-language intent classification happens in the Lark bridge, not in the CLI.
 
 ## Difficulty Levels
 
@@ -158,7 +194,6 @@ To call the configured heavy agents:
 ```powershell
 npm run manager -- plan --task latest --allow-agent-calls
 npm run manager -- reply --task latest "medium" --allow-agent-calls
-npm run manager -- reply --task latest "approve A" --allow-agent-calls
 ```
 
 ## Configure And Swap Roles
@@ -226,12 +261,20 @@ Blocked commands are recorded in the test/build artifact.
 
 Final review is not the endpoint. Manager routes the result to one of:
 
-- `complete`: write final report.
+- `complete`: pause at user acceptance before writing the task record and final report.
 - `route_to_implementer`: keep approval and route back to implementation.
 - `route_to_planner`: request a new planning cycle.
 - `ask_user_direction`: pause for a product, UX, cost, scope, or direction decision.
 
-If Manager routes back to implementation, the task keeps its existing approval. Send `approve A` again to continue the already-approved implementation route.
+If Manager routes back to implementation, the task keeps its existing approval. Send a natural approval in Lark, or the equivalent exact CLI reply, to continue the already-approved implementation route.
+
+If Manager routes to `complete`, the task is not completed immediately. It moves to `awaiting_user_acceptance`.
+
+From `awaiting_user_acceptance`, Lark users can reply naturally:
+
+- `验收通过` finalizes `task-record.md`, writes the final report, and marks the task completed.
+- `补充备注：...` records an acceptance note and keeps waiting.
+- `这里还要改：...` routes the task back for changes.
 
 The final report separates:
 
@@ -251,3 +294,22 @@ A message integration should not duplicate workflow logic. The Lark bridge keeps
 - Briefs, revised plans, explanations, and final reports are sent back as Markdown artifacts.
 
 See [lark-bridge.md](lark-bridge.md) for setup and daily use.
+
+## Token Usage Ledgers
+
+Manager creates `token-usage.json` in every new task record folder. This file is machine-readable and is the source of truth when the user asks how many tokens or how much money a task used.
+
+- `entries[]` records usage by `role`, `subtaskId`, and `stepId`.
+- `accuracy` must be `actual`, `estimated`, or `unknown`.
+- Use `actual` only when platform/API usage is exposed.
+- Use `estimated` only when a documented estimate or price snapshot was used.
+- Use `unknown` when usage is not exposed; do not invent backfill numbers.
+
+Useful commands:
+
+```powershell
+npm run manager -- usage --task latest
+npm run manager -- usage --task latest --by role
+npm run task-usage:summarize -- --task task/<task-id> --by subtask
+npm run task-usage:summarize -- --latest --by step
+```

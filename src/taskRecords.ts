@@ -1,6 +1,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
 
+import { sanitizeTextForArtifact } from './textSanitizer.js';
 import type {
   ExecutionMode,
   ExecutionUnitDraft,
@@ -11,6 +12,14 @@ import type {
   TaskState,
   VerificationCommandResult,
 } from './types.js';
+import {
+  TOKEN_USAGE_FILE_NAME,
+  createEmptyTaskUsageLedger,
+  readTaskUsageLedger,
+  summarizeTaskUsageLedger,
+  writeTaskUsageLedger,
+  type TokenUsageTotals,
+} from './taskUsage.js';
 
 export const SUPPORTED_TASK_CATEGORIES = [
   'Reader Core',
@@ -151,27 +160,35 @@ export class TaskRecordStore {
     for (const file of STANDARD_PARENT_FILES) {
       await writePlaceholderIfMissing(join(parentDir, file));
     }
+    await writeInitialTokenUsageLedger(input.project, input.state);
     await this.writeParentReadme(input);
     await this.updateGlobalReadme(input.project, input.state);
   }
 
   async writeBrief(project: ProjectConfig, state: TaskState, brief: string): Promise<void> {
-    await writeFile(join(parentTaskDir(project, state.taskId), 'brief.md'), ensureTrailingNewline(brief), 'utf8');
+    const parentDir = parentTaskDir(project, state.taskId);
+    await mkdir(parentDir, { recursive: true });
+    await writeFile(join(parentDir, 'brief.md'), ensureTrailingNewline(sanitizeTextForArtifact(brief)), 'utf8');
   }
 
   async persistApprovedPlan(input: ApprovedPlanInput): Promise<ExecutionUnitState[]> {
     const parentDir = parentTaskDir(input.project, input.state.taskId);
     await mkdir(join(parentDir, 'subtasks'), { recursive: true });
-    await writeFile(join(parentDir, 'plan.md'), ensureTrailingNewline(input.planMarkdown), 'utf8');
-    await writeFile(join(parentDir, 'plan-review.md'), ensureTrailingNewline(input.reviewMarkdown || PENDING), 'utf8');
+    await writeFile(join(parentDir, 'plan.md'), ensureTrailingNewline(sanitizeTextForArtifact(input.planMarkdown)), 'utf8');
+    await writeFile(join(parentDir, 'plan-review.md'), ensureTrailingNewline(sanitizeTextForArtifact(input.reviewMarkdown || PENDING)), 'utf8');
 
     const units = makeExecutionUnits(input.executionUnitDrafts);
     const drafts = input.executionUnitDrafts?.filter((draft) => draft.name.trim().length > 0) ?? [];
     await Promise.all(units.map((unit, index) => {
       const draft = drafts[index];
+      const markdown = sanitizeTextForArtifact(normalizeSubtaskMarkdown(unit, draft?.markdown));
+      const errors = validateSubtaskMarkdown(markdown);
+      if (errors.length > 0) {
+        throw new Error(`Invalid subtask markdown for ${unit.fileName}: ${errors.join('; ')}`);
+      }
       return writeFile(
         join(parentDir, 'subtasks', unit.fileName),
-        ensureTrailingNewline(normalizeSubtaskMarkdown(unit, draft?.markdown)),
+        ensureTrailingNewline(markdown),
         'utf8',
       );
     }));
@@ -189,24 +206,27 @@ export class TaskRecordStore {
     const previous = await readFile(path, 'utf8');
     const withStatus = replaceSection(previous, '## Status', status);
     const next = testResult ? replaceSection(withStatus, '## Test Result', testResult) : withStatus;
-    await writeFile(path, ensureTrailingNewline(next), 'utf8');
+    await writeFile(path, ensureTrailingNewline(sanitizeTextForArtifact(next)), 'utf8');
   }
 
   async appendImplementationLog(project: ProjectConfig, state: TaskState, content: string): Promise<void> {
     const path = join(parentTaskDir(project, state.taskId), 'implementation-log.md');
     const previous = await readFile(path, 'utf8').catch(() => '');
+    const cleanContent = sanitizeTextForArtifact(content);
     const body = previous.trim() && previous.trim() !== PENDING
-      ? `${previous.trimEnd()}\n\n${content}`
-      : content;
-    await writeFile(path, ensureTrailingNewline(body), 'utf8');
+      ? `${previous.trimEnd()}\n\n${cleanContent}`
+      : cleanContent;
+    await writeFile(path, ensureTrailingNewline(sanitizeTextForArtifact(body)), 'utf8');
   }
 
   async writeFinalReview(project: ProjectConfig, state: TaskState, finalReview: string): Promise<void> {
-    await writeFile(join(parentTaskDir(project, state.taskId), 'final-review.md'), ensureTrailingNewline(finalReview), 'utf8');
+    const parentDir = parentTaskDir(project, state.taskId);
+    await mkdir(parentDir, { recursive: true });
+    await writeFile(join(parentDir, 'final-review.md'), ensureTrailingNewline(sanitizeTextForArtifact(finalReview)), 'utf8');
   }
 
   async finalizeTaskRecord(input: TaskRecordFinalizeInput): Promise<void> {
-    const markdown = renderTaskRecord(input);
+    const markdown = sanitizeTextForArtifact(renderTaskRecord(input));
     const path = join(parentTaskDir(input.project, input.state.taskId), 'task-record.md');
     await writeFile(path, ensureTrailingNewline(markdown), 'utf8');
     const errors = validateTaskRecordMarkdown(markdown);
@@ -216,9 +236,16 @@ export class TaskRecordStore {
   }
 
   async writeParentReadme(input: ParentTaskRenderInput): Promise<void> {
+    await mkdir(parentTaskDir(input.project, input.state.taskId), { recursive: true });
+    const tokenUsageSection = await renderTokenUsageSection(input.project, input.state);
+    const markdown = sanitizeTextForArtifact(renderParentReadme(input, tokenUsageSection));
+    const errors = validateParentReadmeMarkdown(markdown);
+    if (errors.length > 0) {
+      throw new Error(`Invalid parent task README: ${errors.join('; ')}`);
+    }
     await writeFile(
       join(parentTaskDir(input.project, input.state.taskId), 'README.md'),
-      ensureTrailingNewline(renderParentReadme(input)),
+      ensureTrailingNewline(markdown),
       'utf8',
     );
   }
@@ -239,7 +266,7 @@ export class TaskRecordStore {
       updated: state.updatedAt,
     });
     const legacy = extractLegacyGlobalReadme(existing);
-    await writeFile(readmePath, ensureTrailingNewline(renderGlobalReadme(rows, legacy)), 'utf8');
+    await writeFile(readmePath, ensureTrailingNewline(sanitizeTextForArtifact(renderGlobalReadme(rows, legacy))), 'utf8');
   }
 
   async hasValidTaskRecord(project: ProjectConfig, state: TaskState): Promise<boolean> {
@@ -269,6 +296,7 @@ export function validateParentReadmeMarkdown(markdown: string): string[] {
     '## Plan Summary',
     '## Queue Summary',
     '## Subtask Status',
+    '## Token Usage',
     '## Test Summary',
     '## Final Review Status',
     '## User Acceptance Status',
@@ -312,12 +340,29 @@ function parentTaskDir(project: ProjectConfig, taskId: string): string {
   return join(resolveTaskRecordRoot(project), taskId);
 }
 
+function tokenUsagePath(project: ProjectConfig, taskId: string): string {
+  return join(parentTaskDir(project, taskId), TOKEN_USAGE_FILE_NAME);
+}
+
+async function writeInitialTokenUsageLedger(project: ProjectConfig, state: TaskState): Promise<void> {
+  const path = tokenUsagePath(project, state.taskId);
+  const existing = await readFile(path, 'utf8').catch(() => undefined);
+  if (existing !== undefined) return;
+
+  await writeTaskUsageLedger(path, createEmptyTaskUsageLedger({
+    taskId: state.taskId,
+    taskTitle: state.title,
+    createdAt: state.createdAt,
+    updatedAt: state.updatedAt,
+  }));
+}
+
 async function writePlaceholderIfMissing(path: string): Promise<void> {
   const existing = await readFile(path, 'utf8').catch(() => undefined);
   if (existing === undefined) await writeFile(path, `${PENDING}\n`, 'utf8');
 }
 
-function renderParentReadme(input: ParentTaskRenderInput): string {
+function renderParentReadme(input: ParentTaskRenderInput, tokenUsageSection: string): string {
   const state = input.state;
   const subtaskRows = state.executionQueue.length > 0
     ? state.executionQueue.map((unit) => `| [${String(unit.index).padStart(2, '0')} - ${escapeTableCell(unit.name)}](subtasks/${unit.fileName}) | ${unit.status} |`).join('\n')
@@ -354,6 +399,10 @@ function renderParentReadme(input: ParentTaskRenderInput): string {
     '|---|---|',
     subtaskRows,
     '',
+    '## Token Usage',
+    '',
+    tokenUsageSection,
+    '',
     '## Test Summary',
     '',
     input.testSummary ?? PENDING,
@@ -370,6 +419,45 @@ function renderParentReadme(input: ParentTaskRenderInput): string {
     '',
     input.finalCompletionStatus ?? (state.status === 'completed' ? 'Completed' : PENDING),
   ].join('\n');
+}
+
+async function renderTokenUsageSection(project: ProjectConfig, state: TaskState): Promise<string> {
+  const usagePath = tokenUsagePath(project, state.taskId);
+  const ledger = await readTaskUsageLedger(usagePath).catch(() => undefined);
+  if (!ledger) {
+    return [
+      `Ledger: \`${TOKEN_USAGE_FILE_NAME}\``,
+      '',
+      'No token usage ledger is available yet.',
+    ].join('\n');
+  }
+
+  const summary = summarizeTaskUsageLedger(ledger, { usagePath });
+  if (summary.totals.entries === 0) {
+    return [
+      `Ledger: [${TOKEN_USAGE_FILE_NAME}](${TOKEN_USAGE_FILE_NAME})`,
+      '',
+      'No token usage entries recorded yet. Usage is unknown, not zero.',
+      '',
+      `Query from the Manager repo: \`npm run manager -- usage --task ${state.taskId} --by role\``,
+    ].join('\n');
+  }
+
+  return [
+    `Ledger: [${TOKEN_USAGE_FILE_NAME}](${TOKEN_USAGE_FILE_NAME})`,
+    '',
+    '| Entries | Total Tokens | Input | Output | Reasoning | Cached | Known Cost | Unknown Cost Entries | Accuracy |',
+    '|---:|---:|---:|---:|---:|---:|---:|---:|---|',
+    `| ${summary.totals.entries} | ${summary.totals.totalTokens} | ${summary.totals.inputTokens} | ${summary.totals.outputTokens} | ${summary.totals.reasoningTokens} | ${summary.totals.cachedInputTokens} | ${summary.currency} ${summary.totals.knownCost.toFixed(6)} | ${summary.totals.costUnknownEntries} | ${formatAccuracy(summary.totals)} |`,
+    '',
+    `Query from the Manager repo: \`npm run manager -- usage --task ${state.taskId} --by role\``,
+  ].join('\n');
+}
+
+function formatAccuracy(totals: TokenUsageTotals): string {
+  if (totals.entries === 0) return 'no entries';
+  const percent = (count: number) => `${((count / totals.entries) * 100).toFixed(1)}%`;
+  return `actual ${percent(totals.actualEntries)}, estimated ${percent(totals.estimatedEntries)}, unknown ${percent(totals.unknownEntries)}`;
 }
 
 function renderQueueSummary(state: TaskState): string {
@@ -520,6 +608,15 @@ function renderGlobalReadme(rows: GlobalTaskRow[], legacy: string): string {
     '# Task Records',
     '',
     'This folder contains implementation records grouped by task.',
+    '',
+    '## Token Usage Ledgers',
+    '',
+    `New Manager task folders include a \`${TOKEN_USAGE_FILE_NAME}\` file for machine-readable token and cost accounting.`,
+    '',
+    '- Treat the ledger as the source of truth for token/cost questions.',
+    '- Record usage by role, subtask, and step when usage is available.',
+    '- Use `accuracy: "actual"` only for platform/API usage, `estimated` for documented estimates, and `unknown` when usage is not exposed.',
+    '- Do not backfill fake numbers for historical tasks.',
     '',
     GLOBAL_START,
     '## Tasks',

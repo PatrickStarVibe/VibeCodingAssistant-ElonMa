@@ -10,6 +10,7 @@
     "manager": "tsx src/cli.ts",
     "manager:lark": "tsx src/larkCli.ts",
     "build": "tsc -p tsconfig.json",
+    "task-usage:summarize": "tsx scripts/task-usage/summarizeTaskUsage.ts",
     "test": "vitest run",
     "test:watch": "vitest"
   },

@@ -13,6 +13,7 @@ export interface LarkRunningJob {
   taskId: string;
   label: string;
   startedAt: string;
+  lastNotifiedAt?: string;
 }
 
 export interface LarkPendingTaskProposal extends TaskProposal {
@@ -28,6 +29,8 @@ export interface LarkBridgeState {
   bindingsByChatId: Record<string, LarkTaskBinding>;
   runningJobsByTaskId: Record<string, LarkRunningJob>;
   notifiedStatusByTaskId: Record<string, WorkflowStatus>;
+  notifiedStatusAtByTaskId: Record<string, string>;
+  lastReminderHashByTaskId: Record<string, string>;
   processedEventIds: string[];
   pendingProposalsByChatId: Record<string, LarkPendingTaskProposal>;
 }
@@ -86,6 +89,8 @@ function normalizeState(raw: unknown, config: ManagerConfig): LarkBridgeState {
     bindingsByChatId: recordOfBindings(value.bindingsByChatId),
     runningJobsByTaskId: recordOfRunningJobs(value.runningJobsByTaskId),
     notifiedStatusByTaskId: recordOfStatuses(value.notifiedStatusByTaskId),
+    notifiedStatusAtByTaskId: recordOfStrings(value.notifiedStatusAtByTaskId),
+    lastReminderHashByTaskId: recordOfStrings(value.lastReminderHashByTaskId),
     processedEventIds: stringArray(value.processedEventIds).slice(0, 200),
     pendingProposalsByChatId: recordOfPendingProposals(value.pendingProposalsByChatId),
   };
@@ -129,7 +134,8 @@ function recordOfRunningJobs(value: unknown): Record<string, LarkRunningJob> {
     const job = record(rawJob);
     const label = stringValue(job.label);
     const startedAt = stringValue(job.startedAt);
-    return label && startedAt ? [[taskId, { taskId, label, startedAt }]] : [];
+    const lastNotifiedAt = stringValue(job.lastNotifiedAt);
+    return label && startedAt ? [[taskId, { taskId, label, startedAt, ...(lastNotifiedAt ? { lastNotifiedAt } : {}) }]] : [];
   }));
 }
 
@@ -174,13 +180,21 @@ function isWorkflowStatus(value: unknown): value is WorkflowStatus {
     'awaiting_difficulty_selection',
     'planning_requested',
     'planning',
+    'task_artifacts_persisting',
+    'execution_queue_ready',
     'waiting_user_direction',
     'ready_for_decision',
     'implementation_approved',
     'implementing',
+    'execution_unit_implementing',
+    'execution_unit_testing',
+    'execution_unit_result_recording',
+    'next_execution_unit_or_all_done',
     'implemented',
     'final_reviewing',
     'final_review_routing',
+    'awaiting_user_acceptance',
+    'task_recording',
     'completed',
     'stopped',
   ].includes(value);

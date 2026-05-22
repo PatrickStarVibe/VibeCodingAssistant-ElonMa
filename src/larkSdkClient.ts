@@ -136,10 +136,14 @@ function parseContent(content: string | undefined): string | undefined {
   try {
     const payload = JSON.parse(content) as unknown;
     const text = stringValue(record(payload).text);
-    return text?.trim() || undefined;
+    return stripLarkMentions(text ?? '').trim() || undefined;
   } catch {
-    return content.trim() || undefined;
+    return stripLarkMentions(content).trim() || undefined;
   }
+}
+
+export function stripLarkMentions(text: string): string {
+  return text.replace(/@_user_\d+|<at[^>]*>.*?<\/at>|@\S+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 function assertOk(result: { code?: number; msg?: string } | null, action: string): void {

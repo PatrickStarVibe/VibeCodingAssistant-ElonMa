@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -9,17 +9,23 @@ import type { HeavyAgentAdapter, ManagerAdapter } from '../src/adapters.js';
 import { ManagerConversationService } from '../src/conversation.js';
 import { LarkBridge, type LarkClientPort, type LarkIncomingMessage } from '../src/larkBridge.js';
 import { LarkBridgeStateStore } from '../src/larkBridgeState.js';
-import type { ControlChatResult, ManagerConfig, ManagerRouteResult, ManagerTextResult, PlanResult, TaskProposal, WorkflowDifficulty } from '../src/types.js';
+import type { ControlChatResult, IntentResult, ManagerConfig, ManagerRouteResult, ManagerTextResult, PlanResult, TaskChatRouteResult, TaskProposal, WorkflowDifficulty } from '../src/types.js';
 import { WorkflowService } from '../src/workflow.js';
 
 class FakeLarkClient implements LarkClientPort {
   sentTexts: { chatId: string; text: string }[] = [];
   sentFiles: { chatId: string; path: string; name: string }[] = [];
   createdChats: { name: string; memberOpenIds: string[] }[] = [];
+  failNextText: Error | undefined;
 
   async start(): Promise<void> {}
 
   async sendText(chatId: string, text: string): Promise<void> {
+    if (this.failNextText) {
+      const error = this.failNextText;
+      this.failNextText = undefined;
+      throw error;
+    }
     this.sentTexts.push({ chatId, text });
   }
 
@@ -34,6 +40,9 @@ class FakeLarkClient implements LarkClientPort {
 }
 
 class FakeManager implements ManagerAdapter {
+  intents: IntentResult[] = [];
+  taskRoutes: TaskChatRouteResult[] = [];
+
   async createTaskBrief(): Promise<ManagerTextResult> {
     return { markdown: 'brief ready', needsUserDecision: false };
   }
@@ -54,10 +63,41 @@ class FakeManager implements ManagerAdapter {
     return `confirm: ${input.reply}`;
   }
 
+  async classifyIntent(input: { userMessage: string; state: { status: string } }): Promise<IntentResult> {
+    const next = this.intents.shift();
+    if (next) return next;
+    const message = input.userMessage.toLocaleLowerCase();
+    if (message === 'status' || message === '/status') return intent('status', '查看状态');
+    if (message === 'summary' || message === '/summary') return intent('summary', '查看总结');
+    if (message === 'stop' || message === '/stop') return intent('stop', '停止任务');
+    if (message === 'help' || message === '/help') return intent('ask', '询问帮助');
+    if (message.includes('approve') || input.userMessage.includes('同意') || (message === 'a' && input.state.status === 'awaiting_brief_confirmation')) return intent('approve', '同意继续');
+    if (message.includes('reject') || (message === 'b' && input.state.status === 'awaiting_brief_confirmation')) return intent('reject', '拒绝当前步骤');
+    if (message.includes('medium')) return intent('difficulty', '选择中等难度', { difficulty: 'medium' });
+    if (message.includes('high')) return intent('difficulty', '选择高难度', { difficulty: 'high' });
+    if (input.userMessage.includes('解释') || input.userMessage.includes('？') || message.includes('plan')) return intent('ask', '询问当前任务');
+    return intent('unknown', 'not sure whether。鎴戜笉纭畾。我在。鎴戝湪 我不确定你的意思', { confidence: 0.4, requiresClarification: true });
+  }
+
+  async composeReply(input: { rawMessage: string }): Promise<{ text: string }> {
+    return { text: input.rawMessage };
+  }
+
+  async routeTaskChat(input: { message: string; state: { status: string } }): Promise<TaskChatRouteResult> {
+    const route = this.taskRoutes.shift();
+    if (route) return route;
+    return {
+      action: 'reply_only',
+      confidence: 0.9,
+      reason: `test fallback for ${input.message}`,
+    };
+  }
+
   async handleControlChat(input: {
     message: string;
     pendingProposal?: TaskProposal;
     mode: 'message' | 'edit';
+    projectContext: string;
   }): Promise<ControlChatResult> {
     if (input.mode === 'edit' && input.pendingProposal) {
       return {
@@ -73,6 +113,19 @@ class FakeManager implements ManagerAdapter {
     if (/prompt|先帮我整理一下|先不要创建\s*task|不要执行/i.test(input.message)) {
       return { kind: 'answer', markdown: `prompt draft: ${input.message}` };
     }
+    if (/^implement\b/i.test(input.message)) {
+      return {
+        kind: 'proposal',
+        proposal: {
+          interpretedIntent: `intent: ${input.message}`,
+          title: input.message.slice(0, 40),
+          task: `Task prompt: ${input.message}`,
+          wouldDo: ['Create a workflow task after confirmation.'],
+          wouldNotDo: ['Start the workflow before confirmation.'],
+          suggestedNextAction: 'Reply create task, edit: <instruction>, or cancel.',
+        },
+      };
+    }
     if (/^(帮我|请|实现|检查|修复)/.test(input.message)) {
       return {
         kind: 'proposal',
@@ -86,12 +139,29 @@ class FakeManager implements ManagerAdapter {
         },
       };
     }
+    if (/ireader/i.test(input.message)) {
+      return { kind: 'answer', markdown: `context answer: ${input.projectContext}` };
+    }
     return { kind: 'answer', markdown: `chat answer: ${input.message}` };
   }
 
   async routeAfterFinalReview(): Promise<ManagerRouteResult> {
     return { route: 'complete', reason: 'ok' };
   }
+}
+
+function intent(
+  name: IntentResult['intent'],
+  userFacingInterpretation: string,
+  extras: Partial<IntentResult> = {},
+): IntentResult {
+  return {
+    intent: name,
+    confidence: 0.95,
+    requiresClarification: false,
+    userFacingInterpretation,
+    ...extras,
+  };
 }
 
 class FakeHeavyAgents implements HeavyAgentAdapter {
@@ -245,6 +315,11 @@ async function waitFor(assertion: () => void): Promise<void> {
   throw lastError;
 }
 
+async function readJsonl(path: string): Promise<Record<string, unknown>[]> {
+  const content = await readFile(path, 'utf8');
+  return content.trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
 async function pair(bridge: LarkBridge): Promise<void> {
   await bridge.handleMessage(message({ eventId: 'pair', text: '/pair 123456' }));
 }
@@ -274,6 +349,38 @@ describe('LarkBridge', () => {
 
       expect(client.sentTexts.at(-1)?.text).toContain('配对成功');
       expect((await stateStore.load()).pairedOpenIds).toContain('user-open-id');
+    } finally {
+      await cleanup([root, targetDir]);
+    }
+  });
+
+  it('writes inbound and outbound audit entries for Lark messages', async () => {
+    const { root, targetDir, bridge } = await makeBridge();
+    try {
+      await bridge.handleMessage(message({ eventId: 'audit-pair', messageId: 'audit-message', text: '/pair 123456' }));
+
+      const inbound = await readJsonl(join(root, 'logs', 'ai-workflow', 'lark-inbound.jsonl'));
+      expect(inbound.some((entry) => entry.eventId === 'audit-pair' && entry.outcome === 'received')).toBe(true);
+
+      const outbound = await readJsonl(join(root, 'logs', 'ai-workflow', 'lark-outbound.jsonl'));
+      expect(outbound.some((entry) => entry.kind === 'text' && entry.action === 'pair_succeeded' && entry.success === true)).toBe(true);
+    } finally {
+      await cleanup([root, targetDir]);
+    }
+  });
+
+  it('does not mark a task status notified when outbound Lark send fails', async () => {
+    const { root, targetDir, bridge, client, stateStore, conversation } = await makeBridge();
+    try {
+      const taskId = await bindCreatedTask(stateStore, conversation);
+      client.failNextText = new Error('send failed');
+
+      await expect(bridge.watchTaskStatuses()).rejects.toThrow('send failed');
+
+      const state = await stateStore.load();
+      expect(state.notifiedStatusByTaskId[taskId]).toBeUndefined();
+      const outbound = await readJsonl(join(root, 'logs', 'ai-workflow', 'lark-outbound.jsonl'));
+      expect(outbound.some((entry) => entry.kind === 'text' && entry.success === false && entry.error === 'send failed')).toBe(true);
     } finally {
       await cleanup([root, targetDir]);
     }
@@ -318,7 +425,7 @@ describe('LarkBridge', () => {
       await bridge.handleMessage(message({ eventId: `cmd-${text}`, messageId: `msg-${text}`, text }));
 
       expect(client.createdChats).toHaveLength(0);
-      expect(client.sentTexts.at(-1)?.text).toContain('no active task');
+      expect(client.sentTexts.at(-1)?.text).toMatch(/no active task|没有正在绑定/);
     } finally {
       await cleanup([root, targetDir]);
     }
@@ -345,6 +452,28 @@ describe('LarkBridge', () => {
 
       expect(client.createdChats).toHaveLength(0);
       expect(client.sentTexts.at(-1)?.text).toContain('chat answer: hello');
+    } finally {
+      await cleanup([root, targetDir]);
+    }
+  });
+
+  it('uses mentioned project Markdown context in unbound control chat', async () => {
+    const { root, targetDir, bridge, client } = await makeBridge();
+    try {
+      const docsDir = join(root, 'project-docs', 'ireader');
+      await mkdir(docsDir, { recursive: true });
+      await writeFile(join(docsDir, 'MANAGER_PROJECT_ARCHITECTURE.md'), '# iReader\nIReader project context is available.\n', 'utf8');
+
+      await pair(bridge);
+      await bridge.handleMessage(message({
+        eventId: 'read-ireader',
+        messageId: 'message-read-ireader',
+        text: '你去读一下 iReader 的内容',
+      }));
+
+      expect(client.createdChats).toHaveLength(0);
+      expect(client.sentTexts.at(-1)?.text).toContain('MANAGER_PROJECT_ARCHITECTURE.md#iReader');
+      expect(client.sentTexts.at(-1)?.text).toContain('IReader project context is available');
     } finally {
       await cleanup([root, targetDir]);
     }
@@ -431,6 +560,24 @@ describe('LarkBridge', () => {
     }
   });
 
+  it('accepts mixed natural-language create task confirmation for a pending proposal', async () => {
+    const { root, targetDir, bridge, client, stateStore } = await makeBridge();
+    try {
+      await pair(bridge);
+      await bridge.handleMessage(message({ eventId: 'proposal-before-natural-confirm-ascii', messageId: 'message-before-natural-confirm-ascii', text: 'Implement Lark proposal flow' }));
+      expect((await stateStore.load()).pendingProposalsByChatId['control-chat']).toBeDefined();
+
+      await bridge.handleMessage(message({ eventId: 'natural-confirm-proposal-ascii', messageId: 'message-natural-confirm-proposal-ascii', text: '\u53ef\u4ee5\uff0ccreate task' }));
+      expect(client.createdChats).toHaveLength(1);
+      expect((await stateStore.load()).pendingProposalsByChatId['control-chat']).toBeUndefined();
+      await waitFor(() => {
+        expect(client.sentFiles.some((file) => file.chatId === 'task-chat-1' && file.name === 'manager-brief.md')).toBe(true);
+      });
+    } finally {
+      await cleanup([root, targetDir]);
+    }
+  });
+
   it('editing a pending proposal updates it without creating a task', async () => {
     const { root, targetDir, bridge, client, stateStore } = await makeBridge();
     try {
@@ -447,7 +594,7 @@ describe('LarkBridge', () => {
     }
   });
 
-  it.each(['edit: keep it small', 'confirm', 'create task', 'yes create'])('clarifies %s without a pending proposal', async (text) => {
+  it.each(['edit: keep it small', 'confirm', 'create task', 'yes create', '\u53ef\u4ee5\uff0ccreate task'])('clarifies %s without a pending proposal', async (text) => {
     const { root, targetDir, bridge, client } = await makeBridge();
     try {
       await pair(bridge);
@@ -508,7 +655,7 @@ describe('LarkBridge', () => {
 
       await bridge.handleMessage(message({ eventId: 'bound-help', messageId: 'message-help', chatId: 'task-chat-existing', text: 'help' }));
       expect(client.createdChats).toHaveLength(0);
-      expect(client.sentTexts.at(-1)?.text).toContain('Current task commands');
+      expect(client.sentTexts.at(-1)?.text).toContain('answer: help');
     } finally {
       await cleanup([root, targetDir]);
     }
@@ -549,6 +696,61 @@ describe('LarkBridge', () => {
         expect(client.sentTexts.some((sent) => sent.chatId === 'task-chat-1' && sent.text.includes('Brief approved'))).toBe(true);
       });
       expect((await stateStore.load()).bindingsByChatId['task-chat-1']?.taskId).toBe(binding?.taskId);
+    } finally {
+      await cleanup([root, targetDir]);
+    }
+  });
+
+  it('responds like a task chatbot when casual chat arrives during a waiting state', async () => {
+    const { root, targetDir, bridge, client, stateStore } = await makeBridge();
+    try {
+      await pair(bridge);
+      await bridge.handleMessage(message({
+        eventId: 'new-chatty-task',
+        messageId: 'message-chatty-task',
+        text: 'create task: Chatty task',
+      }));
+      await waitFor(() => {
+        expect(client.sentFiles.some((file) => file.chatId === 'task-chat-1' && file.name === 'manager-brief.md')).toBe(true);
+      });
+
+      await bridge.handleMessage(message({ eventId: 'chatty-approve', messageId: 'message-chatty-approve', chatId: 'task-chat-1', text: 'approve A' }));
+      await waitFor(() => {
+        expect(client.sentTexts.some((sent) => sent.chatId === 'task-chat-1' && sent.text.includes('low, medium, or high'))).toBe(true);
+      });
+
+      await bridge.handleMessage(message({ eventId: 'chatty-hi', messageId: 'message-chatty-hi', chatId: 'task-chat-1', text: 'hi' }));
+      const last = client.sentTexts.at(-1)?.text ?? '';
+      expect(last).toContain('我在');
+      expect(last).toContain('不能执行');
+      expect((await stateStore.load()).bindingsByChatId['task-chat-1']).toBeDefined();
+    } finally {
+      await cleanup([root, targetDir]);
+    }
+  });
+
+  it('accepts natural-language difficulty choices from a task chat', async () => {
+    const { root, targetDir, bridge, client } = await makeBridge();
+    try {
+      await pair(bridge);
+      await bridge.handleMessage(message({
+        eventId: 'new-natural-difficulty-task',
+        messageId: 'message-natural-difficulty-task',
+        text: 'create task: Natural difficulty task',
+      }));
+      await waitFor(() => {
+        expect(client.sentFiles.some((file) => file.chatId === 'task-chat-1' && file.name === 'manager-brief.md')).toBe(true);
+      });
+
+      await bridge.handleMessage(message({ eventId: 'natural-difficulty-approve', messageId: 'message-natural-difficulty-approve', chatId: 'task-chat-1', text: 'approve A' }));
+      await waitFor(() => {
+        expect(client.sentTexts.some((sent) => sent.chatId === 'task-chat-1' && sent.text.includes('low, medium, or high'))).toBe(true);
+      });
+
+      await bridge.handleMessage(message({ eventId: 'natural-difficulty-medium', messageId: 'message-natural-difficulty-medium', chatId: 'task-chat-1', text: 'choose medium' }));
+      await waitFor(() => {
+        expect(client.sentTexts.some((sent) => sent.chatId === 'task-chat-1' && sent.text.includes('Revised plan is ready'))).toBe(true);
+      });
     } finally {
       await cleanup([root, targetDir]);
     }

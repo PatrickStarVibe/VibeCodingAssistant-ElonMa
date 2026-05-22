@@ -1,19 +1,28 @@
-import { readFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 
 import { getDefaultManagerRoot } from './config.js';
+import { sanitizeTextForArtifact } from './textSanitizer.js';
 import type {
   AgentProfileConfig,
+  AllowedAction,
+  ArtifactName,
+  ComposedReply,
   ControlChatResult,
   FinalReviewResult,
   ExecutionUnitState,
   ImplementationResult,
+  IntentName,
+  IntentResult,
   ManagerConfig,
   ManagerRouteResult,
   ManagerTextResult,
   PlanPackDraft,
   PlanResult,
   ReviewResult,
+  TaskChatRouteAction,
+  TaskChatRouteResult,
   TaskProposal,
   TaskState,
   WorkflowDifficulty,
@@ -22,6 +31,20 @@ import type {
 import { runFile } from './processRunner.js';
 
 export interface ManagerAdapter {
+  classifyIntent(input: {
+    userMessage: string;
+    state: TaskState;
+    allowedActions: AllowedAction[];
+    recentContext: string;
+    config: ManagerConfig;
+  }): Promise<IntentResult>;
+  composeReply(input: {
+    rawMessage: string;
+    state: TaskState;
+    pendingPrompt?: string;
+    userQuestion?: string;
+    config: ManagerConfig;
+  }): Promise<ComposedReply>;
   createTaskBrief(input: { task: string; projectContext: string; briefRevisionRequests: string[]; state: TaskState; config: ManagerConfig }): Promise<ManagerTextResult>;
   createRevisionInstructions(input: {
     task: string;
@@ -43,10 +66,12 @@ export interface ManagerAdapter {
   }): Promise<ManagerTextResult>;
   answerQuestion(input: { question: string; context: string; projectContext: string; state: TaskState; config: ManagerConfig }): Promise<string>;
   interpretAmbiguousReply(input: { reply: string; context: string; state: TaskState; config: ManagerConfig }): Promise<string>;
+  routeTaskChat(input: { message: string; context: string; projectContext: string; state: TaskState; config: ManagerConfig }): Promise<TaskChatRouteResult>;
   handleControlChat(input: {
     message: string;
     pendingProposal?: TaskProposal;
     mode: 'message' | 'edit';
+    projectContext: string;
     config: ManagerConfig;
   }): Promise<ControlChatResult>;
   routeAfterFinalReview(input: {
@@ -114,6 +139,10 @@ function booleanValue(value: unknown): boolean | undefined {
   return typeof value === 'boolean' ? value : undefined;
 }
 
+function numberValue(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
 function managerTextFromContent(content: string): ManagerTextResult {
   const payload = record(parseMaybeJson(content));
   const result: ManagerTextResult = {
@@ -148,6 +177,42 @@ function routeFromContent(content: string): ManagerRouteResult {
     reason: 'Manager route response was not valid JSON.',
     userPrompt: content,
   };
+}
+
+const INTENT_NAMES = new Set<IntentName>([
+  'approve',
+  'reject',
+  'revise',
+  'difficulty',
+  'stop',
+  'status',
+  'summary',
+  'accept',
+  'note',
+  'ask',
+  'unknown',
+]);
+
+function intentResultFromContent(content: string): IntentResult {
+  const payload = record(parseMaybeJson(content));
+  const rawIntent = stringValue(payload.intent);
+  const intent = rawIntent && INTENT_NAMES.has(rawIntent as IntentName)
+    ? rawIntent as IntentName
+    : 'unknown';
+  const confidence = Math.max(0, Math.min(1, numberValue(payload.confidence) ?? 0));
+  const difficulty = stringValue(payload.difficulty);
+  const result: IntentResult = {
+    intent,
+    confidence,
+    requiresClarification: booleanValue(payload.requiresClarification) ?? (intent === 'unknown' || confidence < 0.6),
+    userFacingInterpretation: stringValue(payload.userFacingInterpretation) ?? '我还不确定你想让我怎么处理这条消息。',
+  };
+  if (difficulty === 'low' || difficulty === 'medium' || difficulty === 'high') result.difficulty = difficulty;
+  const instruction = stringValue(payload.instruction);
+  if (instruction) result.instruction = instruction;
+  const note = stringValue(payload.note);
+  if (note) result.note = note;
+  return result;
 }
 
 function stringArrayValue(value: unknown): string[] | undefined {
@@ -187,7 +252,87 @@ function controlChatFromContent(content: string): ControlChatResult {
   if (kind === 'clarify') {
     return { kind: 'clarify', markdown: stringValue(payload.markdown) ?? content };
   }
+  if (kind === 'create_task' || kind === 'confirm') {
+    return {
+      kind: 'clarify',
+      markdown: [
+        'I understood that as a task creation confirmation, but no task was created from the Manager JSON response.',
+        'Reply `create task` to confirm the pending proposal, or use `create task: <task>` to create a direct task.',
+      ].join('\n'),
+    };
+  }
   return { kind: 'answer', markdown: stringValue(payload.markdown) ?? content };
+}
+
+const TASK_CHAT_ACTIONS = new Set<TaskChatRouteAction>([
+  'reply_only',
+  'answer_question',
+  'status',
+  'summary',
+  'approve',
+  'reject',
+  'revise',
+  'choose_difficulty',
+  'stop',
+  'show_artifact',
+  'create_new_task',
+  'clarify',
+]);
+
+export function taskChatRouteFromContent(content: string): TaskChatRouteResult {
+  const payload = record(parseMaybeJson(content));
+  const rawAction = stringValue(payload.action);
+  const action = rawAction && TASK_CHAT_ACTIONS.has(rawAction as TaskChatRouteAction)
+    ? rawAction as TaskChatRouteAction
+    : 'clarify';
+  const args = record(payload.actionArgs);
+  const difficulty = stringValue(args.difficulty);
+  const artifact = stringValue(args.artifact);
+  const actionArgs: NonNullable<TaskChatRouteResult['actionArgs']> = {};
+  const question = stringValue(args.question);
+  if (question) actionArgs.question = question;
+  if (difficulty === 'low' || difficulty === 'medium' || difficulty === 'high') actionArgs.difficulty = difficulty;
+  const revision = stringValue(args.revision);
+  if (revision) actionArgs.revision = revision;
+  if (isArtifactName(artifact)) actionArgs.artifact = artifact;
+  const title = stringValue(args.title);
+  if (title) actionArgs.title = title;
+  const task = stringValue(args.task);
+  if (task) actionArgs.task = task;
+
+  const result: TaskChatRouteResult = {
+    action,
+    confidence: Math.max(0, Math.min(1, numberValue(payload.confidence) ?? 0)),
+    reason: stringValue(payload.reason) ?? (rawAction ? `Invalid task chat route action: ${rawAction}` : 'Task chat route response was not valid JSON.'),
+  };
+  const replyMarkdown = stringValue(payload.replyMarkdown);
+  if (replyMarkdown) result.replyMarkdown = replyMarkdown;
+  const requiresConfirmation = booleanValue(payload.requiresConfirmation);
+  if (requiresConfirmation !== undefined) result.requiresConfirmation = requiresConfirmation;
+  if (Object.keys(actionArgs).length > 0) result.actionArgs = actionArgs;
+  return result;
+}
+
+function isArtifactName(value: string | undefined): value is ArtifactName {
+  return !!value && [
+    'original-task',
+    'manager-brief',
+    'initial-plan',
+    'review',
+    'revision-instructions',
+    'revised-plan',
+    'manager-explanation',
+    'qa-log',
+    'decision-log',
+    'implementation-log',
+    'git-pre-status',
+    'git-post-status',
+    'git-pre-diff',
+    'git-post-diff',
+    'test-build-log',
+    'final-review',
+    'final-report',
+  ].includes(value);
 }
 
 export async function loadManagerSkill(name: string): Promise<string> {
@@ -252,6 +397,90 @@ export class DeepSeekManagerAdapter implements ManagerAdapter {
       { role: 'user', content: user },
     ], true);
     return managerTextFromContent(content);
+  }
+
+  async classifyIntent(input: {
+    userMessage: string;
+    state: TaskState;
+    allowedActions: AllowedAction[];
+    recentContext: string;
+    config: ManagerConfig;
+  }): Promise<IntentResult> {
+    const content = await this.chat([
+      {
+        role: 'system',
+        content: [
+          '你是 Manager 工作流的对话意图分类器。',
+          '状态机负责流程正确性；你只负责理解用户自然语言。',
+          '只返回 JSON object，不要输出 markdown。',
+          'JSON keys: intent, difficulty, instruction, note, confidence, requiresClarification, userFacingInterpretation.',
+          'intent 必须是 allowedActions 里的 id；如果无法判断，用 unknown。',
+          'difficulty 只在 intent=difficulty 时填写 low、medium 或 high。',
+          'instruction 只在 intent=revise 时填写用户要改什么。',
+          'note 只在 intent=note 时填写备注。',
+          'confidence 是 0 到 1。',
+          'requiresClarification=true 表示需要先问清楚，不能推动 workflow。',
+          'userFacingInterpretation 必须是简短自然中文，用来告诉用户你理解成了什么。',
+        ].join(' '),
+      },
+      {
+        role: 'user',
+        content: [
+          `当前任务状态:\n${JSON.stringify({
+            taskId: input.state.taskId,
+            title: input.state.title,
+            status: input.state.status,
+            difficulty: input.state.difficulty,
+            pendingUserPrompt: input.state.pendingUserPrompt,
+            revisionRound: input.state.revisionRound,
+            reviewerRunCount: input.state.reviewerRunCount,
+          }, null, 2)}`,
+          `当前允许动作:\n${JSON.stringify(input.allowedActions, null, 2)}`,
+          `最近上下文:\n${input.recentContext}`,
+          `用户消息:\n${input.userMessage}`,
+        ].join('\n\n'),
+      },
+    ], true);
+    return intentResultFromContent(content);
+  }
+
+  async composeReply(input: {
+    rawMessage: string;
+    state: TaskState;
+    pendingPrompt?: string;
+    userQuestion?: string;
+    config: ManagerConfig;
+  }): Promise<ComposedReply> {
+    const content = await this.chat([
+      {
+        role: 'system',
+        content: [
+          '你是 Manager 的中文回复润色器。',
+          '把 raw workflow result 改写成自然、简洁、中文优先的聊天回复。',
+          '不要 dump Task ID / Status / Pending 这种状态块。',
+          '不要暴露英文路由词或类似 "User explicitly selected" 的内部措辞。',
+          '可以保留必要的 artifact 名称、命令名和英文技术名。',
+          '必须尊重 workflow gate：如果状态在等待用户，就清楚告诉用户下一步能怎么说。',
+          '不要声称状态机没有做过的事。',
+        ].join(' '),
+      },
+      {
+        role: 'user',
+        content: [
+          `任务状态:\n${JSON.stringify({
+            title: input.state.title,
+            status: input.state.status,
+            difficulty: input.state.difficulty,
+            pendingUserPrompt: input.pendingPrompt ?? input.state.pendingUserPrompt,
+            revisionRound: input.state.revisionRound,
+            reviewerRunCount: input.state.reviewerRunCount,
+          }, null, 2)}`,
+          input.userQuestion ? `用户问题:\n${input.userQuestion}` : undefined,
+          `Raw workflow result:\n${input.rawMessage}`,
+        ].filter(Boolean).join('\n\n'),
+      },
+    ]);
+    return { text: content.trim() || input.rawMessage };
   }
 
   async createTaskBrief(input: { task: string; projectContext: string; briefRevisionRequests: string[]; state: TaskState; config: ManagerConfig }): Promise<ManagerTextResult> {
@@ -353,10 +582,52 @@ export class DeepSeekManagerAdapter implements ManagerAdapter {
     ]);
   }
 
+  async routeTaskChat(input: { message: string; context: string; projectContext: string; state: TaskState; config: ManagerConfig }): Promise<TaskChatRouteResult> {
+    const content = await this.chat([
+      {
+        role: 'system',
+        content: [
+          'You are the Manager Agent inside a bound Lark task chat.',
+          'You are a normal chatbot first, but you may route user intent into workflow actions.',
+          'Return JSON only with keys: action, confidence, reason, optional replyMarkdown, optional requiresConfirmation, optional actionArgs.',
+          'Allowed action values: reply_only, answer_question, status, summary, approve, reject, revise, choose_difficulty, stop, show_artifact, create_new_task, clarify.',
+          'Use reply_only for greetings, acknowledgements, "did you receive this?", and normal chat that does not need task artifact Q&A.',
+          'Use answer_question for questions about the current task, plan, risks, progress, implementation, artifacts, or project context.',
+          'Use approve when the user clearly wants to continue/approve the current waiting decision.',
+          'Use choose_difficulty only with actionArgs.difficulty equal to low, medium, or high.',
+          'Use revise only with actionArgs.revision containing the requested change.',
+          'Use show_artifact only with actionArgs.artifact using one of the known artifact names.',
+          'For stop or create_new_task, set requiresConfirmation=true unless the user is explicit and unambiguous.',
+          'For low confidence or mixed intent, use clarify and ask one short question.',
+          'Do not claim that you executed anything; the local state machine will check permissions and execute.',
+        ].join(' '),
+      },
+      {
+        role: 'user',
+        content: [
+          `Current state:\n${JSON.stringify({
+            taskId: input.state.taskId,
+            title: input.state.title,
+            status: input.state.status,
+            difficulty: input.state.difficulty,
+            pendingUserPrompt: input.state.pendingUserPrompt,
+            revisionRound: input.state.revisionRound,
+            reviewerRunCount: input.state.reviewerRunCount,
+          }, null, 2)}`,
+          `Project context:\n${input.projectContext}`,
+          `Task context:\n${input.context}`,
+          `User message:\n${input.message}`,
+        ].join('\n\n'),
+      },
+    ], true);
+    return taskChatRouteFromContent(content);
+  }
+
   async handleControlChat(input: {
     message: string;
     pendingProposal?: TaskProposal;
     mode: 'message' | 'edit';
+    projectContext: string;
     config: ManagerConfig;
   }): Promise<ControlChatResult> {
     const content = await this.chat([
@@ -365,6 +636,8 @@ export class DeepSeekManagerAdapter implements ManagerAdapter {
         content: [
           'You are the Manager Agent for an unbound Lark control chat.',
           'Behave like a chatbot first: answer questions, explain concepts, help think, and generate prompts when asked.',
+          'Use the provided project context when the user mentions a configured project, asks to read project content, or asks project-specific questions.',
+          'If the provided project context does not contain the requested fact, say that the retrieved context was insufficient instead of claiming direct filesystem access.',
           'Never create or start a real task. You may only propose a task for later confirmation.',
           'Return JSON only.',
           'For normal chat or prompt generation, return {"kind":"answer","markdown":"..."}; do not create a proposal unless the user clearly describes a future workflow task.',
@@ -378,6 +651,7 @@ export class DeepSeekManagerAdapter implements ManagerAdapter {
         content: [
           `Mode: ${input.mode}`,
           `Target workspace: ${input.config.workspace.targetDir}`,
+          `Project context:\n${input.projectContext}`,
           input.pendingProposal ? `Pending proposal:\n${JSON.stringify(input.pendingProposal, null, 2)}` : 'Pending proposal: none',
           `User message:\n${input.message}`,
         ].join('\n\n'),
@@ -493,15 +767,36 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
     const profile = config.profiles[profileName];
     const command = profile?.command ?? 'codex';
     const sandbox = role === 'developer' ? 'danger-full-access' : 'read-only';
-    const result = await runFile(command, ['-a', 'never', 'exec', '-C', config.workspace.targetDir, '--sandbox', sandbox, '--skip-git-repo-check', '-'], config.workspace.targetDir, prompt);
-    return [result.stdout, result.stderr].filter(Boolean).join('\n');
+    const outputDir = await mkdtemp(join(tmpdir(), 'manager-codex-'));
+    const outputPath = join(outputDir, 'last-message.md');
+    try {
+      const result = await runFile(command, [
+        '-a',
+        'never',
+        'exec',
+        '--color',
+        'never',
+        '--output-last-message',
+        outputPath,
+        '-C',
+        config.workspace.targetDir,
+        '--sandbox',
+        sandbox,
+        '--skip-git-repo-check',
+        '-',
+      ], config.workspace.targetDir, prompt);
+      const lastMessage = await readFile(outputPath, 'utf8').catch(() => '');
+      return sanitizeTextForArtifact(lastMessage.trim() || [result.stdout, result.stderr].filter(Boolean).join('\n'));
+    } finally {
+      await rm(outputDir, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 
   private async claude(prompt: string, profileName: string, config = this.config): Promise<string> {
     const profile = config.profiles[profileName];
     const command = profile?.command ?? 'claude';
     const result = await runFile(command, ['-p', '--permission-mode', 'bypassPermissions', '--add-dir', config.workspace.targetDir], config.workspace.targetDir, prompt);
-    return [result.stdout, result.stderr].filter(Boolean).join('\n');
+    return sanitizeTextForArtifact([result.stdout, result.stderr].filter(Boolean).join('\n'));
   }
 
   private runWorkflowRole(
@@ -594,6 +889,7 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
       `Current execution unit:\nTask ${String(input.executionUnit.index).padStart(2, '0')}: ${input.executionUnit.name}`,
       'Do not revert unrelated user changes. Report changed files at the end.',
       'Run focused tests when practical and include the Test Result details for this execution unit.',
+      'When reading Markdown or other text files, preserve UTF-8 text. On Windows PowerShell, use Get-Content -Raw -Encoding utf8 for file content, and keep command output free of ANSI color codes.',
     ].join('\n\n'), difficulty, 'developer', input.config);
     return { markdown, changedFiles: [] };
   }

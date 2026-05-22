@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -11,10 +11,12 @@ import type { HeavyAgentAdapter, ManagerAdapter } from '../src/adapters.js';
 import type {
   ControlChatResult,
   FinalReviewResult,
+  IntentResult,
   ManagerConfig,
   ManagerRouteResult,
   ManagerTextResult,
   PlanResult,
+  TaskChatRouteResult,
   TaskProposal,
   WorkflowDifficulty,
 } from '../src/types.js';
@@ -22,6 +24,12 @@ import { createHeavyAgentAdapter } from '../src/adapters.js';
 import { WorkflowService, type WorkflowResult } from '../src/workflow.js';
 
 const execFileAsync = promisify(execFile);
+const gb18030Decoder = new TextDecoder('gb18030');
+const utf8Encoder = new TextEncoder();
+
+function simulateUtf8ReadAsGbk(value: string): string {
+  return gb18030Decoder.decode(utf8Encoder.encode(value));
+}
 
 class FakeManager implements ManagerAdapter {
   route: ManagerRouteResult = { route: 'complete', reason: 'No blocking issues.' };
@@ -54,6 +62,28 @@ class FakeManager implements ManagerAdapter {
     return this.fallbackReply;
   }
 
+  async classifyIntent(): Promise<IntentResult> {
+    return {
+      intent: 'unknown',
+      confidence: 0.4,
+      requiresClarification: true,
+      userFacingInterpretation: 'unclear',
+    };
+  }
+
+  async composeReply(input: { rawMessage: string }): Promise<{ text: string }> {
+    return { text: input.rawMessage };
+  }
+
+  async routeTaskChat(input: { message: string }): Promise<TaskChatRouteResult> {
+    return {
+      action: 'reply_only',
+      confidence: 0.9,
+      reason: `test fallback for ${input.message}`,
+      replyMarkdown: this.fallbackReply,
+    };
+  }
+
   async handleControlChat(input: { message: string; pendingProposal?: TaskProposal; mode: 'message' | 'edit' }): Promise<ControlChatResult> {
     if (input.mode === 'edit' && input.pendingProposal) {
       return {
@@ -74,11 +104,15 @@ class FakeManager implements ManagerAdapter {
 
 class FakeHeavyAgents implements HeavyAgentAdapter {
   reviewerRuns = 0;
+  implementRuns = 0;
+  finalReviewRuns = 0;
   difficultyCalls: WorkflowDifficulty[] = [];
   initialPlanProjectContexts: string[] = [];
   implementationProjectContexts: string[] = [];
   finalReviewResult: FinalReviewResult = { markdown: 'Final review passed.', passed: true };
+  implementationMarkdown = 'Implementation completed by fake adapter.';
   implementationWritePath?: string;
+  planPackDraft?: PlanResult['planPackDraft'];
 
   async createInitialPlan(input: { difficulty: WorkflowDifficulty; projectContext: string }): Promise<PlanResult> {
     this.difficultyCalls.push(input.difficulty);
@@ -86,6 +120,7 @@ class FakeHeavyAgents implements HeavyAgentAdapter {
     return {
       markdown: '# Initial Plan\n\n- Build the workflow.\n\n## Verification Commands\n- npm test',
       verificationCommands: ['npm test'],
+      ...(this.planPackDraft ? { planPackDraft: this.planPackDraft } : {}),
     };
   }
 
@@ -100,18 +135,21 @@ class FakeHeavyAgents implements HeavyAgentAdapter {
     return {
       markdown: '# Revised Plan\n\n- Build the workflow with explicit artifact boundaries.\n\n## Verification Commands\n- npm test\n- node unsafe.js',
       verificationCommands: ['npm test', 'node unsafe.js'],
+      ...(this.planPackDraft ? { planPackDraft: this.planPackDraft } : {}),
     };
   }
 
   async implement(input: { projectContext: string }): Promise<{ markdown: string; changedFiles: string[] }> {
+    this.implementRuns += 1;
     this.implementationProjectContexts.push(input.projectContext);
     if (this.implementationWritePath) {
       await writeFile(this.implementationWritePath, 'implementation output\n', 'utf8');
     }
-    return { markdown: 'Implementation completed by fake adapter.', changedFiles: ['implementation.txt'] };
+    return { markdown: this.implementationMarkdown, changedFiles: ['implementation.txt'] };
   }
 
   async finalReview(): Promise<FinalReviewResult> {
+    this.finalReviewRuns += 1;
     return this.finalReviewResult;
   }
 }
@@ -301,21 +339,79 @@ describe('WorkflowService', () => {
   });
 
   it('approves, implements, final-reviews, and writes a final report with dirty sections', async () => {
-    const { root, targetDir, service } = await makeService();
+    const { root, targetDir, service, heavy } = await makeService();
     try {
+      heavy.implementationMarkdown = [
+        'Implementation completed by fake adapter.',
+        `\u001b[36m${simulateUtf8ReadAsGbk('中文文件读取')}\u001b[39m`,
+      ].join('\n');
       await writeFile(join(targetDir, 'preexisting.txt'), 'dirty before implementation\n', 'utf8');
       const created = await service.createTask({ title: 'Approve task', task: 'Build a feature.' });
       const planned = await planThroughBrief(service, created.state.taskId);
       const approved = await service.reply(planned.state.taskId, 'A');
 
-      expect(approved.state.status).toBe('completed');
-      const report = await service.showArtifact(approved.state.taskId, 'final-report');
+      expect(approved.state.status).toBe('awaiting_user_acceptance');
+      const accepted = await service.reply(planned.state.taskId, 'accept');
+      expect(accepted.state.status).toBe('completed');
+      const report = await service.showArtifact(accepted.state.taskId, 'final-report');
       expect(report).toContain('## 本次 implementation 产生的 diff');
+      expect(report).toContain('中文文件读取');
+      expect(report).not.toContain('\u001b[');
       expect(report).toContain('implementation.txt');
       expect(report).toContain('## pre-existing dirty');
       expect(report).toContain('preexisting.txt');
-      expect(await service.showArtifact(approved.state.taskId, 'test-build-log')).toContain('node unsafe.js');
-      expect(await service.showArtifact(approved.state.taskId, 'test-build-log')).toContain('blocked');
+      expect(await service.showArtifact(accepted.state.taskId, 'test-build-log')).toContain('node unsafe.js');
+      expect(await service.showArtifact(accepted.state.taskId, 'test-build-log')).toContain('blocked');
+      const taskRecord = await readFile(join(targetDir, 'task', accepted.state.taskId, 'task-record.md'), 'utf8');
+      expect(taskRecord).toContain('中文文件读取');
+      expect(taskRecord).not.toContain('\u001b[');
+    } finally {
+      await cleanup([root, targetDir]);
+    }
+  });
+
+  it('persists approved plan artifacts, runs decomposed execution units sequentially, and waits for user acceptance', async () => {
+    const { root, targetDir, service, heavy } = await makeService();
+    try {
+      heavy.planPackDraft = {
+        category: 'Manager / Workflow',
+        summary: 'Add universal task record storage.',
+        executionUnits: [
+          { name: 'Task record storage' },
+          { name: 'Acceptance workflow' },
+        ],
+      };
+      const created = await service.createTask({ title: 'Task records', task: 'Add universal task records.' });
+      const planned = await planThroughBrief(service, created.state.taskId);
+      const approved = await service.reply(planned.state.taskId, 'approve A');
+
+      expect(approved.state.status).toBe('awaiting_user_acceptance');
+      expect(approved.state.category).toBe('Manager / Workflow');
+      expect(approved.state.executionMode).toBe('decomposed');
+      expect(approved.state.executionQueue.map((unit) => unit.status)).toEqual(['Done', 'Done']);
+      expect(heavy.implementRuns).toBe(2);
+      expect(heavy.finalReviewRuns).toBe(1);
+
+      const parentDir = join(targetDir, 'task', approved.state.taskId);
+      await expect(readFile(join(parentDir, 'plan.md'), 'utf8')).resolves.toContain('Build the workflow');
+      await expect(readFile(join(parentDir, 'plan-review.md'), 'utf8')).resolves.toContain('Reviewer says');
+      await expect(readFile(join(parentDir, 'subtasks', '01-task-record-storage.md'), 'utf8')).resolves.toContain('## Test Result');
+      await expect(readFile(join(parentDir, 'task-record.md'), 'utf8')).resolves.toContain('Pending');
+
+      const noted = await service.reply(approved.state.taskId, 'note: looks good after smoke testing');
+      expect(noted.state.status).toBe('awaiting_user_acceptance');
+      expect(noted.state.userAcceptanceNotes).toContain('looks good after smoke testing');
+
+      const accepted = await service.reply(approved.state.taskId, 'accept');
+      expect(accepted.state.status).toBe('completed');
+      const taskRecord = await readFile(join(parentDir, 'task-record.md'), 'utf8');
+      expect(taskRecord).toContain('# Task Record: Task records');
+      expect(taskRecord).toContain('Accepted at');
+      expect(taskRecord).toContain('looks good after smoke testing');
+      const globalReadme = await readFile(join(targetDir, 'task', 'README.md'), 'utf8');
+      expect(globalReadme).toContain('| Task | Category | Status | Execution Mode | Summary | Updated |');
+      expect(globalReadme).toContain('Manager / Workflow');
+      expect(globalReadme).toContain('completed');
     } finally {
       await cleanup([root, targetDir]);
     }
