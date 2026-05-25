@@ -3,6 +3,7 @@ import { basename } from 'node:path';
 import { ArtifactStore } from './artifacts.js';
 import type { AssistantAdapter } from './adapters.js';
 import { getAllowedActions, humanStageName } from './allowedActions.js';
+import { normalizeWorkflowDifficulty } from './difficulty.js';
 import { orchestrateTaskMessage, type OrchestratorTurn } from './orchestrator.js';
 import { ProjectKnowledgeService } from './projectKnowledge.js';
 import { getDefaultProjectId } from './projects.js';
@@ -22,6 +23,7 @@ const ARTIFACT_NAMES: ArtifactName[] = [
   'initial-plan',
   'review',
   'revision-instructions',
+  'plan-rounds-log',
   'revised-plan',
   'assistant-explanation',
   'qa-log',
@@ -97,7 +99,7 @@ export class AssistantConversationService {
   startPlanning(taskId: string): BackgroundConversationTurn {
     return {
       kind: 'background',
-      startedMessage: { text: '任务已创建，请先选择工作难度：low、medium 或 high。' },
+      startedMessage: { text: '任务已创建，请先选择工作难度：low、medium、high 或 extra high。' },
       run: () => this.workflow.planTask(taskId),
     };
   }
@@ -368,7 +370,7 @@ export class AssistantConversationService {
         auditAction: `intent:${intent.intent}:clarify`,
         auditMetadata: intentAuditMetadata(intent),
         messages: [await this.composeMessage({
-          rawMessage: '我理解你想继续推进，但缺少必要信息。比如选择难度时需要明确 low、medium 或 high。',
+          rawMessage: '我理解你想继续推进，但缺少必要信息。比如选择难度时需要明确 low、medium、high 或 extra high。',
           state,
         })],
       };
@@ -553,11 +555,13 @@ export function parseExplicitWorkflowCommand(text: string, state: TaskState): Ex
   const acceptMatch = compact.match(/^(?:accept|accepted)(?:\s*:\s*(.+))?$/i);
   if (acceptMatch) return { intent: 'accept', reply: compact, ...(acceptMatch[1]?.trim() ? { instruction: acceptMatch[1].trim() } : {}) };
 
-  const difficultyMatch = compact.match(/^(low|medium|high)(?:\s*:\s*(.+))?$/i);
+  const difficultyMatch = compact.match(/^(low|medium|high|extra[-_ ]?high)(?:\s*:\s*(.+))?$/i);
   if (difficultyMatch?.[1]) {
+    const difficulty = normalizeWorkflowDifficulty(difficultyMatch[1]);
+    if (!difficulty) return undefined;
     return {
       intent: 'difficulty',
-      reply: compact,
+      reply: difficultyMatch[2]?.trim() ? `${difficulty}: ${difficultyMatch[2].trim()}` : difficulty,
       ...(difficultyMatch[2]?.trim() ? { instruction: difficultyMatch[2].trim() } : {}),
     };
   }
@@ -883,7 +887,7 @@ function isWorkflowBoilerplate(text: string): boolean {
 
 function localizePendingPrompt(prompt: string): string {
   if (/Choose workflow difficulty/i.test(prompt)) {
-    return '请选择难度：低/中/高。也可以直接说「默认难度」或「高难度」。';
+    return '请选择难度：低/中/高/extra high。也可以直接说「默认难度」或「高难度」。';
   }
   if (/Approve A to implement/i.test(prompt) || /ready for your decision/i.test(prompt)) {
     return '请确认修订后的计划：可以说「批准/开始实现」，或说明还要改哪里。';

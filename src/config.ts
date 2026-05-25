@@ -2,13 +2,13 @@ import { readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { WORKFLOW_DIFFICULTIES } from './difficulty.js';
 import { loadDynamicProjects, mergeProjectLists } from './projectRegistry.js';
 import type {
   AgentProfileConfig,
   HeavyWorkflowRoleName,
   AssistantConfig,
   ProjectConfig,
-  WorkflowDifficulty,
   WorkflowRoleProfiles,
 } from './types.js';
 
@@ -36,6 +36,12 @@ const DEFAULT_WORKFLOW_ROLES: WorkflowRoleProfiles = {
     finalReviewer: 'final-reviewer-agent',
   },
   high: {
+    architect: 'architect-agent',
+    planReviewer: 'plan-reviewer-agent',
+    developer: 'developer-agent',
+    finalReviewer: 'final-reviewer-agent',
+  },
+  'extra-high': {
     architect: 'architect-agent',
     planReviewer: 'plan-reviewer-agent',
     developer: 'developer-agent',
@@ -211,15 +217,16 @@ function normalizeProjects(rawProjects: unknown, workspaceTargetDir: string, def
 
 function normalizeWorkflowRoles(raw: unknown, base: WorkflowRoleProfiles): WorkflowRoleProfiles {
   const root = objectValue(raw);
-  const difficulties: WorkflowDifficulty[] = ['low', 'medium', 'high'];
   const roleNames: HeavyWorkflowRoleName[] = ['architect', 'planReviewer', 'developer', 'finalReviewer'];
   const normalized = { ...base, assistant: stringValue(root.assistant) ?? base.assistant } as WorkflowRoleProfiles;
+  const hasRawExtraHigh = Object.prototype.hasOwnProperty.call(root, 'extra-high');
 
-  for (const difficulty of difficulties) {
+  for (const difficulty of WORKFLOW_DIFFICULTIES) {
     const rawRoles = objectValue(root[difficulty]);
-    normalized[difficulty] = { ...base[difficulty] };
+    const baseRoles = difficulty === 'extra-high' && !hasRawExtraHigh ? normalized.high : base[difficulty];
+    normalized[difficulty] = { ...baseRoles };
     for (const role of roleNames) {
-      normalized[difficulty][role] = stringValue(rawRoles[role]) ?? base[difficulty][role];
+      normalized[difficulty][role] = stringValue(rawRoles[role]) ?? baseRoles[role];
     }
   }
 

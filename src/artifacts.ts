@@ -9,6 +9,7 @@ const ARTIFACT_FILES: Record<ArtifactName, string> = {
   'initial-plan': 'initial-plan.md',
   review: 'review.md',
   'revision-instructions': 'revision-instructions.md',
+  'plan-rounds-log': 'plan-rounds-log.md',
   'revised-plan': 'revised-plan.md',
   'assistant-explanation': 'assistant-explanation.md',
   'qa-log': 'qa-log.md',

@@ -204,6 +204,12 @@ function makeConfig(targetDir: string): AssistantConfig {
         developer: 'implementer',
         finalReviewer: 'finalReviewer',
       },
+      'extra-high': {
+        architect: 'reviewer',
+        planReviewer: 'planner',
+        developer: 'implementer',
+        finalReviewer: 'finalReviewer',
+      },
     },
     profiles: {
       assistant: { kind: 'deepseek' },
@@ -278,12 +284,13 @@ async function cleanup(paths: string[]): Promise<void> {
   await Promise.all(paths.map((path) => rm(path, { recursive: true, force: true })));
 }
 
-async function planThroughDifficulty(service: WorkflowService, taskId: string, difficulty: 'low' | 'medium' | 'high' = 'medium'): Promise<WorkflowResult> {
+async function planThroughDifficulty(service: WorkflowService, taskId: string, difficulty: WorkflowDifficulty = 'medium'): Promise<WorkflowResult> {
   const difficultyStop = await service.planTask(taskId);
   expect(difficultyStop.state.status).toBe('awaiting_difficulty_selection');
   expect(difficultyStop.state.pendingUserPrompt).toContain('low');
   expect(difficultyStop.state.pendingUserPrompt).toContain('medium');
   expect(difficultyStop.state.pendingUserPrompt).toContain('high');
+  expect(difficultyStop.state.pendingUserPrompt).toContain('extra high');
   return service.reply(taskId, difficulty);
 }
 
@@ -552,6 +559,7 @@ describe('WorkflowService', () => {
       expect(difficultyStop.state.pendingUserPrompt).toContain('low');
       expect(difficultyStop.state.pendingUserPrompt).toContain('medium');
       expect(difficultyStop.state.pendingUserPrompt).toContain('high');
+      expect(difficultyStop.state.pendingUserPrompt).toContain('extra high');
       expect(difficultyStop.state.revisionRound).toBe(0);
       expect(heavy.difficultyCalls).toHaveLength(0);
       expect(heavy.reviewerRuns).toBe(0);
@@ -571,6 +579,25 @@ describe('WorkflowService', () => {
       expect(planned.state.difficulty).toBe('medium');
       expect(planned.state.pendingUserPrompt).toBeUndefined();
       expect(heavy.difficultyCalls).toEqual(['medium', 'medium', 'medium']);
+    } finally {
+      await cleanup([root, targetDir]);
+    }
+  });
+
+  it.each([
+    ['extra high', []],
+    ['Extra-High', []],
+    ['EXTRA_HIGH: keep the original prompt', ['keep the original prompt']],
+  ])('canonicalizes %s to extra-high difficulty', async (reply, expectedChanges) => {
+    const { root, targetDir, service } = await makeService();
+    try {
+      const created = await service.createTask({ title: 'Extra high task', task: 'Build a careful feature.' });
+      await service.planTask(created.state.taskId);
+      const planned = await service.reply(created.state.taskId, reply);
+
+      expect(planned.state.status).toBe('ready_for_decision');
+      expect(planned.state.difficulty).toBe('extra-high');
+      expect(planned.state.requestedChanges).toEqual(expectedChanges);
     } finally {
       await cleanup([root, targetDir]);
     }

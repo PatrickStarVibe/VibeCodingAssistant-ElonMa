@@ -29,6 +29,7 @@ describe('workflow role config', () => {
       developer: 'developer-agent',
       finalReviewer: 'final-reviewer-agent',
     });
+    expect(config.workflowRoles['extra-high']).toEqual(config.workflowRoles.high);
     expect(config.profiles[config.workflowRoles.assistant]).toMatchObject({
       kind: 'openai-compatible',
       apiKeyEnv: 'ASSISTANT_API_KEY',
@@ -73,6 +74,21 @@ describe('workflow role config', () => {
       apiKeyEnv: 'ACME_API_KEY',
     });
     expect(config.profiles['custom-medium-developer']?.command).toBe('custom-agent');
+  });
+
+  it('fills missing extra-high workflow roles from high for old configs', () => {
+    const config = normalizeConfig({
+      workflowRoles: {
+        high: {
+          architect: 'custom-high-architect',
+          planReviewer: 'custom-high-reviewer',
+          developer: 'custom-high-developer',
+          finalReviewer: 'custom-high-final-reviewer',
+        },
+      },
+    });
+
+    expect(config.workflowRoles['extra-high']).toEqual(config.workflowRoles.high);
   });
 
   it('retains legacy DeepSeek profiles as explicit compatibility config', () => {

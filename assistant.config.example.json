@@ -42,6 +42,12 @@
       "planReviewer": "plan-reviewer-agent",
       "developer": "developer-agent",
       "finalReviewer": "final-reviewer-agent"
+    },
+    "extra-high": {
+      "architect": "architect-agent",
+      "planReviewer": "plan-reviewer-agent",
+      "developer": "developer-agent",
+      "finalReviewer": "final-reviewer-agent"
     }
   },
   "profiles": {

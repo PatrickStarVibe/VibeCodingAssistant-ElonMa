@@ -61,6 +61,12 @@ function makeConfig(): AssistantConfig {
         developer: 'implementer',
         finalReviewer: 'finalReviewer',
       },
+      'extra-high': {
+        architect: 'reviewer',
+        planReviewer: 'planner',
+        developer: 'implementer',
+        finalReviewer: 'finalReviewer',
+      },
     },
     profiles: {
       assistant: makeAssistantProfile(),
@@ -416,6 +422,28 @@ describe('OpenAICompatibleAssistantAdapter', () => {
     expect(toolNames).not.toContain('accept_task');
     expect(toolNames).not.toContain('approve_plan');
     expect(toolNames).not.toContain('revise_plan');
+  });
+
+  it('instructs bridge decisions to submit pending user answers via answer_user_direction', async () => {
+    let requestBody: Record<string, unknown> | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      requestBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: 'ok' } }],
+      }), { status: 200 });
+    }));
+    const adapter = makeAssistantAdapter();
+    const input = makeBridgeInput();
+    input.latestUserMessage = '1';
+    if (!input.task) throw new Error('Expected task fixture.');
+    input.task.status = 'waiting_user_direction';
+    input.task.pendingUserPrompt = 'Options: 1) Accept current worktree. 2) Revert unrelated files.';
+
+    await adapter.decideBridgeAction(input);
+
+    const messages = requestBody?.messages as Array<{ role: string; content: string }> | undefined;
+    const system = messages?.filter((message) => message.role === 'system').map((message) => message.content).join('\n\n') ?? '';
+    expect(system).toContain('MUST be sent via `answer_user_direction`');
   });
 
   it('parses bridge assistant text when no tool is called', async () => {

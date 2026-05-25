@@ -111,6 +111,7 @@ function makeConfig(targetDir: string): AssistantConfig {
       low: { architect: 'planner', planReviewer: 'planner', developer: 'implementer', finalReviewer: 'implementer' },
       medium: { architect: 'planner', planReviewer: 'reviewer', developer: 'implementer', finalReviewer: 'finalReviewer' },
       high: { architect: 'reviewer', planReviewer: 'planner', developer: 'implementer', finalReviewer: 'finalReviewer' },
+      'extra-high': { architect: 'reviewer', planReviewer: 'planner', developer: 'implementer', finalReviewer: 'finalReviewer' },
     },
     profiles: {
       assistant: { kind: 'deepseek' },
@@ -179,6 +180,26 @@ async function createTaskAwaitingAcceptance(harness: Awaited<ReturnType<typeof m
   return taskId;
 }
 
+const DEFAULT_DIRECTION_PROMPT = 'Options: 1) Accept current worktree as-is. 2) Revert unrelated files.';
+
+async function createTaskWaitingForUserDirection(
+  harness: Awaited<ReturnType<typeof makeHarness>>,
+  pendingUserPrompt = DEFAULT_DIRECTION_PROMPT,
+): Promise<string> {
+  const created = await harness.workflow.createTask({ title: 'Direction task', task: 'Update docs.' });
+  let state = await harness.store.writeArtifact(created.state, 'final-review', pendingUserPrompt);
+  state = {
+    ...state,
+    status: 'waiting_user_direction',
+    difficulty: 'low',
+    lastDecision: 'ask_user_direction',
+    pendingUserPrompt,
+    updatedAt: new Date().toISOString(),
+  };
+  await harness.store.saveState(state);
+  return state.taskId;
+}
+
 function activeTaskChat(taskId: string, chatId = 'task-chat') {
   return {
     chatKind: 'project' as const,
@@ -210,6 +231,56 @@ describe('BridgeAgentService', () => {
         const result = await turn.run();
         expect(result.state.difficulty).toBe('low');
       }
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('uses choose_difficulty for extra-high choices', async () => {
+    const harness = await makeHarness();
+    try {
+      const taskId = await createTaskAtDifficultyGate(harness);
+      harness.assistant.decisions.push({
+        kind: 'tool_call',
+        toolCall: { name: 'choose_difficulty', arguments: { difficulty: 'extra-high' } },
+      });
+
+      const turn = await harness.agent.handleMessage({
+        chatId: 'task-chat',
+        senderOpenId: 'user-open-id',
+        text: 'extra high',
+        ...activeTaskChat(taskId),
+      });
+
+      expect(turn.kind).toBe('background');
+      if (turn.kind === 'background') {
+        const result = await turn.run();
+        expect(result.state.difficulty).toBe('extra-high');
+      }
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('rejects partial extra difficulty values', async () => {
+    const harness = await makeHarness();
+    try {
+      const taskId = await createTaskAtDifficultyGate(harness);
+      harness.assistant.decisions.push({
+        kind: 'tool_call',
+        toolCall: { name: 'choose_difficulty', arguments: { difficulty: 'extra' } },
+      });
+
+      const turn = await harness.agent.handleMessage({
+        chatId: 'task-chat',
+        senderOpenId: 'user-open-id',
+        text: 'extra',
+        ...activeTaskChat(taskId),
+      });
+
+      expect(turn.kind).toBe('reply');
+      if (turn.kind === 'reply') expect(turn.messages[0]?.text).toContain('没有执行');
+      expect((await harness.store.loadState(taskId)).status).toBe('awaiting_difficulty_selection');
     } finally {
       await cleanup([harness.root, harness.targetDir]);
     }
@@ -308,6 +379,139 @@ describe('BridgeAgentService', () => {
       expect(next.pendingUserPrompt).toBeUndefined();
       expect(next.lastDecision).toBe('user direction: 1');
       expect(await harness.store.readArtifact(next, 'decision-log')).toContain('user direction: 1');
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('blocks soft-future workflow claims while waiting for user direction', async () => {
+    const harness = await makeHarness();
+    try {
+      const taskId = await createTaskWaitingForUserDirection(harness);
+      harness.assistant.decisions.push({ kind: 'reply', text: '收到，我会把你的选择 1 反馈给 workflow。' });
+
+      const turn = await harness.agent.handleMessage({
+        chatId: 'task-chat',
+        senderOpenId: 'user-open-id',
+        text: '1',
+        ...activeTaskChat(taskId),
+      });
+
+      expect(turn.kind).toBe('reply');
+      expect(turn.auditAction).toBe('guard:fake-claim');
+      if (turn.kind === 'reply') {
+        const text = turn.messages[0]?.text ?? '';
+        expect(text).toContain(DEFAULT_DIRECTION_PROMPT);
+        expect(text).toContain('answer_user_direction');
+        expect(text).toContain('记录用户选择并反馈给 workflow');
+      }
+      const next = await harness.store.loadState(taskId);
+      expect(next.status).toBe('waiting_user_direction');
+      expect(next.pendingUserPrompt).toBe(DEFAULT_DIRECTION_PROMPT);
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('includes truncated pending prompts in waiting-direction no-op replies', async () => {
+    const harness = await makeHarness();
+    try {
+      const pendingUserPrompt = [
+        'Options:',
+        '1) Accept current worktree as-is after checking the final-review scope and preserving unrelated user edits.',
+        '2) Revert unrelated files before acceptance and document why the reroute is needed.',
+        '3) Ask for a narrower follow-up task before proceeding.',
+      ].join(' ');
+      const taskId = await createTaskWaitingForUserDirection(harness, pendingUserPrompt);
+      harness.assistant.decisions.push({ kind: 'reply', text: '收到，我会把你的选择 1 反馈给 workflow。' });
+
+      const turn = await harness.agent.handleMessage({
+        chatId: 'task-chat',
+        senderOpenId: 'user-open-id',
+        text: '1',
+        ...activeTaskChat(taskId),
+      });
+
+      expect(turn.kind).toBe('reply');
+      if (turn.kind === 'reply') {
+        const text = turn.messages[0]?.text ?? '';
+        expect(text).toContain(`${pendingUserPrompt.slice(0, 197)}...`);
+        expect(text).toContain('必须用 `answer_user_direction` 提交答案');
+      }
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('auto-routes neutral acknowledgements to answer_user_direction for numeric answers', async () => {
+    const harness = await makeHarness();
+    try {
+      const taskId = await createTaskWaitingForUserDirection(harness);
+      harness.assistant.decisions.push({ kind: 'reply', text: '好的，我理解你的选择。' });
+
+      const turn = await harness.agent.handleMessage({
+        chatId: 'task-chat',
+        senderOpenId: 'user-open-id',
+        text: '1',
+        ...activeTaskChat(taskId),
+      });
+
+      expect(turn.kind).toBe('reply');
+      expect(turn.auditAction).toBe('guard:direction-autoanswer');
+      const next = await harness.store.loadState(taskId);
+      expect(next.status).toBe('awaiting_user_acceptance');
+      expect(next.pendingUserPrompt).toBeUndefined();
+      expect(next.lastDecision).toBe('user direction: 1');
+      expect(await harness.store.readArtifact(next, 'decision-log')).toContain('user direction: 1');
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('auto-routes reply_to_user acknowledgements to answer_user_direction for numeric answers', async () => {
+    const harness = await makeHarness();
+    try {
+      const taskId = await createTaskWaitingForUserDirection(harness);
+      harness.assistant.decisions.push({
+        kind: 'tool_call',
+        toolCall: { name: 'reply_to_user', arguments: { text: '好的' } },
+      });
+
+      const turn = await harness.agent.handleMessage({
+        chatId: 'task-chat',
+        senderOpenId: 'user-open-id',
+        text: '1',
+        ...activeTaskChat(taskId),
+      });
+
+      expect(turn.kind).toBe('reply');
+      expect(turn.auditAction).toBe('guard:direction-autoanswer');
+      const next = await harness.store.loadState(taskId);
+      expect(next.status).toBe('awaiting_user_acceptance');
+      expect(next.pendingUserPrompt).toBeUndefined();
+      expect(next.lastDecision).toBe('user direction: 1');
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('passes through legitimate clarifying questions while waiting for user direction', async () => {
+    const harness = await makeHarness();
+    try {
+      const taskId = await createTaskWaitingForUserDirection(harness);
+      harness.assistant.decisions.push({ kind: 'reply', text: '你说的选项 1 是指 accept 还是 revert？' });
+
+      const turn = await harness.agent.handleMessage({
+        chatId: 'task-chat',
+        senderOpenId: 'user-open-id',
+        text: '我不确定选项 1 的范围，先解释 accept current worktree 和 revert unrelated files 的区别',
+        ...activeTaskChat(taskId),
+      });
+
+      expect(turn.kind).toBe('reply');
+      expect(turn.auditAction).toBeUndefined();
+      if (turn.kind === 'reply') expect(turn.messages[0]?.text).toBe('你说的选项 1 是指 accept 还是 revert？');
+      expect((await harness.store.loadState(taskId)).status).toBe('waiting_user_direction');
     } finally {
       await cleanup([harness.root, harness.targetDir]);
     }

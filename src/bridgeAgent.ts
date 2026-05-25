@@ -6,6 +6,7 @@ import {
   bridgeToolNamesForTaskStatus,
   type AssistantAdapter,
 } from './adapters.js';
+import { normalizeWorkflowDifficulty } from './difficulty.js';
 import { addProjectToRegistry, type AddProjectInput } from './projectRegistry.js';
 import { getDefaultProjectId, renderProjectList, requireProject } from './projects.js';
 import type { ProjectKnowledgeService } from './projectKnowledge.js';
@@ -58,9 +59,9 @@ export interface BridgeAgentRequest {
 
 type LiveProcessProvider = (taskId: string) => BridgeLiveProcessSnapshot[];
 type ToolStateCheck = { ok: true } | { ok: false; reason: string };
-type NoOpState = Pick<TaskState, 'status'>;
+type NoOpState = Pick<TaskState, 'status' | 'pendingUserPrompt'>;
 
-const FAKE_STATE_CLAIM_PATTERN = /已记录|已推进|已启动|已停止|已进入验收|已验收|已批准|已通过|已接受|已反馈给.*?(workflow|工作流)|我会推进|我会反馈给.*?(workflow|工作流)|工作流.*?已|流程.*?已推进|已经推进|帮你推进/;
+const FAKE_STATE_CLAIM_PATTERN = /已记录|已推进|已启动|已停止|已进入验收|已验收|已批准|已通过|已接受|已反馈给.*?(workflow|工作流)|我会(记录|反馈|提交|推进|转交)|我来(记录|反馈|提交|推进)|帮你(记录|反馈|提交|推进|转交)|(反馈|提交|转交)给.*?(workflow|工作流)|(马上|现在|立刻|稍后).*(推进|反馈|记录|提交).*(workflow|工作流|流程)|工作流.*?已|流程.*?已推进|已经推进/;
 
 const BRIDGE_TOOL_USER_LABELS: Record<BridgeToolName, string> = {
   reply_to_user: '普通对话回复（reply_to_user，不推进 workflow）',
@@ -84,6 +85,18 @@ const BRIDGE_TOOL_USER_LABELS: Record<BridgeToolName, string> = {
 
 export function isFakeStateClaim(text: string): boolean {
   return FAKE_STATE_CLAIM_PATTERN.test(text);
+}
+
+function looksLikeUserDirectionAnswer(text: string, pendingPrompt?: string): boolean {
+  const trimmed = text.trim();
+  if (/^[1-9][0-9]?\s*[。.!\s]?$/.test(trimmed)) return true;
+  if (/^[A-Da-d]\s*[。.!\s]?$/.test(trimmed)) return true;
+  return Boolean(pendingPrompt?.trim()) && trimmed.length > 0 && trimmed.length <= 30;
+}
+
+function looksLikeClarifyingQuestion(text: string): boolean {
+  const trimmed = text.trim();
+  return /[?？]\s*$/.test(trimmed) && /(吗|么|哪个|哪一个|是否|还是|要不要|需要|请确认|是指|区别|范围|哪种|什么)/.test(trimmed);
 }
 
 export type BridgeAgentTurn =
@@ -152,9 +165,7 @@ export class BridgeAgentService {
       text: `Elon Ma could not make a bridge decision: ${errorMessage(error)}`,
     }));
 
-    if (decision.kind === 'reply') {
-      return this.replyGuarded(input, decision.text);
-    }
+    if (decision.kind === 'reply') return await this.replyGuarded(input, decision.text);
     return this.executeTool(request, input, decision.toolCall);
   }
 
@@ -252,7 +263,7 @@ export class BridgeAgentService {
     try {
       switch (toolCall.name) {
         case 'reply_to_user':
-          return this.replyGuarded(input, requiredString(toolCall, 'text'));
+          return await this.replyGuarded(input, requiredString(toolCall, 'text'));
         case 'create_task':
           return await this.createTask(request, toolCall, false);
         case 'create_new_task_from_task_chat':
@@ -397,20 +408,37 @@ export class BridgeAgentService {
     }
   }
 
-  private async answerUserDirection(taskId: string, answer: string): Promise<BridgeAgentTurn> {
+  private async answerUserDirection(
+    taskId: string,
+    answer: string,
+    auditAction = 'tool:answer_user_direction',
+  ): Promise<BridgeAgentTurn> {
     const result = await this.workflow.answerUserDirection(taskId, answer);
     return {
       kind: 'reply',
       ...(result.state.projectId ? { activeProjectId: result.state.projectId } : {}),
-      auditAction: 'tool:answer_user_direction',
+      auditAction,
       messages: [this.workflowMessage(result)],
     };
   }
 
-  private replyGuarded(input: BridgeAgentInput, text: string): BridgeAgentTurn {
+  private async replyGuarded(input: BridgeAgentInput, text: string): Promise<BridgeAgentTurn> {
+    if (!isFakeStateClaim(text) && input.task?.status === 'waiting_user_direction') {
+      if (looksLikeUserDirectionAnswer(input.latestUserMessage, input.task.pendingUserPrompt)) {
+        return this.answerUserDirection(input.task.taskId, input.latestUserMessage, 'guard:direction-autoanswer');
+      }
+      if (looksLikeClarifyingQuestion(text)) return this.reply(text);
+      return this.replyNoOp({
+        state: input.task,
+        input,
+        intendedAction: '回复用户但不推进 workflow',
+        reason: 'task 在 waiting_user_direction，纯文本回复不能推进 workflow，请使用 answer_user_direction',
+        auditAction: 'guard:direction-text-blocked',
+      });
+    }
     if (!isFakeStateClaim(text)) return this.reply(text);
     return this.replyNoOp({
-      state: input.task,
+      ...(input.task ? { state: input.task } : {}),
       input,
       intendedAction: inferFakeClaimIntent(text),
       reason: '没有调用 workflow 工具',
@@ -423,7 +451,7 @@ export class BridgeAgentService {
     input?: BridgeAgentInput;
     intendedAction: string;
     reason: string;
-    auditAction: 'guard:state-mismatch' | 'guard:no-tool' | 'guard:fake-claim';
+    auditAction: 'guard:state-mismatch' | 'guard:no-tool' | 'guard:fake-claim' | 'guard:direction-text-blocked';
   }): BridgeAgentTurn {
     const toolNames = options.state
       ? bridgeToolNamesForTaskStatus(options.state.status)
@@ -432,6 +460,14 @@ export class BridgeAgentService {
     const scopeLine = options.state
       ? `当前阶段（${options.state.status}）下你可以：`
       : '当前可用操作：';
+    const pendingPrompt = options.state?.status === 'waiting_user_direction'
+      ? options.state.pendingUserPrompt?.trim()
+      : undefined;
+    const directionPromptLine = pendingPrompt
+      ? `当前 task 正在等你回答下面这个问题，必须用 \`answer_user_direction\` 提交答案，不能用普通文字回复推进 workflow：${
+        pendingPrompt.length <= 200 ? pendingPrompt : `${pendingPrompt.slice(0, 197)}...`
+      }`
+      : undefined;
     // Guard-rejected model text is intentionally not echoed to the user; the raw assistant decision
     // is still available through the normal decision logging path.
     return {
@@ -439,6 +475,7 @@ export class BridgeAgentService {
       auditAction: options.auditAction,
       messages: [{
         text: [
+          ...(directionPromptLine ? [directionPromptLine] : []),
           '我没有调用任何 workflow 工具，所以 workflow 实际上没有变化（未推进 workflow）。',
           `原本想做的：${options.intendedAction}`,
           `不能执行的原因：${options.reason}`,
@@ -677,7 +714,7 @@ export class BridgeAgentService {
         `任务已创建：${result.state.title}`,
         `项目：${projectName} (${result.state.projectId ?? getDefaultProjectId(this.config)})`,
         `任务 ID：${result.state.taskId}`,
-        '请选择工作难度：low、medium 或 high。',
+        '请选择工作难度：low、medium、high 或 extra high。',
       ].join('\n'),
     });
   }
@@ -856,7 +893,7 @@ function bridgeNextStep(status: TaskState['status'], missingBackgroundWorker = f
   switch (status) {
     case 'awaiting_difficulty_selection':
     case 'created':
-      return '下一步：选 low / medium / high。你也可以问我为什么要选难度。';
+      return '下一步：选 low / medium / high / extra high。你也可以问我为什么要选难度。';
     case 'ready_for_decision':
       return '下一步：如果计划没问题，可以说 approve；如果要改，直接说改哪里。';
     case 'waiting_user_direction':
@@ -918,7 +955,8 @@ function optionalString(toolCall: BridgeToolCall, key: string): string | undefin
 
 function requiredDifficulty(toolCall: BridgeToolCall): WorkflowDifficulty {
   const difficulty = requiredString(toolCall, 'difficulty');
-  if (difficulty === 'low' || difficulty === 'medium' || difficulty === 'high') return difficulty;
+  const normalized = normalizeWorkflowDifficulty(difficulty);
+  if (normalized) return normalized;
   throw new Error(`Invalid difficulty: ${difficulty}`);
 }
 
@@ -934,6 +972,7 @@ function isArtifactName(value: string): value is ArtifactName {
     'initial-plan',
     'review',
     'revision-instructions',
+    'plan-rounds-log',
     'revised-plan',
     'assistant-explanation',
     'qa-log',
@@ -977,8 +1016,8 @@ function inferFakeClaimIntent(text: string): string {
   if (/已进入验收|已验收|已接受/.test(text)) return '验收当前 task 或进入验收阶段';
   if (/已批准|已通过/.test(text)) return '批准计划或验收结果';
   if (/已启动/.test(text)) return '启动后台 workflow';
-  if (/已记录|已反馈给.*?(workflow|工作流)/.test(text)) return '记录用户选择并反馈给 workflow';
-  if (/我会推进|流程.*?已推进|已经推进|帮你推进|已推进/.test(text)) return '推进 workflow';
+  if (/已记录|已反馈给.*?(workflow|工作流)|我会(记录|反馈|提交|推进|转交)|我来(记录|反馈|提交|推进)|帮你(记录|反馈|提交|推进|转交)|(反馈|提交|转交)给.*?(workflow|工作流)|(马上|现在|立刻|稍后).*(推进|反馈|记录|提交).*(workflow|工作流|流程)/.test(text)) return '记录用户选择并反馈给 workflow';
+  if (/流程.*?已推进|已经推进|已推进/.test(text)) return '推进 workflow';
   return '执行一个会改变 workflow 状态的动作';
 }
 

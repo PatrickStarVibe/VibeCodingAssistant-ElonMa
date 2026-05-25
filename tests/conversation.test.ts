@@ -166,6 +166,12 @@ function makeConfig(targetDir: string): AssistantConfig {
         developer: 'implementer',
         finalReviewer: 'finalReviewer',
       },
+      'extra-high': {
+        architect: 'reviewer',
+        planReviewer: 'planner',
+        developer: 'implementer',
+        finalReviewer: 'finalReviewer',
+      },
     },
     profiles: {
       assistant: { kind: 'deepseek' },

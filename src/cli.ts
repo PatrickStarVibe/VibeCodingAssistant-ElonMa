@@ -23,6 +23,7 @@ const ARTIFACT_NAMES: ArtifactName[] = [
   'initial-plan',
   'review',
   'revision-instructions',
+  'plan-rounds-log',
   'revised-plan',
   'assistant-explanation',
   'qa-log',

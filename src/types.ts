@@ -1,6 +1,6 @@
 export type AgentProfileKind = string;
 
-export type WorkflowDifficulty = 'low' | 'medium' | 'high';
+export type WorkflowDifficulty = 'low' | 'medium' | 'high' | 'extra-high';
 
 export type IntentName =
   | 'approve'
@@ -315,6 +315,7 @@ export type ArtifactName =
   | 'initial-plan'
   | 'review'
   | 'revision-instructions'
+  | 'plan-rounds-log'
   | 'revised-plan'
   | 'assistant-explanation'
   | 'qa-log'

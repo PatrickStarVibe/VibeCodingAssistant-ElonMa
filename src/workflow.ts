@@ -3,6 +3,7 @@ import { join } from 'node:path';
 
 import { ArtifactStore } from './artifacts.js';
 import { buildInitialPlanPrompt, type HeavyAgentAdapter, type AssistantAdapter } from './adapters.js';
+import { normalizeWorkflowDifficulty, WORKFLOW_DIFFICULTIES } from './difficulty.js';
 import { diffStatusLines, readGitSnapshot } from './git.js';
 import { ProjectKnowledgeService } from './projectKnowledge.js';
 import { configForProject, getDefaultProjectId, requireProject } from './projects.js';
@@ -94,7 +95,7 @@ export class WorkflowService {
         updatedAt: new Date().toISOString(),
       };
       await this.store.saveState(state);
-      return { state, message: 'Choose a workflow difficulty: low, medium, or high.' };
+      return { state, message: 'Choose a workflow difficulty: low, medium, high, or extra high.' };
     }
     const difficulty = state.difficulty;
 
@@ -682,7 +683,7 @@ export class WorkflowService {
   private async writeAgentPromptPreview(state: TaskState): Promise<{ state: TaskState; content: string }> {
     const task = await this.store.readArtifact(state, 'original-task');
     const projectContext = await this.buildProjectContext(state, [task, state.requestedChanges.join('\n')].filter(Boolean).join('\n\n'));
-    const difficulties: WorkflowDifficulty[] = state.difficulty ? [state.difficulty] : ['low', 'medium', 'high'];
+    const difficulties: WorkflowDifficulty[] = state.difficulty ? [state.difficulty] : WORKFLOW_DIFFICULTIES;
     const sections = difficulties.flatMap((difficulty) => [
       `## Architect Prompt - ${difficulty}`,
       '',
@@ -738,6 +739,7 @@ export class WorkflowService {
       'initial-plan',
       'review',
       'revision-instructions',
+      'plan-rounds-log',
       'revised-plan',
       'assistant-explanation',
       'qa-log',
@@ -976,7 +978,7 @@ type ParsedWorkflowReply =
   | { kind: 'reject' }
   | { kind: 'revise'; instruction: string }
   | { kind: 'restart'; instruction: string }
-  | { kind: 'difficulty'; level: 'low' | 'medium' | 'high'; instruction?: string }
+  | { kind: 'difficulty'; level: WorkflowDifficulty; instruction?: string }
   | { kind: 'stop' }
   | { kind: 'status' }
   | { kind: 'summary' }
@@ -993,11 +995,13 @@ function parseWorkflowReply(input: string): ParsedWorkflowReply {
   if (/^stop$/i.test(text)) return { kind: 'stop' };
   const acceptMatch = text.match(/^(?:accept|accepted)(?:\s*:\s*(.+))?$/i);
   if (acceptMatch) return { kind: 'accept', ...(acceptMatch[1]?.trim() ? { instruction: acceptMatch[1].trim() } : {}) };
-  const difficultyMatch = text.match(/^(low|medium|high)(?:\s*:\s*(.+))?$/i);
+  const difficultyMatch = text.match(/^(low|medium|high|extra[-_ ]?high)(?:\s*:\s*(.+))?$/i);
   if (difficultyMatch?.[1]) {
+    const level = normalizeWorkflowDifficulty(difficultyMatch[1]);
+    if (!level) return { kind: 'ambiguous', reason: 'Reply did not match a known workflow difficulty.', useLlmFallback: false };
     return {
       kind: 'difficulty',
-      level: difficultyMatch[1].toLocaleLowerCase() as 'low' | 'medium' | 'high',
+      level,
       ...(difficultyMatch[2]?.trim() ? { instruction: difficultyMatch[2].trim() } : {}),
     };
   }
@@ -1053,7 +1057,8 @@ function renderDifficultyPrompt(): string {
     '- low: simple copy, text, color, or tiny changes. Runs the initial Architect plan, copies it to revised-plan, and skips only plan review and revision instructions.',
     '- medium: default flow. Codex plans, Claude reviews, Codex revises.',
     '- high: complex or risky work. Claude plans/revises, Codex reviews the plan.',
-    'Reply with exactly one of: low, medium, high.',
+    '- extra high: high 流程 + Planner ↔ Reviewer 最多 3 轮 plan 打磨.',
+    'Reply with exactly one of: low, medium, high, extra high.',
   ].join('\n');
 }
 

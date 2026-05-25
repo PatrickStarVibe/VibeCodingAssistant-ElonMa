@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 import { getDefaultAssistantRoot } from './config.js';
+import { normalizeWorkflowDifficulty, WORKFLOW_DIFFICULTIES } from './difficulty.js';
 import { sanitizeTextForArtifact } from './textSanitizer.js';
 import { runFile } from './processRunner.js';
 import type {
@@ -212,6 +213,7 @@ const ARTIFACT_NAMES = new Set<ArtifactName>([
   'initial-plan',
   'review',
   'revision-instructions',
+  'plan-rounds-log',
   'revised-plan',
   'assistant-explanation',
   'qa-log',
@@ -355,13 +357,14 @@ function intentResultFromContent(content: string): IntentResult {
     : 'unknown';
   const confidence = Math.max(0, Math.min(1, numberValue(payload.confidence) ?? 0));
   const difficulty = stringValue(payload.difficulty);
+  const normalizedDifficulty = difficulty ? normalizeWorkflowDifficulty(difficulty) : undefined;
   const result: IntentResult = {
     intent,
     confidence,
     requiresClarification: booleanValue(payload.requiresClarification) ?? (intent === 'unknown' || confidence < 0.6),
     userFacingInterpretation: stringValue(payload.userFacingInterpretation) ?? '我还不确定你想让我怎么处理这条消息。',
   };
-  if (difficulty === 'low' || difficulty === 'medium' || difficulty === 'high') result.difficulty = difficulty;
+  if (normalizedDifficulty) result.difficulty = normalizedDifficulty;
   const instruction = stringValue(payload.instruction);
   if (instruction) result.instruction = instruction;
   const note = stringValue(payload.note);
@@ -391,7 +394,8 @@ function orchestratorDecisionFromContent(content: string): OrchestratorDecision 
     confidence: Math.max(0, Math.min(1, numberValue(payload.confidence) ?? 0)),
   };
   if (rawIntent && INTENT_NAMES.has(rawIntent as IntentName)) decision.intent = rawIntent as IntentName;
-  if (rawDifficulty === 'low' || rawDifficulty === 'medium' || rawDifficulty === 'high') decision.difficulty = rawDifficulty;
+  const normalizedDifficulty = rawDifficulty ? normalizeWorkflowDifficulty(rawDifficulty) : undefined;
+  if (normalizedDifficulty) decision.difficulty = normalizedDifficulty;
   const instruction = stringValue(payload.instruction);
   if (instruction) decision.instruction = instruction;
   const text = stringValue(payload.text);
@@ -485,10 +489,10 @@ function bridgeTools(input?: BridgeAgentInput): ChatCompletionTool[] {
       type: 'function',
       function: {
         name: 'choose_difficulty',
-        description: '为当前 task 选择 low/medium/high 难度并开始规划。',
+        description: '为当前 task 选择 low/medium/high/extra-high 难度并开始规划。',
         parameters: object({
           taskId: string('可选 task id；缺省时使用当前绑定 task。'),
-          difficulty: { type: 'string', enum: ['low', 'medium', 'high'], description: '工作难度。' },
+          difficulty: { type: 'string', enum: WORKFLOW_DIFFICULTIES, description: '工作难度。' },
           instruction: string('可选，用户给 Planner/Developer 的额外约束。'),
         }, ['difficulty']),
       },
@@ -936,7 +940,7 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
           'When a Project Chat has an active task, use only the active-task workflow tools that are available. Do not start a second task in that group.',
           'If you do not call a tool, your text MUST NOT claim that anything was recorded, advanced, accepted, approved, stopped, started, routed, or fed back to the workflow. Plain replies are explanation, translation, Q&A, or clarification only.',
           'If the user asks for an action that has no available tool in the current state, do not pretend to do it. Say plainly that you cannot execute it, name what you would have done, and list the available tools for the current state.',
-          'When task.status is waiting_user_direction, answer the pendingUserPrompt with answer_user_direction. Never use approve_plan, accept_task, or revise_plan to acknowledge a numbered choice; those tools are not even available in this state.',
+          'If task.status is `waiting_user_direction`, any reply that addresses the pending question — including a bare number, an option letter, or a sentence explaining the choice — **MUST be sent via `answer_user_direction`**. Plain text is allowed only when you are genuinely asking the user a clarifying question back; in that case do not claim you will record, forward, or feed anything to the workflow.',
           'When Control/Private Chat receives a task prompt, identify the project. If the project is unclear, ask a short clarification question. If the project is clear, use schedule_task_to_project_chat so Manager can place it into an idle Project Chat.',
           'If every Project Chat for a clear project is busy, explain that and ask whether to create a new Project Chat; do not auto-create one without user confirmation.',
           'Use create_project_chat only after the user asks for a new Project Chat or confirms that they want one.',
@@ -968,8 +972,8 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
         content: [
           '你是 Assistant Elon Ma 的 workflow advisor/orchestrator.',
           '只能选择 allowedActions 内允许的 intent；action 只能是 respond, approve_implementation, forward_to_workflow, show_artifact, ask_clarification, wait_for_user.',
-          'awaiting_difficulty_selection 阶段，如果用户明确选择 low/medium/high，返回 action=forward_to_workflow, intent=difficulty, difficulty=<level>.',
-          'awaiting_difficulty_selection 阶段不是表单监狱；如果用户在提问、吐槽、补充上下文、要求解释或表达想暂停/取消，就像助理一样理解并选择 respond、wait_for_user、ask_clarification 或合法的 stop，不要机械复读 low/medium/high.',
+          'awaiting_difficulty_selection 阶段，如果用户明确选择 low/medium/high/extra-high，返回 action=forward_to_workflow, intent=difficulty, difficulty=<level>. extra-high 表示 high 流程加 Planner/Reviewer 最多 3 轮 plan 打磨。',
+          'awaiting_difficulty_selection 阶段不是表单监狱；如果用户在提问、吐槽、补充上下文、要求解释或表达想暂停/取消，就像助理一样理解并选择 respond、wait_for_user、ask_clarification 或合法的 stop，不要机械复读 low/medium/high/extra-high.',
           'ready_for_decision 阶段，如果用户明确批准计划，返回 action=approve_implementation.',
           '高风险动作 approve_implementation 以及 accept/reject/stop 要求 confidence >= 0.8.',
           '只返回 JSON object。JSON keys: action, intent, difficulty, instruction, text, artifact, question, reason, reasoning, confidence, userConsentForContinuation.',
@@ -1010,8 +1014,8 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
           '只返回 JSON object，不要输出 markdown。',
           'JSON keys: intent, difficulty, instruction, note, artifact, confidence, requiresClarification, userFacingInterpretation.',
           'intent 必须是 allowedActions 里的 id；如果无法判断，用 unknown。',
-          '如果 allowedActions 里有 ask，而用户是在提问、聊天、吐槽、补充上下文或要求解释，不要用 unknown；用 ask。等待难度选择时也一样，不能把这个阶段当成只接受 low/medium/high 的表单。',
-          'difficulty 只在 intent=difficulty 时填写 low、medium 或 high。',
+          '如果 allowedActions 里有 ask，而用户是在提问、聊天、吐槽、补充上下文或要求解释，不要用 unknown；用 ask。等待难度选择时也一样，不能把这个阶段当成只接受 low/medium/high/extra-high 的表单。',
+          'difficulty 只在 intent=difficulty 时填写 low、medium、high 或 extra-high。extra-high 表示 high 流程加 Planner/Reviewer 最多 3 轮 plan 打磨。',
           'instruction 可以跟随任何会推动 workflow 的 intent，用来保留用户给后续 agent 的约束、原文使用要求、范围边界或修改要求；不要丢掉这些信息。',
           'note 只在 intent=note 时填写备注。',
           'artifact 可在用户要求查看、发送、解释或使用某个产物时填写；可选值包括 original-task、revised-plan、agent-prompts、agent-prompt-preview、final-report 等。',

@@ -13,7 +13,7 @@ export function getAllowedActions(state: { status: WorkflowStatus }): AllowedAct
   switch (state.status) {
     case 'awaiting_difficulty_selection':
       return [
-        { id: 'difficulty', description: '选择 low、medium 或 high 难度；可以附带给后续 agent 的执行约束。' },
+        { id: 'difficulty', description: '选择 low、medium、high 或 extra high 难度；可以附带给后续 agent 的执行约束。' },
         STOP,
         ...ASK_STATUS_SUMMARY,
       ];
