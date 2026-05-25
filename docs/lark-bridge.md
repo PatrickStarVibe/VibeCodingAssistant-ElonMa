@@ -10,7 +10,7 @@ It keeps only:
 - task chat creation when Elon Ma calls the tool
 - minimal inbound/outbound audit logs
 
-It does not parse `low`, `approve`, `status`, `summary`, or normal chat text by itself. Authorized messages go to DeepSeek Elon Ma, which either replies naturally or calls a workflow tool.
+It does not parse `low`, `approve`, `status`, `summary`, or normal chat text by itself. Authorized messages go to the configured Assistant Elon Ma chat profile, which either replies naturally or calls a workflow tool.
 
 ## Setup
 
@@ -22,15 +22,31 @@ It does not parse `low`, `approve`, `status`, `summary`, or normal chat text by 
 "allowedOpenIds": ["ou_your_open_id_here"]
 ```
 
-4. Set local environment variables:
+4. Configure local-only secrets in `.env.local`, `assistant.config.local.json`, or your shell environment. `assistant.config.example.json` shows the required shape:
+
+```json
+"profiles": {
+  "assistant-api": {
+    "kind": "openai-compatible",
+    "provider": "your-chat-provider",
+    "model": "your-chat-model",
+    "baseUrl": "https://api.your-provider.example/v1",
+    "apiKeyEnv": "ASSISTANT_API_KEY"
+  }
+}
+```
+
+The assistant chat profile uses an OpenAI-compatible `/chat/completions` endpoint. Set `baseUrl`, `model`, and `apiKeyEnv` for your provider. For command-backed workflow roles, set an explicit `command`; Manager does not assume a default CLI. Existing shell environment variables take precedence over values in `.env.local`.
+
+5. Set local environment variables or put the same names in `.env.local`:
 
 ```powershell
 $env:LARK_APP_ID="cli_xxx"
 $env:LARK_APP_SECRET="xxx"
-$env:DEEPSEEK_API_KEY="sk_xxx"
+$env:ASSISTANT_API_KEY="sk_xxx"
 ```
 
-5. Start the transport:
+6. Start the transport:
 
 ```powershell
 npm run assistant:lark
@@ -71,7 +87,7 @@ Elon Ma can call these tools:
 
 If a tool is not valid for the current workflow state, the tool layer returns the error to Elon Ma so it can explain in normal language.
 
-Only an obvious stop/cancel message is allowed to bypass DeepSeek, so the transport can stop a bound task immediately.
+Only an obvious stop/cancel message is allowed to bypass the assistant chat profile, so the transport can stop a bound task immediately.
 
 ## State
 

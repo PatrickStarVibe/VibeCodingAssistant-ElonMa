@@ -394,6 +394,49 @@ describe('LarkTransport', () => {
     }
   });
 
+  it('clears orphaned running jobs on start without changing task state', async () => {
+    const harness = await makeHarness();
+    try {
+      const taskId = await bindTask(harness);
+      const taskState = await harness.store.loadState(taskId);
+      await harness.store.saveState({
+        ...taskState,
+        status: 'execution_unit_implementing',
+        difficulty: 'low',
+        currentExecutionIndex: 0,
+        executionQueue: [{
+          index: 1,
+          slug: 'main',
+          name: 'Main',
+          status: 'In Progress',
+          fileName: '01-main.md',
+        }],
+        updatedAt: new Date().toISOString(),
+      });
+      const state = await harness.stateStore.load();
+      state.runningJobsByTaskId[taskId] = {
+        taskId,
+        label: 'implementing',
+        startedAt: '2026-05-25T05:12:40.983Z',
+      };
+      await harness.stateStore.save(state);
+
+      await harness.transport.start();
+
+      const saved = await harness.stateStore.load();
+      expect(saved.runningJobsByTaskId[taskId]).toBeUndefined();
+      expect(saved.activeTaskByChatId['task-chat-existing']?.taskId).toBe(taskId);
+      expect((await harness.store.loadState(taskId)).status).toBe('execution_unit_implementing');
+      expect(harness.client.sentTexts.at(-1)).toMatchObject({ chatId: 'task-chat-existing' });
+      const text = harness.client.sentTexts.at(-1)?.text ?? '';
+      expect(text).toContain('后台任务标记');
+      expect(text).toContain('没有对应 worker');
+      expect(text).toContain('任务本身状态没有自动修改');
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
   it('hard-stops an obvious cancel command and clears the running marker', async () => {
     const harness = await makeHarness();
     try {
@@ -613,6 +656,88 @@ describe('LarkTransport', () => {
 
       const outbound = await readJsonl(join(harness.root, 'logs', 'ai-workflow', 'lark-outbound.jsonl'));
       expect(outbound.some((entry) => entry.kind === 'text' && entry.success === true)).toBe(true);
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('records inbound user messages and outbound assistant replies into chat memory', async () => {
+    const harness = await makeHarness();
+    try {
+      harness.assistant.decisions.push({ kind: 'reply', text: 'first reply' });
+      await harness.transport.handleMessage(message({ eventId: 'mem-1', chatId: 'control-chat', text: 'first user message' }));
+
+      harness.assistant.decisions.push({ kind: 'reply', text: 'second reply' });
+      await harness.transport.handleMessage(message({ eventId: 'mem-2', chatId: 'control-chat', text: 'second user message' }));
+
+      const state = await harness.stateStore.load();
+      const messages = state.recentMessagesByChatId['control-chat'] ?? [];
+      const summary = messages.map((entry) => `${entry.role}:${entry.text}`);
+      expect(summary).toEqual([
+        'user:first user message',
+        'assistant:first reply',
+        'user:second user message',
+        'assistant:second reply',
+      ]);
+      expect(messages[0]?.eventId).toBe('mem-1');
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('passes prior recent messages and summary to decideBridgeAction without including the latest one', async () => {
+    const harness = await makeHarness();
+    try {
+      const state = await harness.stateStore.load();
+      const { appendRecentMessage, setChatSummary } = await import('../src/larkBridgeState.js');
+      appendRecentMessage(state, 'control-chat', {
+        role: 'assistant',
+        text: '要为 IReader 创建 Project Chat 吗？',
+        at: '2025-01-01T00:00:00Z',
+      });
+      setChatSummary(state, 'control-chat', {
+        summary: '用户正在为 IReader 配置 Project Chat',
+        messageCountCovered: 4,
+        updatedAt: '2025-01-01T00:00:00Z',
+      });
+      await harness.stateStore.save(state);
+
+      harness.assistant.decisions.push({ kind: 'reply', text: '好的，正在为 IReader 创建 Project Chat。' });
+      await harness.transport.handleMessage(message({ eventId: 'context-1', chatId: 'control-chat', text: '现在创建吧' }));
+
+      const captured = harness.assistant.bridgeInputs[0];
+      expect(captured?.latestUserMessage).toBe('现在创建吧');
+      expect(captured?.recentMessages?.length).toBe(1);
+      expect(captured?.recentMessages?.[0]?.text).toBe('要为 IReader 创建 Project Chat 吗？');
+      expect(captured?.recentMessages?.some((m) => m.text === '现在创建吧')).toBe(false);
+      expect(captured?.chatSummary?.summary).toBe('用户正在为 IReader 配置 Project Chat');
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('does not record duplicate-event messages into chat memory', async () => {
+    const harness = await makeHarness();
+    try {
+      harness.assistant.decisions.push({ kind: 'reply', text: 'first reply' });
+      await harness.transport.handleMessage(message({ eventId: 'dup', chatId: 'control-chat', text: 'only once' }));
+      await harness.transport.handleMessage(message({ eventId: 'dup', chatId: 'control-chat', text: 'only once' }));
+
+      const state = await harness.stateStore.load();
+      const messages = state.recentMessagesByChatId['control-chat'] ?? [];
+      const userOnly = messages.filter((m) => m.role === 'user');
+      expect(userOnly).toHaveLength(1);
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('does not record unauthorized inbound messages into chat memory', async () => {
+    const harness = await makeHarness();
+    try {
+      await harness.transport.handleMessage(message({ senderOpenId: 'stranger', text: 'leak this' }));
+      const state = await harness.stateStore.load();
+      expect(state.recentMessagesByChatId['control-chat']).toBeUndefined();
     } finally {
       await cleanup([harness.root, harness.targetDir]);
     }

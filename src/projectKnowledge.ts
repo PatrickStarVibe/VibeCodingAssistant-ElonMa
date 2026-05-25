@@ -7,6 +7,8 @@ import type { AssistantConfig } from './types.js';
 const DEFAULT_ALWAYS_BUDGET = 8_000;
 const DEFAULT_RETRIEVED_BUDGET = 12_000;
 const DEFAULT_MAX_RETRIEVED_CHUNKS = 6;
+const DEFAULT_MAX_MEMORY_SNIPPETS = 3;
+const DEFAULT_MEMORY_SNIPPET_CHARS = 600;
 const MAX_FILE_CHARS = 60_000;
 
 interface KnowledgeChunk {
@@ -22,6 +24,20 @@ export interface ProjectContextOptions {
   alwaysBudget?: number;
   retrievedBudget?: number;
   maxRetrievedChunks?: number;
+}
+
+export interface MemorySnippet {
+  path: string;
+  heading: string;
+  text: string;
+  score: number;
+}
+
+export interface RetrieveMemoryOptions {
+  projectId?: string;
+  query: string;
+  maxSnippets?: number;
+  maxSnippetChars?: number;
 }
 
 export class ProjectKnowledgeService {
@@ -55,6 +71,22 @@ export class ProjectKnowledgeService {
       '### Retrieved Markdown',
       retrieved || 'No relevant Markdown was found for this request.',
     ].join('\n');
+  }
+
+  async retrieveMemorySnippets(config: AssistantConfig, options: RetrieveMemoryOptions): Promise<MemorySnippet[]> {
+    if (!options.query.trim()) return [];
+    const project = requireProject(config, options.projectId);
+    const docsRoot = resolveProjectDocsDir(this.assistantRoot, project);
+    const files = await listMarkdownFiles(docsRoot).catch(() => []);
+    const chunks = (await Promise.all(files.map((file) => readMarkdownChunks(docsRoot, file)))).flat();
+    const ranked = rankChunks(chunks, options.query).slice(0, options.maxSnippets ?? DEFAULT_MAX_MEMORY_SNIPPETS);
+    const charLimit = options.maxSnippetChars ?? DEFAULT_MEMORY_SNIPPET_CHARS;
+    return ranked.map((chunk) => ({
+      path: chunk.path,
+      heading: chunk.heading,
+      text: truncate(chunk.text, charLimit),
+      score: chunk.score,
+    }));
   }
 }
 

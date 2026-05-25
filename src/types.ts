@@ -1,4 +1,4 @@
-export type AgentProfileKind = 'deepseek' | 'codex' | 'claude' | 'stub';
+export type AgentProfileKind = string;
 
 export type WorkflowDifficulty = 'low' | 'medium' | 'high';
 
@@ -101,6 +101,49 @@ export type BridgeAgentDecision =
   | { kind: 'reply'; text: string }
   | { kind: 'tool_call'; toolCall: BridgeToolCall };
 
+export interface BridgeChatMemoryMessage {
+  role: 'user' | 'assistant';
+  text: string;
+  at: string;
+  messageId?: string;
+  eventId?: string;
+}
+
+export interface BridgeChatSummary {
+  summary: string;
+  updatedAt: string;
+  messageCountCovered: number;
+}
+
+export interface BridgeRetrievedMemorySnippet {
+  source: string;
+  heading?: string;
+  text: string;
+  score?: number;
+}
+
+export interface BridgeRetrievedMemory {
+  query: string;
+  projectId?: string;
+  snippets: BridgeRetrievedMemorySnippet[];
+}
+
+export interface BridgeLiveProcessSnapshot {
+  id: string;
+  command: string;
+  cwd: string;
+  startedAt: string;
+  elapsedMs: number;
+  pid?: number;
+  taskId?: string;
+  role?: HeavyWorkflowRoleName;
+  profileName?: string;
+  label?: string;
+  outputPath?: string;
+  stdoutTail?: string;
+  stderrTail?: string;
+}
+
 export interface BridgeAgentInput {
   latestUserMessage: string;
   chat: {
@@ -122,12 +165,18 @@ export interface BridgeAgentInput {
     idle: boolean;
     name?: string;
   }>;
-  task?: Pick<TaskState, 'taskId' | 'title' | 'status' | 'difficulty' | 'pendingUserPrompt' | 'revisionRound' | 'reviewerRunCount' | 'requestedChanges'>;
+  task?: Pick<TaskState, 'taskId' | 'title' | 'status' | 'difficulty' | 'pendingUserPrompt' | 'revisionRound' | 'reviewerRunCount' | 'requestedChanges'> & {
+    generatedArtifacts?: ArtifactName[];
+  };
   runningJob?: {
     taskId: string;
     label: string;
     startedAt: string;
   };
+  liveProcesses?: BridgeLiveProcessSnapshot[];
+  recentMessages?: BridgeChatMemoryMessage[];
+  chatSummary?: BridgeChatSummary;
+  retrievedMemory?: BridgeRetrievedMemory;
   projects: Array<Pick<ProjectConfig, 'id' | 'name'>>;
   config: AssistantConfig;
 }
@@ -197,6 +246,7 @@ export interface ExecutionUnitState {
 
 export interface AgentProfileConfig {
   kind: AgentProfileKind;
+  provider?: string;
   model?: string;
   effort?: string;
   baseUrl?: string;

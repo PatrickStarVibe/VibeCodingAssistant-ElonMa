@@ -25,11 +25,31 @@ export interface LarkRunningJob {
   startedAt: string;
 }
 
+export type ChatMemoryRole = 'user' | 'assistant';
+
+export interface ChatMemoryMessage {
+  role: ChatMemoryRole;
+  text: string;
+  at: string;
+  messageId?: string;
+  eventId?: string;
+}
+
+export interface ChatSummary {
+  summary: string;
+  updatedAt: string;
+  messageCountCovered: number;
+}
+
+export const RECENT_MESSAGES_LIMIT = 20;
+
 export interface LarkBridgeState {
   projectChatsByChatId: Record<string, ProjectChatRegistration>;
   activeTaskByChatId: Record<string, ActiveTaskBinding>;
   activeProjectIdByChatId: Record<string, string>;
   runningJobsByTaskId: Record<string, LarkRunningJob>;
+  recentMessagesByChatId: Record<string, ChatMemoryMessage[]>;
+  chatSummariesByChatId: Record<string, ChatSummary>;
   processedEventIds: string[];
 }
 
@@ -162,6 +182,42 @@ export function releaseProjectChatTask(
   }
 }
 
+export function appendRecentMessage(
+  state: LarkBridgeState,
+  chatId: string,
+  message: ChatMemoryMessage,
+  limit: number = RECENT_MESSAGES_LIMIT,
+): void {
+  const existing = state.recentMessagesByChatId[chatId] ?? [];
+  const next = [...existing, message];
+  state.recentMessagesByChatId[chatId] = next.slice(-limit);
+}
+
+export function getRecentMessages(state: LarkBridgeState, chatId: string): ChatMemoryMessage[] {
+  return state.recentMessagesByChatId[chatId] ?? [];
+}
+
+export function getChatSummary(state: LarkBridgeState, chatId: string): ChatSummary | undefined {
+  return state.chatSummariesByChatId[chatId];
+}
+
+export function setChatSummary(
+  state: LarkBridgeState,
+  chatId: string,
+  input: { summary: string; messageCountCovered: number; updatedAt?: string },
+): void {
+  const summary = input.summary.trim();
+  if (!summary) {
+    delete state.chatSummariesByChatId[chatId];
+    return;
+  }
+  state.chatSummariesByChatId[chatId] = {
+    summary,
+    messageCountCovered: Math.max(0, Math.floor(input.messageCountCovered)),
+    updatedAt: input.updatedAt ?? new Date().toISOString(),
+  };
+}
+
 function normalizeState(raw: unknown): LarkBridgeState {
   const value = record(raw);
   const activeProjectIdByChatId = recordOfStrings(value.activeProjectIdByChatId);
@@ -192,6 +248,8 @@ function normalizeState(raw: unknown): LarkBridgeState {
     activeTaskByChatId,
     activeProjectIdByChatId,
     runningJobsByTaskId: recordOfRunningJobs(value.runningJobsByTaskId),
+    recentMessagesByChatId: recordOfRecentMessages(value.recentMessagesByChatId),
+    chatSummariesByChatId: recordOfChatSummaries(value.chatSummariesByChatId),
     processedEventIds: stringArray(value.processedEventIds).slice(0, 200),
   };
 }
@@ -202,10 +260,17 @@ function hasLegacyOrUnknownKeys(raw: unknown): boolean {
     'activeTaskByChatId',
     'activeProjectIdByChatId',
     'runningJobsByTaskId',
+    'recentMessagesByChatId',
+    'chatSummariesByChatId',
     'processedEventIds',
   ]);
   const keys = Object.keys(record(raw));
-  return keys.some((key) => !allowed.has(key)) || keys.includes('bindingsByChatId');
+  if (keys.includes('bindingsByChatId')) return true;
+  if (keys.some((key) => !allowed.has(key))) return true;
+  for (const key of allowed) {
+    if (!keys.includes(key)) return true;
+  }
+  return false;
 }
 
 function record(value: unknown): Record<string, unknown> {
@@ -278,4 +343,44 @@ function recordOfRunningJobs(value: unknown): Record<string, LarkRunningJob> {
     const startedAt = stringValue(job.startedAt);
     return label && startedAt ? [[taskId, { taskId, label, startedAt }]] : [];
   }));
+}
+
+function recordOfRecentMessages(value: unknown): Record<string, ChatMemoryMessage[]> {
+  const result: Record<string, ChatMemoryMessage[]> = {};
+  for (const [chatId, rawList] of Object.entries(record(value))) {
+    if (!Array.isArray(rawList)) continue;
+    const messages: ChatMemoryMessage[] = [];
+    for (const rawMessage of rawList) {
+      const message = record(rawMessage);
+      const role = stringValue(message.role);
+      const text = stringValue(message.text);
+      const at = stringValue(message.at);
+      if (!text || !at || (role !== 'user' && role !== 'assistant')) continue;
+      const messageId = stringValue(message.messageId);
+      const eventId = stringValue(message.eventId);
+      const entry: ChatMemoryMessage = { role, text, at };
+      if (messageId) entry.messageId = messageId;
+      if (eventId) entry.eventId = eventId;
+      messages.push(entry);
+    }
+    if (messages.length > 0) {
+      result[chatId] = messages.slice(-RECENT_MESSAGES_LIMIT);
+    }
+  }
+  return result;
+}
+
+function recordOfChatSummaries(value: unknown): Record<string, ChatSummary> {
+  const result: Record<string, ChatSummary> = {};
+  for (const [chatId, rawSummary] of Object.entries(record(value))) {
+    const summary = record(rawSummary);
+    const text = stringValue(summary.summary);
+    const updatedAt = stringValue(summary.updatedAt);
+    const count = typeof summary.messageCountCovered === 'number' && Number.isFinite(summary.messageCountCovered)
+      ? Math.max(0, Math.floor(summary.messageCountCovered))
+      : 0;
+    if (!text || !updatedAt) continue;
+    result[chatId] = { summary: text, updatedAt, messageCountCovered: count };
+  }
+  return result;
 }

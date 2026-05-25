@@ -1,12 +1,30 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
-  DeepSeekAssistantAdapter,
+  OpenAICompatibleAssistantAdapter,
   buildClaudeProfileArgs,
   buildCodexProfileArgs,
   buildInitialPlanPrompt,
+  createAssistantAdapter,
+  createHeavyAgentAdapter,
 } from '../src/adapters.js';
-import type { BridgeAgentInput, AssistantConfig, OrchestratorDecisionInput } from '../src/types.js';
+import { normalizeConfig } from '../src/config.js';
+import type { AgentProfileConfig, BridgeAgentInput, AssistantConfig, OrchestratorDecisionInput } from '../src/types.js';
+
+function makeAssistantProfile(overrides: Partial<AgentProfileConfig> = {}): AgentProfileConfig {
+  return {
+    kind: 'openai-compatible',
+    provider: 'example-compatible',
+    model: 'example-chat-model',
+    baseUrl: 'https://api.example.test/v1',
+    apiKeyEnv: 'EXAMPLE_API_KEY',
+    ...overrides,
+  };
+}
+
+function makeAssistantAdapter(profile: AgentProfileConfig = makeAssistantProfile()): OpenAICompatibleAssistantAdapter {
+  return new OpenAICompatibleAssistantAdapter(profile, { EXAMPLE_API_KEY: 'test-key' }, 'assistant');
+}
 
 function makeConfig(): AssistantConfig {
   return {
@@ -43,17 +61,17 @@ function makeConfig(): AssistantConfig {
       },
     },
     profiles: {
-      assistant: { kind: 'deepseek' },
-      planner: { kind: 'codex' },
-      reviewer: { kind: 'claude' },
-      implementer: { kind: 'codex' },
-      finalReviewer: { kind: 'claude' },
+      assistant: makeAssistantProfile(),
+      planner: { kind: 'command', provider: 'codex', command: 'codex' },
+      reviewer: { kind: 'command', provider: 'claude', command: 'claude' },
+      implementer: { kind: 'command', provider: 'codex', command: 'codex' },
+      finalReviewer: { kind: 'command', provider: 'claude', command: 'claude' },
     },
     verification: { allowlist: [] },
   };
 }
 
-function stubDeepSeekContent(content: string): void {
+function stubChatContent(content: string): void {
   vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
     choices: [{ message: { content } }],
   }), { status: 200 })));
@@ -118,14 +136,14 @@ function makeControlBridgeInput(): BridgeAgentInput {
   };
 }
 
-describe('DeepSeekAssistantAdapter', () => {
+describe('OpenAICompatibleAssistantAdapter', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
   });
 
   it('normalizes create_task control JSON into a proposal confirmation action', async () => {
-    stubDeepSeekContent(JSON.stringify({ kind: 'create_task' }));
-    const adapter = new DeepSeekAssistantAdapter({ kind: 'deepseek' }, { DEEPSEEK_API_KEY: 'test-key' });
+    stubChatContent(JSON.stringify({ kind: 'create_task' }));
+    const adapter = makeAssistantAdapter();
 
     const result = await adapter.handleControlChat({
       message: '\u53ef\u4ee5\uff0ccreate task',
@@ -138,14 +156,14 @@ describe('DeepSeekAssistantAdapter', () => {
   });
 
   it('uses Chinese fallback fields for incomplete control-chat proposals', async () => {
-    stubDeepSeekContent(JSON.stringify({
+    stubChatContent(JSON.stringify({
       kind: 'proposal',
       proposal: {
         title: 'Lark proposal flow',
         task: 'Implement the proposal flow.',
       },
     }));
-    const adapter = new DeepSeekAssistantAdapter({ kind: 'deepseek' }, { DEEPSEEK_API_KEY: 'test-key' });
+    const adapter = makeAssistantAdapter();
 
     const result = await adapter.handleControlChat({
       message: 'Implement the proposal flow',
@@ -170,7 +188,7 @@ describe('DeepSeekAssistantAdapter', () => {
         choices: [{ message: { content: JSON.stringify({ kind: 'answer', markdown: '好的。' }) } }],
       }), { status: 200 });
     }));
-    const adapter = new DeepSeekAssistantAdapter({ kind: 'deepseek' }, { DEEPSEEK_API_KEY: 'test-key' });
+    const adapter = makeAssistantAdapter();
 
     await adapter.handleControlChat({
       message: 'Based on this spec, create a task proposal',
@@ -219,7 +237,7 @@ describe('DeepSeekAssistantAdapter', () => {
     })).toEqual(['--model', 'claude-opus-4-7', '--effort', 'high']);
   });
 
-  it('parses orchestrator decisions from DeepSeek JSON mode', async () => {
+  it('parses orchestrator decisions from chat JSON mode', async () => {
     let requestBody: Record<string, unknown> | undefined;
     vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
       requestBody = JSON.parse(String(init.body)) as Record<string, unknown>;
@@ -238,7 +256,7 @@ describe('DeepSeekAssistantAdapter', () => {
         }],
       }), { status: 200 });
     }));
-    const adapter = new DeepSeekAssistantAdapter({ kind: 'deepseek' }, { DEEPSEEK_API_KEY: 'test-key' });
+    const adapter = makeAssistantAdapter();
 
     const result = await adapter.decideNextAction(makeDecisionInput());
 
@@ -253,8 +271,8 @@ describe('DeepSeekAssistantAdapter', () => {
   });
 
   it('falls back safely when orchestrator decision JSON is invalid', async () => {
-    stubDeepSeekContent('not-json');
-    const adapter = new DeepSeekAssistantAdapter({ kind: 'deepseek' }, { DEEPSEEK_API_KEY: 'test-key' });
+    stubChatContent('not-json');
+    const adapter = makeAssistantAdapter();
 
     const result = await adapter.decideNextAction(makeDecisionInput());
 
@@ -263,7 +281,7 @@ describe('DeepSeekAssistantAdapter', () => {
     expect(result.text).toContain('没有返回有效 JSON');
   });
 
-  it('parses DeepSeek bridge function calls', async () => {
+  it('parses bridge function calls', async () => {
     let requestBody: Record<string, unknown> | undefined;
     vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
       requestBody = JSON.parse(String(init.body)) as Record<string, unknown>;
@@ -282,7 +300,7 @@ describe('DeepSeekAssistantAdapter', () => {
         }],
       }), { status: 200 });
     }));
-    const adapter = new DeepSeekAssistantAdapter({ kind: 'deepseek' }, { DEEPSEEK_API_KEY: 'test-key' });
+    const adapter = makeAssistantAdapter();
 
     const result = await adapter.decideBridgeAction(makeBridgeInput());
 
@@ -308,7 +326,7 @@ describe('DeepSeekAssistantAdapter', () => {
         choices: [{ message: { content: 'ok' } }],
       }), { status: 200 });
     }));
-    const adapter = new DeepSeekAssistantAdapter({ kind: 'deepseek' }, { DEEPSEEK_API_KEY: 'test-key' });
+    const adapter = makeAssistantAdapter();
 
     await adapter.decideBridgeAction(makeControlBridgeInput());
 
@@ -318,13 +336,129 @@ describe('DeepSeekAssistantAdapter', () => {
     expect(toolNames).not.toContain('show_status');
   });
 
-  it('parses DeepSeek bridge assistant text when no tool is called', async () => {
-    stubDeepSeekContent('我在。');
-    const adapter = new DeepSeekAssistantAdapter({ kind: 'deepseek' }, { DEEPSEEK_API_KEY: 'test-key' });
+  it('parses bridge assistant text when no tool is called', async () => {
+    stubChatContent('我在。');
+    const adapter = makeAssistantAdapter();
 
     const result = await adapter.decideBridgeAction(makeBridgeInput());
 
     expect(result).toEqual({ kind: 'reply', text: '我在。' });
+  });
+
+  it('uses configured OpenAI-compatible provider URL, model, and API key env var', async () => {
+    let requestUrl: string | undefined;
+    let requestBody: Record<string, unknown> | undefined;
+    let authorization: string | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
+      requestUrl = url;
+      requestBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+      authorization = (init.headers as Record<string, string>).Authorization;
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({ action: 'wait_for_user', confidence: 1 }) } }],
+      }), { status: 200 });
+    }));
+    const config = makeConfig();
+    config.profiles.assistant = makeAssistantProfile({
+      provider: 'acme-compatible',
+      model: 'acme-chat',
+      baseUrl: 'https://llm.acme.test/compatible/v1/',
+      apiKeyEnv: 'ACME_CHAT_KEY',
+    });
+
+    const adapter = createAssistantAdapter(config, { ACME_CHAT_KEY: 'acme-key' });
+    await adapter.decideNextAction({ ...makeDecisionInput(), config });
+
+    expect(requestUrl).toBe('https://llm.acme.test/compatible/v1/chat/completions');
+    expect(requestBody?.model).toBe('acme-chat');
+    expect(authorization).toBe('Bearer acme-key');
+  });
+
+  it('uses legacy DeepSeek profiles only after config compatibility normalization', async () => {
+    let requestUrl: string | undefined;
+    let requestBody: Record<string, unknown> | undefined;
+    let authorization: string | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
+      requestUrl = url;
+      requestBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+      authorization = (init.headers as Record<string, string>).Authorization;
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({ action: 'wait_for_user', confidence: 1 }) } }],
+      }), { status: 200 });
+    }));
+    const config = normalizeConfig({
+      workflowRoles: { assistant: 'legacy-assistant' },
+      profiles: { 'legacy-assistant': { kind: 'deepseek' } },
+    });
+
+    const adapter = createAssistantAdapter(config, { DEEPSEEK_API_KEY: 'legacy-key' });
+    await adapter.decideNextAction({ ...makeDecisionInput(), config });
+
+    expect(config.profiles['legacy-assistant']).toMatchObject({
+      kind: 'openai-compatible',
+      provider: 'deepseek',
+    });
+    expect(requestUrl).toBe('https://api.deepseek.com/v1/chat/completions');
+    expect(requestBody?.model).toBe('deepseek-v4-flash');
+    expect(authorization).toBe('Bearer legacy-key');
+  });
+
+  it('rejects command-backed profiles for assistant chat', async () => {
+    const adapter = new OpenAICompatibleAssistantAdapter(
+      { kind: 'command', provider: 'codex' },
+      {},
+      'assistant-api',
+    );
+
+    await expect(adapter.handleControlChat({
+      message: 'hello',
+      mode: 'message',
+      projectContext: '',
+      config: makeConfig(),
+    })).rejects.toThrow('Assistant profile "assistant-api" is command-backed');
+  });
+
+  it('reports a readable missing API key error', async () => {
+    const adapter = new OpenAICompatibleAssistantAdapter(
+      makeAssistantProfile({ apiKeyEnv: 'MISSING_PROVIDER_KEY' }),
+      {},
+      'assistant-api',
+    );
+
+    await expect(adapter.handleControlChat({
+      message: 'hello',
+      mode: 'message',
+      projectContext: '',
+      config: makeConfig(),
+    })).rejects.toThrow('Assistant profile "assistant-api" expects API key env var MISSING_PROVIDER_KEY');
+  });
+
+  it('reports a readable missing apiKeyEnv error', async () => {
+    const adapter = new OpenAICompatibleAssistantAdapter(
+      makeAssistantProfile({ apiKeyEnv: undefined as never }),
+      {},
+      'assistant-api',
+    );
+
+    await expect(adapter.handleControlChat({
+      message: 'hello',
+      mode: 'message',
+      projectContext: '',
+      config: makeConfig(),
+    })).rejects.toThrow('Assistant profile "assistant-api" is missing apiKeyEnv');
+  });
+
+  it('reports a readable missing command error before spawning a heavy agent', async () => {
+    const config = makeConfig();
+    config.profiles.planner = { kind: 'command', provider: 'custom-cli' };
+    const heavy = createHeavyAgentAdapter(config, true);
+
+    await expect(heavy.createInitialPlan({
+      task: 'Plan this.',
+      projectContext: '',
+      difficulty: 'low',
+      state: { taskId: 'TASK-1', requestedChanges: [] } as never,
+      config,
+    })).rejects.toThrow('Workflow role architect uses profile "planner", but profiles.planner.command is missing.');
   });
 
 });

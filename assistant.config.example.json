@@ -1,15 +1,15 @@
 {
   "workspace": {
-    "targetDir": "E:/GameDeveloping/IReader/my-reader"
+    "targetDir": "C:/path/to/your/project"
   },
-  "defaultProjectId": "ireader",
+  "defaultProjectId": "example-project",
   "projects": [
     {
-      "id": "ireader",
-      "name": "IReader",
-      "targetDir": "E:/GameDeveloping/IReader/my-reader",
-      "docsDir": "project-docs/ireader",
-      "taskRecordRoot": "E:/GameDeveloping/IReader/my-reader/task",
+      "id": "example-project",
+      "name": "Example Project",
+      "targetDir": "C:/path/to/your/project",
+      "docsDir": "project-docs/example-project",
+      "taskRecordRoot": "C:/path/to/your/project/task",
       "alwaysRead": []
     }
   ],
@@ -24,74 +24,52 @@
   },
   "maxRevisionRounds": 3,
   "workflowRoles": {
-    "assistant": "assistant-elon-ma",
+    "assistant": "assistant-api",
     "low": {
-      "architect": "codex-architect",
-      "planReviewer": "codex-plan-reviewer",
-      "developer": "codex-developer",
-      "finalReviewer": "codex-final-reviewer"
+      "architect": "architect-agent",
+      "planReviewer": "plan-reviewer-agent",
+      "developer": "developer-agent",
+      "finalReviewer": "final-reviewer-agent"
     },
     "medium": {
-      "architect": "codex-architect",
-      "planReviewer": "claude-plan-reviewer",
-      "developer": "codex-developer",
-      "finalReviewer": "claude-final-reviewer"
+      "architect": "architect-agent",
+      "planReviewer": "plan-reviewer-agent",
+      "developer": "developer-agent",
+      "finalReviewer": "final-reviewer-agent"
     },
     "high": {
-      "architect": "claude-architect",
-      "planReviewer": "codex-plan-reviewer",
-      "developer": "codex-developer",
-      "finalReviewer": "claude-final-reviewer"
+      "architect": "architect-agent",
+      "planReviewer": "plan-reviewer-agent",
+      "developer": "developer-agent",
+      "finalReviewer": "final-reviewer-agent"
     }
   },
   "profiles": {
-    "assistant-elon-ma": {
-      "kind": "deepseek",
-      "model": "deepseek-v4-flash",
-      "baseUrl": "https://api.deepseek.com/v1",
-      "apiKeyEnv": "DEEPSEEK_API_KEY"
+    "assistant-api": {
+      "kind": "openai-compatible",
+      "model": "",
+      "baseUrl": "",
+      "apiKeyEnv": "ASSISTANT_API_KEY"
     },
-    "codex-architect": {
-      "kind": "codex",
-      "model": "gpt-5.5",
-      "effort": "xhigh",
-      "command": "codex"
+    "architect-agent": {
+      "kind": "command",
+      "provider": "",
+      "command": ""
     },
-    "codex-plan-reviewer": {
-      "kind": "codex",
-      "model": "gpt-5.5",
-      "effort": "xhigh",
-      "command": "codex"
+    "plan-reviewer-agent": {
+      "kind": "command",
+      "provider": "",
+      "command": ""
     },
-    "codex-developer": {
-      "kind": "codex",
-      "model": "gpt-5.5",
-      "effort": "xhigh",
-      "command": "codex"
+    "developer-agent": {
+      "kind": "command",
+      "provider": "",
+      "command": ""
     },
-    "codex-final-reviewer": {
-      "kind": "codex",
-      "model": "gpt-5.5",
-      "effort": "xhigh",
-      "command": "codex"
-    },
-    "claude-architect": {
-      "kind": "claude",
-      "model": "claude-opus-4-7",
-      "effort": "high",
-      "command": "claude"
-    },
-    "claude-plan-reviewer": {
-      "kind": "claude",
-      "model": "claude-opus-4-7",
-      "effort": "high",
-      "command": "claude"
-    },
-    "claude-final-reviewer": {
-      "kind": "claude",
-      "model": "claude-opus-4-7",
-      "effort": "high",
-      "command": "claude"
+    "final-reviewer-agent": {
+      "kind": "command",
+      "provider": "",
+      "command": ""
     }
   },
   "verification": {

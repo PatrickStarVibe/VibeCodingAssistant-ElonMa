@@ -3,7 +3,14 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { loadDynamicProjects, mergeProjectLists } from './projectRegistry.js';
-import type { HeavyWorkflowRoleName, AssistantConfig, ProjectConfig, WorkflowDifficulty, WorkflowRoleProfiles } from './types.js';
+import type {
+  AgentProfileConfig,
+  HeavyWorkflowRoleName,
+  AssistantConfig,
+  ProjectConfig,
+  WorkflowDifficulty,
+  WorkflowRoleProfiles,
+} from './types.js';
 
 export const DEFAULT_VERIFICATION_ALLOWLIST = [
   'npm test',
@@ -15,24 +22,24 @@ export const DEFAULT_VERIFICATION_ALLOWLIST = [
 ];
 
 const DEFAULT_WORKFLOW_ROLES: WorkflowRoleProfiles = {
-  assistant: 'assistant-elon-ma',
+  assistant: 'assistant-api',
   low: {
-    architect: 'codex-architect',
-    planReviewer: 'codex-plan-reviewer',
-    developer: 'codex-developer',
-    finalReviewer: 'codex-final-reviewer',
+    architect: 'architect-agent',
+    planReviewer: 'plan-reviewer-agent',
+    developer: 'developer-agent',
+    finalReviewer: 'final-reviewer-agent',
   },
   medium: {
-    architect: 'codex-architect',
-    planReviewer: 'claude-plan-reviewer',
-    developer: 'codex-developer',
-    finalReviewer: 'claude-final-reviewer',
+    architect: 'architect-agent',
+    planReviewer: 'plan-reviewer-agent',
+    developer: 'developer-agent',
+    finalReviewer: 'final-reviewer-agent',
   },
   high: {
-    architect: 'claude-architect',
-    planReviewer: 'codex-plan-reviewer',
-    developer: 'codex-developer',
-    finalReviewer: 'claude-final-reviewer',
+    architect: 'architect-agent',
+    planReviewer: 'plan-reviewer-agent',
+    developer: 'developer-agent',
+    finalReviewer: 'final-reviewer-agent',
   },
 };
 
@@ -67,53 +74,21 @@ export function defaultConfig(): AssistantConfig {
     maxRevisionRounds: 3,
     workflowRoles: DEFAULT_WORKFLOW_ROLES,
     profiles: {
-      'assistant-elon-ma': {
-        kind: 'deepseek',
-        model: 'deepseek-v4-flash',
-        baseUrl: 'https://api.deepseek.com/v1',
-        apiKeyEnv: 'DEEPSEEK_API_KEY',
+      'assistant-api': {
+        kind: 'openai-compatible',
+        apiKeyEnv: 'ASSISTANT_API_KEY',
       },
-      'codex-architect': {
-        kind: 'codex',
-        model: 'gpt-5.5',
-        effort: 'xhigh',
-        command: 'codex',
+      'architect-agent': {
+        kind: 'command',
       },
-      'codex-plan-reviewer': {
-        kind: 'codex',
-        model: 'gpt-5.5',
-        effort: 'xhigh',
-        command: 'codex',
+      'plan-reviewer-agent': {
+        kind: 'command',
       },
-      'codex-developer': {
-        kind: 'codex',
-        model: 'gpt-5.5',
-        effort: 'xhigh',
-        command: 'codex',
+      'developer-agent': {
+        kind: 'command',
       },
-      'codex-final-reviewer': {
-        kind: 'codex',
-        model: 'gpt-5.5',
-        effort: 'xhigh',
-        command: 'codex',
-      },
-      'claude-architect': {
-        kind: 'claude',
-        model: 'claude-opus-4-7',
-        effort: 'high',
-        command: 'claude',
-      },
-      'claude-plan-reviewer': {
-        kind: 'claude',
-        model: 'claude-opus-4-7',
-        effort: 'high',
-        command: 'claude',
-      },
-      'claude-final-reviewer': {
-        kind: 'claude',
-        model: 'claude-opus-4-7',
-        effort: 'high',
-        command: 'claude',
+      'final-reviewer-agent': {
+        kind: 'command',
       },
     },
     verification: {
@@ -147,6 +122,57 @@ function numberValue(value: unknown): number | undefined {
 
 function stringArrayValue(value: unknown): string[] | undefined {
   return Array.isArray(value) && value.every((entry) => typeof entry === 'string') ? value : undefined;
+}
+
+function profileKind(rawProfile: Record<string, unknown>, baseProfile?: AgentProfileConfig): string {
+  return stringValue(rawProfile.kind)
+    ?? baseProfile?.kind
+    ?? (stringValue(rawProfile.command) ? 'command' : 'openai-compatible');
+}
+
+function applyLegacyDeepSeekCompatibility(profile: AgentProfileConfig): AgentProfileConfig {
+  if (profile.kind !== 'deepseek' && profile.provider !== 'deepseek') return profile;
+  return {
+    ...profile,
+    kind: 'openai-compatible',
+    provider: profile.provider ?? 'deepseek',
+    model: profile.model ?? 'deepseek-v4-flash',
+    baseUrl: profile.baseUrl ?? 'https://api.deepseek.com/v1',
+    apiKeyEnv: profile.apiKeyEnv ?? 'DEEPSEEK_API_KEY',
+  };
+}
+
+function normalizeProfile(entry: unknown, baseProfile?: AgentProfileConfig): AgentProfileConfig {
+  const rawProfile = objectValue(entry);
+  const kind = profileKind(rawProfile, baseProfile);
+  const provider = stringValue(rawProfile.provider) ?? baseProfile?.provider;
+  const model = stringValue(rawProfile.model) ?? baseProfile?.model;
+  const effort = stringValue(rawProfile.effort) ?? baseProfile?.effort;
+  const baseUrl = stringValue(rawProfile.baseUrl) ?? baseProfile?.baseUrl;
+  const apiKeyEnv = stringValue(rawProfile.apiKeyEnv) ?? baseProfile?.apiKeyEnv;
+  const command = stringValue(rawProfile.command) ?? baseProfile?.command;
+  return applyLegacyDeepSeekCompatibility({
+    kind,
+    ...(provider ? { provider } : {}),
+    ...(model ? { model } : {}),
+    ...(effort ? { effort } : {}),
+    ...(baseUrl ? { baseUrl } : {}),
+    ...(apiKeyEnv ? { apiKeyEnv } : {}),
+    ...(command ? { command } : {}),
+  });
+}
+
+function normalizeProfiles(rawProfiles: unknown, baseProfiles: AssistantConfig['profiles']): AssistantConfig['profiles'] {
+  const profiles = objectValue(rawProfiles);
+  const normalized: AssistantConfig['profiles'] = Object.fromEntries(
+    Object.entries(baseProfiles).map(([name, profile]) => [name, normalizeProfile(profile)]),
+  );
+
+  for (const [name, profile] of Object.entries(profiles)) {
+    normalized[name] = normalizeProfile(profile, normalized[name]);
+  }
+
+  return normalized;
 }
 
 function normalizeProject(entry: unknown, workspaceTargetDir: string): ProjectConfig | undefined {
@@ -228,17 +254,62 @@ export function normalizeConfig(raw: unknown, base = defaultConfig()): Assistant
     },
     maxRevisionRounds: numberValue(root.maxRevisionRounds) ?? base.maxRevisionRounds,
     workflowRoles: normalizeWorkflowRoles(workflowRoles, base.workflowRoles),
-    profiles: {
-      ...base.profiles,
-      ...Object.fromEntries(Object.entries(profiles).map(([name, profile]) => [name, { ...objectValue(profile) }])),
-    } as AssistantConfig['profiles'],
+    profiles: normalizeProfiles(profiles, base.profiles),
     verification: {
       allowlist: stringArrayValue(verification.allowlist) ?? base.verification.allowlist,
     },
   };
 }
 
+function unquoteEnvValue(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    return trimmed
+      .slice(1, -1)
+      .replace(/\\n/g, '\n')
+      .replace(/\\r/g, '\r')
+      .replace(/\\t/g, '\t')
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, '\\');
+  }
+  if (trimmed.length >= 2 && trimmed.startsWith("'") && trimmed.endsWith("'")) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function parseEnvLocal(content: string): Record<string, string> {
+  const values: Record<string, string> = {};
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const exportPrefix = 'export ';
+    const assignment = line.startsWith(exportPrefix) ? line.slice(exportPrefix.length).trim() : line;
+    const equalsIndex = assignment.indexOf('=');
+    if (equalsIndex <= 0) continue;
+    const key = assignment.slice(0, equalsIndex).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    values[key] = unquoteEnvValue(assignment.slice(equalsIndex + 1));
+  }
+  return values;
+}
+
+export async function loadLocalEnv(assistantRoot: string): Promise<void> {
+  const content = await readFile(resolve(assistantRoot, '.env.local'), 'utf8').catch((error: unknown) => {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return undefined;
+    throw error;
+  });
+  if (!content) return;
+
+  for (const [key, value] of Object.entries(parseEnvLocal(content))) {
+    if (process.env[key] === undefined) {
+      process.env[key] = value;
+    }
+  }
+}
+
 export async function loadConfig(assistantRoot: string, configPath?: string): Promise<AssistantConfig> {
+  await loadLocalEnv(assistantRoot);
   const example = await readJsonFile(resolve(assistantRoot, 'assistant.config.example.json'));
   const local = await readJsonFile(configPath ? resolve(assistantRoot, configPath) : resolve(assistantRoot, 'assistant.config.local.json'));
   const config = normalizeConfig(local ?? example);

@@ -7,15 +7,20 @@ import { isStopCommand } from './conversation.js';
 import type { AssistantConfig, TaskState } from './types.js';
 import type { WorkflowResult } from './workflow.js';
 import {
+  appendRecentMessage,
   bindTaskToProjectChat,
   findIdleProjectChat,
+  getChatSummary,
+  getRecentMessages,
   isAuthorizedOpenId,
   listProjectChats,
   registerProjectChat,
   releaseProjectChatTask,
   rememberEvent,
   type ActiveTaskBinding,
+  type ChatMemoryMessage,
   type LarkBridgeState,
+  type LarkRunningJob,
   LarkBridgeStateStore,
   type ProjectChatRegistration,
 } from './larkBridgeState.js';
@@ -49,6 +54,7 @@ export class LarkTransport {
 
   async start(): Promise<void> {
     this.state = await this.stateStore.load();
+    await this.releaseOrphanedRunningJobs();
     if (this.config.lark.allowedOpenIds.length === 0) {
       console.warn('Lark transport has no allowedOpenIds configured; all incoming user messages will be ignored.');
     }
@@ -60,6 +66,46 @@ export class LarkTransport {
   }
 
   stop(): void {}
+
+  private async releaseOrphanedRunningJobs(): Promise<void> {
+    const state = await this.loadState();
+    const orphanedJobs = Object.values(state.runningJobsByTaskId);
+    if (orphanedJobs.length === 0) return;
+
+    state.runningJobsByTaskId = {};
+    await this.saveState(state);
+
+    for (const job of orphanedJobs) {
+      const chatId = findChatIdForTask(state, job.taskId);
+      if (!chatId) {
+        await this.auditOutbound({
+          kind: 'orphaned_running_job',
+          success: true,
+          taskId: job.taskId,
+          label: job.label,
+          startedAt: job.startedAt,
+          action: 'orphaned_running_job_released_no_chat',
+        });
+        continue;
+      }
+      await this.notifyOrphanedRunningJob(chatId, job);
+    }
+  }
+
+  private async notifyOrphanedRunningJob(chatId: string, job: LarkRunningJob): Promise<void> {
+    const message = [
+      '检测到上次 Manager 启动留下的后台任务标记，但当前进程没有对应 worker。',
+      `任务 ID：${job.taskId}`,
+      `后台任务：${job.label}`,
+      `开始时间：${job.startedAt}`,
+      '我已清除这个假 in-progress 标记；任务本身状态没有自动修改，也不会自动推断完成。',
+      '你可以查看当前状态或相关 artifacts，或明确说 stop 停止；如果要重做，可以用 restart 重新开始。',
+    ].join('\n');
+
+    await this.sendText(chatId, message, { taskId: job.taskId, action: 'orphaned_running_job_released' })
+      .then(() => this.recordAssistantText(chatId, message))
+      .catch(() => undefined);
+  }
 
   async handleMessage(message: LarkIncomingMessage): Promise<void> {
     const state = await this.loadState();
@@ -110,6 +156,10 @@ export class LarkTransport {
       return;
     }
 
+    const recentMessagesSnapshot = snapshotRecentMessages(current, message.chatId);
+    const chatSummarySnapshot = getChatSummary(current, message.chatId);
+    await this.recordUserMessage(message);
+
     let projectChat = current.projectChatsByChatId[message.chatId];
     const chatKind = projectChat ? 'project' : 'control';
     let activeTask = projectChat ? await this.resolveActiveTaskBinding(current, projectChat) : undefined;
@@ -154,6 +204,8 @@ export class LarkTransport {
       ...(activeProjectId ? { activeProjectId } : {}),
       projectChatsSummary: projectChatsSummary(current),
       canCreateTask: this.canCreateTaskFromChat(message.chatId, current),
+      ...(recentMessagesSnapshot.length > 0 ? { recentMessages: recentMessagesSnapshot } : {}),
+      ...(chatSummarySnapshot ? { chatSummary: chatSummarySnapshot } : {}),
     });
     await this.auditInbound(message, {
       ...(activeTask ? { boundTaskId: activeTask.taskId } : {}),
@@ -237,7 +289,9 @@ export class LarkTransport {
 
     if (existingProjectChat) {
       if (existingProjectChat.activeTaskId || state.activeTaskByChatId[chatId]) {
-        await this.sendText(chatId, '这个 Project Chat 正在运行另一个 task，不能同时塞第二个 task。', { taskId: turn.taskId, action: 'project_chat_busy' });
+        const busyMessage = '这个 Project Chat 正在运行另一个 task，不能同时塞第二个 task。';
+        await this.sendText(chatId, busyMessage, { taskId: turn.taskId, action: 'project_chat_busy' });
+        await this.recordAssistantText(chatId, busyMessage);
         return;
       }
       bindTaskToProjectChat(state, chatId, {
@@ -261,10 +315,12 @@ export class LarkTransport {
         memberOpenIds,
       });
     } catch (error) {
-      await this.sendText(chatId, [
+      const fallbackMessage = [
         'task 已创建，但自动创建 Project Chat 失败；我先把当前聊天注册为这个项目的 Project Chat。',
         errorMessage(error),
-      ].join('\n'), { taskId: turn.taskId, action: 'create_project_chat_fallback' });
+      ].join('\n');
+      await this.sendText(chatId, fallbackMessage, { taskId: turn.taskId, action: 'create_project_chat_fallback' });
+      await this.recordAssistantText(chatId, fallbackMessage);
     }
 
     const next = await this.loadState();
@@ -288,13 +344,17 @@ export class LarkTransport {
     const state = await this.loadState();
     const target = state.projectChatsByChatId[turn.targetChatId];
     if (!target || target.projectId !== turn.projectId) {
-      await this.sendText(originChatId, `没有找到项目 ${turn.projectName ?? turn.projectId} 的目标 Project Chat。`, { taskId: turn.taskId, action: 'dispatch_target_missing' });
+      const missingMessage = `没有找到项目 ${turn.projectName ?? turn.projectId} 的目标 Project Chat。`;
+      await this.sendText(originChatId, missingMessage, { taskId: turn.taskId, action: 'dispatch_target_missing' });
+      await this.recordAssistantText(originChatId, missingMessage);
       return;
     }
     if (target.activeTaskId || state.activeTaskByChatId[turn.targetChatId]) {
       const retry = findIdleProjectChat(state, turn.projectId);
       if (!retry) {
-        await this.sendText(originChatId, `项目 ${turn.projectName ?? turn.projectId} 的 Project Chat 都在忙。要不要我新建一个 Project Chat？`, { taskId: turn.taskId, action: 'dispatch_target_busy' });
+        const busyMessage = `项目 ${turn.projectName ?? turn.projectId} 的 Project Chat 都在忙。要不要我新建一个 Project Chat？`;
+        await this.sendText(originChatId, busyMessage, { taskId: turn.taskId, action: 'dispatch_target_busy' });
+        await this.recordAssistantText(originChatId, busyMessage);
         return;
       }
       turn = { ...turn, targetChatId: retry.chatId };
@@ -326,7 +386,9 @@ export class LarkTransport {
       name,
     });
     await this.saveState(state);
-    await this.sendText(originChatId, `已创建 Project Chat：${name}`, { action: 'create_project_chat' });
+    const createdMessage = `已创建 Project Chat：${name}`;
+    await this.sendText(originChatId, createdMessage, { action: 'create_project_chat' });
+    await this.recordAssistantText(originChatId, createdMessage);
   }
 
   private async runBackgroundJob(
@@ -364,7 +426,9 @@ export class LarkTransport {
     const state = await this.loadState();
     delete state.runningJobsByTaskId[taskId];
     await this.saveState(state);
-    await this.sendText(chatId, `后台任务失败：${errorMessage(error)}`, { taskId, action: 'background_error' });
+    const errorText = `后台任务失败：${errorMessage(error)}`;
+    await this.sendText(chatId, errorText, { taskId, action: 'background_error' });
+    await this.recordAssistantText(chatId, errorText);
   }
 
   private canCreateTaskFromChat(chatId: string, state: LarkBridgeState): boolean {
@@ -375,6 +439,7 @@ export class LarkTransport {
 
   private async sendOutbound(chatId: string, outbound: BridgeOutboundMessage): Promise<void> {
     await this.sendText(chatId, outbound.text, { action: 'outbound_message' });
+    await this.recordAssistantText(chatId, outbound.text);
     for (const file of outbound.files ?? []) {
       if (!await fileExists(file.path)) {
         await this.auditOutbound({ chatId, kind: 'file', success: false, file, action: 'outbound_file_missing', error: 'File does not exist.' });
@@ -382,6 +447,33 @@ export class LarkTransport {
       }
       await this.sendFile(chatId, file, { action: 'outbound_file' });
     }
+  }
+
+  private async recordUserMessage(message: LarkIncomingMessage): Promise<void> {
+    const trimmed = message.text?.trim();
+    if (!trimmed) return;
+    const state = await this.loadState();
+    const entry: ChatMemoryMessage = {
+      role: 'user',
+      text: message.text,
+      at: new Date().toISOString(),
+    };
+    if (message.messageId) entry.messageId = message.messageId;
+    if (message.eventId) entry.eventId = message.eventId;
+    appendRecentMessage(state, message.chatId, entry);
+    await this.saveState(state);
+  }
+
+  private async recordAssistantText(chatId: string, text: string): Promise<void> {
+    const trimmed = text?.trim();
+    if (!trimmed) return;
+    const state = await this.loadState();
+    appendRecentMessage(state, chatId, {
+      role: 'assistant',
+      text,
+      at: new Date().toISOString(),
+    });
+    await this.saveState(state);
   }
 
   private async sendProcessingFailure(chatId: string, taskId: string | undefined, error: unknown): Promise<void> {
@@ -497,6 +589,20 @@ function projectChatsSummary(state: LarkBridgeState): Array<{ chatId: string; pr
       idle: !chat.activeTaskId && !state.activeTaskByChatId[chat.chatId],
       ...(chat.name ? { name: chat.name } : {}),
     }));
+}
+
+function findChatIdForTask(state: LarkBridgeState, taskId: string): string | undefined {
+  const activeBinding = Object.values(state.activeTaskByChatId)
+    .find((binding) => binding.taskId === taskId);
+  if (activeBinding) return activeBinding.chatId;
+
+  return Object.values(state.projectChatsByChatId)
+    .find((chat) => chat.activeTaskId === taskId)
+    ?.chatId;
+}
+
+function snapshotRecentMessages(state: LarkBridgeState, chatId: string): ChatMemoryMessage[] {
+  return getRecentMessages(state, chatId).map((entry) => ({ ...entry }));
 }
 
 function isIdleProjectChatState(state: TaskState): boolean {

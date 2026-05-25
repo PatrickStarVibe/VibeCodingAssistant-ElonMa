@@ -86,4 +86,43 @@ describe('ProjectKnowledgeService', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it('retrieves long-term memory snippets ranked by relevance', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'assistant-root-'));
+    try {
+      const docs = join(root, 'project-docs', 'ireader');
+      await mkdir(docs, { recursive: true });
+      await writeFile(
+        join(docs, 'memory.md'),
+        '# Project Chat decision\nWe decided Project Chat does not bind tasks; tasks are transient inside a Project Chat.\n',
+        'utf8',
+      );
+      await writeFile(join(docs, 'misc.md'), '# Random\nUnrelated note about other things.\n', 'utf8');
+
+      const snippets = await new ProjectKnowledgeService(root).retrieveMemorySnippets(makeConfig(root), {
+        projectId: 'ireader',
+        query: 'why does Project Chat not bind task',
+        maxSnippets: 2,
+      });
+
+      expect(snippets.length).toBeGreaterThan(0);
+      expect(snippets[0]?.path).toBe('memory.md');
+      expect(snippets[0]?.text).toContain('Project Chat does not bind tasks');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('returns empty memory when no docs match', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'assistant-root-'));
+    try {
+      const snippets = await new ProjectKnowledgeService(root).retrieveMemorySnippets(makeConfig(root), {
+        projectId: 'ireader',
+        query: 'anything',
+      });
+      expect(snippets).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

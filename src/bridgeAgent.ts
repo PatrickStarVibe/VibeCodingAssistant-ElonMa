@@ -4,15 +4,21 @@ import type { ArtifactStore } from './artifacts.js';
 import type { AssistantAdapter } from './adapters.js';
 import { addProjectToRegistry, type AddProjectInput } from './projectRegistry.js';
 import { getDefaultProjectId, renderProjectList, requireProject } from './projects.js';
+import type { ProjectKnowledgeService } from './projectKnowledge.js';
 import type {
   ArtifactName,
   BridgeAgentDecision,
   BridgeAgentInput,
+  BridgeChatMemoryMessage,
+  BridgeChatSummary,
+  BridgeRetrievedMemory,
   BridgeToolCall,
+  BridgeLiveProcessSnapshot,
   AssistantConfig,
   TaskState,
   WorkflowDifficulty,
 } from './types.js';
+import { getActiveProcessSnapshots } from './processRunner.js';
 import type { WorkflowResult, WorkflowService } from './workflow.js';
 import type { ActiveTaskBinding, LarkRunningJob, ProjectChatRegistration } from './larkBridgeState.js';
 
@@ -41,7 +47,11 @@ export interface BridgeAgentRequest {
   activeProjectId?: string;
   canCreateTask: boolean;
   projectChatsSummary?: BridgeAgentInput['projectChatsSummary'];
+  recentMessages?: BridgeChatMemoryMessage[];
+  chatSummary?: BridgeChatSummary;
 }
+
+type LiveProcessProvider = (taskId: string) => BridgeLiveProcessSnapshot[];
 
 export type BridgeAgentTurn =
   | {
@@ -94,6 +104,8 @@ export class BridgeAgentService {
     private readonly store: ArtifactStore,
     private readonly assistant: AssistantAdapter,
     private readonly config: AssistantConfig,
+    private readonly knowledge?: ProjectKnowledgeService,
+    private readonly liveProcessProvider: LiveProcessProvider = (taskId) => getActiveProcessSnapshots({ taskId }),
   ) {}
 
   async handleMessage(request: BridgeAgentRequest): Promise<BridgeAgentTurn> {
@@ -129,6 +141,10 @@ export class BridgeAgentService {
     const task = request.activeTask
       ? await this.store.loadState(request.activeTask.taskId).catch(() => undefined)
       : undefined;
+    const observedTaskId = request.activeTask?.taskId ?? request.runningJob?.taskId;
+    const liveProcesses = observedTaskId ? this.liveProcessProvider(observedTaskId) : [];
+    const memoryProjectId = request.projectChat?.projectId ?? request.activeProjectId;
+    const retrievedMemory = await this.retrieveMemory(request.text, memoryProjectId, request.chatSummary?.summary);
     return {
       latestUserMessage: request.text,
       chat: {
@@ -149,6 +165,7 @@ export class BridgeAgentService {
           revisionRound: task.revisionRound,
           reviewerRunCount: task.reviewerRunCount,
           requestedChanges: task.requestedChanges,
+          generatedArtifacts: Object.keys(task.artifacts) as ArtifactName[],
           ...(task.difficulty ? { difficulty: task.difficulty } : {}),
           ...(task.pendingUserPrompt ? { pendingUserPrompt: task.pendingUserPrompt } : {}),
         },
@@ -160,9 +177,42 @@ export class BridgeAgentService {
           startedAt: request.runningJob.startedAt,
         },
       } : {}),
+      ...(liveProcesses.length > 0 ? { liveProcesses: liveProcesses.map(trimLiveProcessSnapshot) } : {}),
+      ...(request.recentMessages && request.recentMessages.length > 0 ? { recentMessages: request.recentMessages } : {}),
+      ...(request.chatSummary ? { chatSummary: request.chatSummary } : {}),
+      ...(retrievedMemory ? { retrievedMemory } : {}),
       projects: (this.config.projects ?? []).map((project) => ({ id: project.id, name: project.name })),
       config: this.config,
     };
+  }
+
+  private async retrieveMemory(
+    latestUserMessage: string,
+    projectId: string | undefined,
+    summary: string | undefined,
+  ): Promise<BridgeRetrievedMemory | undefined> {
+    if (!this.knowledge) return undefined;
+    if (!projectId) return undefined;
+    const project = (this.config.projects ?? []).find((entry) => entry.id === projectId);
+    if (!project) return undefined;
+    const query = [latestUserMessage, summary].filter((value): value is string => Boolean(value && value.trim())).join('\n');
+    if (!query.trim()) return undefined;
+    try {
+      const snippets = await this.knowledge.retrieveMemorySnippets(this.config, { projectId, query });
+      if (snippets.length === 0) return undefined;
+      return {
+        query: latestUserMessage,
+        projectId,
+        snippets: snippets.map((snippet) => ({
+          source: snippet.path,
+          ...(snippet.heading ? { heading: snippet.heading } : {}),
+          text: snippet.text,
+          ...(typeof snippet.score === 'number' ? { score: snippet.score } : {}),
+        })),
+      };
+    } catch {
+      return undefined;
+    }
   }
 
   private async executeTool(request: BridgeAgentRequest, toolCall: BridgeToolCall): Promise<BridgeAgentTurn> {
@@ -332,13 +382,34 @@ export class BridgeAgentService {
     if (!taskId) return this.reply('当前聊天没有 active task。');
     const state = await this.store.loadState(taskId);
     const running = request.runningJob?.taskId === taskId ? request.runningJob : undefined;
-    return this.reply(renderBridgeStatus(state, running?.label));
+    const liveProcesses = this.liveProcessProvider(taskId);
+    return this.reply(renderBridgeStatus(state, running?.label, liveProcesses));
   }
 
   private async showArtifact(request: BridgeAgentRequest, toolCall: BridgeToolCall): Promise<BridgeAgentTurn> {
     const taskId = this.resolveTaskId(request, toolCall);
     const artifact = requiredArtifact(toolCall);
-    const content = await this.workflow.showArtifact(taskId, artifact);
+    const stateBeforeRead = await this.store.loadState(taskId);
+    if (artifact !== 'agent-prompt-preview' && !stateBeforeRead.artifacts[artifact]) {
+      return this.reply(renderMissingArtifactReply(
+        stateBeforeRead,
+        artifact,
+        request.runningJob?.taskId === taskId ? request.runningJob.label : undefined,
+      ));
+    }
+    let content: string;
+    try {
+      content = await this.workflow.showArtifact(taskId, artifact);
+    } catch (error) {
+      if (isMissingArtifactError(error)) {
+        return this.reply(renderMissingArtifactReply(
+          stateBeforeRead,
+          artifact,
+          request.runningJob?.taskId === taskId ? request.runningJob.label : undefined,
+        ));
+      }
+      throw error;
+    }
     const state = await this.store.loadState(taskId);
     const path = state.artifacts[artifact];
     return {
@@ -451,17 +522,100 @@ function filesForState(state: TaskState): BridgeOutboundFile[] | undefined {
   return files.length > 0 ? files : undefined;
 }
 
-function renderBridgeStatus(state: TaskState, runningLabel?: string): string {
+function trimLiveProcessSnapshot(snapshot: BridgeLiveProcessSnapshot): BridgeLiveProcessSnapshot {
+  const next: BridgeLiveProcessSnapshot = { ...snapshot };
+  if (snapshot.stdoutTail) {
+    next.stdoutTail = shorten(lastNonEmptyLines(snapshot.stdoutTail, 12), 1600);
+  } else {
+    delete next.stdoutTail;
+  }
+  if (snapshot.stderrTail) {
+    next.stderrTail = shorten(lastNonEmptyLines(snapshot.stderrTail, 12), 1600);
+  } else {
+    delete next.stderrTail;
+  }
+  return next;
+}
+
+function renderBridgeStatus(state: TaskState, runningLabel?: string, liveProcesses: BridgeLiveProcessSnapshot[] = []): string {
+  const liveLines = renderLiveProcessSummary(liveProcesses);
+  const executionLines = renderExecutionProgress(state);
+  const missingBackgroundWorker = isBackgroundWorkflowState(state.status) && !runningLabel && liveProcesses.length === 0;
   const lines = [
     `当前任务：${state.title}`,
     `阶段：${bridgeStageName(state.status)}`,
     `状态码：${state.status}`,
     state.difficulty ? `难度：${state.difficulty}` : undefined,
-    runningLabel ? `后台正在运行：${runningLabel}` : undefined,
+    runningLabel ? `后台任务：${runningLabel}` : undefined,
+    missingBackgroundWorker
+      ? '后台任务未运行：可能是上次 Manager 重启或进程中断后的残留状态；当前没有可恢复的 worker。'
+      : undefined,
+    ...executionLines,
+    ...(liveLines.length > 0 ? ['', '实时观察：', ...liveLines] : []),
     '',
-    bridgeNextStep(state.status),
+    bridgeNextStep(state.status, missingBackgroundWorker),
   ].filter((line): line is string => Boolean(line));
   return lines.join('\n');
+}
+
+function isBackgroundWorkflowState(status: TaskState['status']): boolean {
+  return [
+    'planning',
+    'task_artifacts_persisting',
+    'implementing',
+    'execution_queue_ready',
+    'execution_unit_implementing',
+    'execution_unit_testing',
+    'execution_unit_result_recording',
+    'next_execution_unit_or_all_done',
+    'implemented',
+    'final_reviewing',
+    'final_review_routing',
+    'task_recording',
+  ].includes(status);
+}
+
+function renderExecutionProgress(state: TaskState): string[] {
+  if (state.executionQueue.length === 0) return [];
+  const currentIndex = typeof state.currentExecutionIndex === 'number'
+    ? state.currentExecutionIndex
+    : state.executionQueue.findIndex((unit) => unit.status === 'In Progress');
+  const current = currentIndex >= 0 ? state.executionQueue[currentIndex] : undefined;
+  const done = state.executionQueue.filter((unit) => unit.status === 'Done').length;
+  const total = state.executionQueue.length;
+  return [
+    `执行单元：${done}/${total} 已完成`,
+    current ? `当前单元：${current.index}/${total} ${current.name}（${current.status}）` : undefined,
+  ].filter((line): line is string => Boolean(line));
+}
+
+function renderLiveProcessSummary(processes: BridgeLiveProcessSnapshot[]): string[] {
+  return processes.flatMap((process, index) => {
+    const roleName = [process.role, process.profileName].filter(Boolean).join(':');
+    const name = process.label ?? (roleName || process.command);
+    const output = process.stdoutTail || process.stderrTail;
+    return [
+      `- worker ${index + 1}: ${name}${process.pid ? `, pid ${process.pid}` : ''}, 已运行 ${formatElapsed(process.elapsedMs)}`,
+      `  cwd: ${process.cwd}`,
+      output ? `  最近输出：${shorten(lastNonEmptyLines(output, 8), 900)}` : '  最近输出：还没有可见 stdout/stderr；这通常表示 worker 正在内部思考或工具还没吐日志。',
+    ];
+  });
+}
+
+function formatElapsed(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return minutes > 0 ? `${minutes}m ${rest}s` : `${rest}s`;
+}
+
+function lastNonEmptyLines(text: string, maxLines: number): string {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0)
+    .slice(-maxLines)
+    .join('\n');
 }
 
 function bridgeStageName(status: TaskState['status']): string {
@@ -501,7 +655,10 @@ function bridgeStageName(status: TaskState['status']): string {
   }
 }
 
-function bridgeNextStep(status: TaskState['status']): string {
+function bridgeNextStep(status: TaskState['status'], missingBackgroundWorker = false): string {
+  if (missingBackgroundWorker) {
+    return '下一步：请查看已有 artifacts 判断进度，或明确说 stop 停止任务；如果要重做，可以用 restart 重新开始。';
+  }
   switch (status) {
     case 'awaiting_difficulty_selection':
     case 'created':
@@ -518,6 +675,39 @@ function bridgeNextStep(status: TaskState['status']): string {
     default:
       return '下一步：你可以问我当前进度，也可以明确说停止任务。';
   }
+}
+
+function renderMissingArtifactReply(state: TaskState, artifact: ArtifactName, runningLabel?: string): string {
+  return [
+    `不是权限问题，是 ${artifact}.md 现在还没生成。`,
+    `当前阶段：${bridgeStageName(state.status)} (${state.status})`,
+    runningLabel ? `后台正在运行：${runningLabel}` : undefined,
+    '',
+    missingArtifactHint(artifact, state.status),
+  ].filter((line): line is string => Boolean(line)).join('\n');
+}
+
+function missingArtifactHint(artifact: ArtifactName, status: TaskState['status']): string {
+  if (artifact === 'implementation-log') {
+    return ['implementation_approved', 'implementing', 'execution_unit_implementing'].includes(status)
+      ? 'Developer 还在执行；implementation-log 要等这一段实现结束后才会落盘。你可以问“当前状态”确认它是不是还在跑。'
+      : '这个 task 还没有产生 implementation-log；可能还没进入实现，或者实现没有成功产生日志。';
+  }
+  if (artifact === 'test-build-log') {
+    return 'test-build-log 要等实现后的验证阶段结束才会生成。';
+  }
+  if (artifact === 'final-review') {
+    return 'final-review 要等实现和验证结束后才会生成。';
+  }
+  if (artifact === 'final-report') {
+    return 'final-report 要等你最终验收后才会生成。';
+  }
+  return '这个 artifact 还没在当前 task 中生成。';
+}
+
+function isMissingArtifactError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return /ENOENT|no such file or directory/i.test(error.message);
 }
 
 function requiredString(toolCall: BridgeToolCall, key: string): string {

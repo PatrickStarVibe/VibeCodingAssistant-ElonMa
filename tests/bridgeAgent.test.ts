@@ -7,9 +7,11 @@ import { describe, expect, it } from 'vitest';
 import { ArtifactStore } from '../src/artifacts.js';
 import type { HeavyAgentAdapter, AssistantAdapter } from '../src/adapters.js';
 import { BridgeAgentService } from '../src/bridgeAgent.js';
+import { ProjectKnowledgeService } from '../src/projectKnowledge.js';
 import type {
   BridgeAgentDecision,
   BridgeAgentInput,
+  BridgeLiveProcessSnapshot,
   ControlChatResult,
   IntentResult,
   AssistantConfig,
@@ -121,7 +123,7 @@ function makeConfig(targetDir: string): AssistantConfig {
   };
 }
 
-async function makeHarness(): Promise<{
+async function makeHarness(liveProcessProvider?: (taskId: string) => BridgeLiveProcessSnapshot[]): Promise<{
   root: string;
   targetDir: string;
   store: ArtifactStore;
@@ -142,7 +144,9 @@ async function makeHarness(): Promise<{
     store,
     workflow,
     assistant,
-    agent: new BridgeAgentService(workflow, store, assistant, config),
+    agent: liveProcessProvider
+      ? new BridgeAgentService(workflow, store, assistant, config, undefined, liveProcessProvider)
+      : new BridgeAgentService(workflow, store, assistant, config),
     config,
   };
 }
@@ -293,6 +297,106 @@ describe('BridgeAgentService', () => {
         expect(turn.messages[0]?.text).toContain('等待你验收');
         expect(turn.messages[0]?.text).toContain('task recording');
         expect(turn.messages[0]?.text).not.toContain('等待批准实现');
+      }
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('includes live worker observation in task status', async () => {
+    const liveProcesses: BridgeLiveProcessSnapshot[] = [{
+      id: 'run-1',
+      command: 'codex',
+      cwd: 'C:\\workspace\\reader',
+      startedAt: new Date(Date.now() - 90_000).toISOString(),
+      elapsedMs: 90_000,
+      pid: 1234,
+      role: 'developer',
+      profileName: 'implementer',
+      label: 'developer:implementer',
+      stdoutTail: [
+        'Reading src/components/Reader.tsx',
+        'Editing vocabulary overlay positioning',
+        'Running focused tests',
+      ].join('\n'),
+    }];
+    const harness = await makeHarness((taskId) => liveProcesses.map((process) => ({ ...process, taskId })));
+    try {
+      const taskId = await createTaskAtDifficultyGate(harness);
+      const state = await harness.store.loadState(taskId);
+      await harness.store.saveState({
+        ...state,
+        status: 'execution_unit_implementing',
+        difficulty: 'low',
+        currentExecutionIndex: 0,
+        executionQueue: [{
+          index: 1,
+          slug: 'main',
+          name: 'Fix reader overlay',
+          status: 'In Progress',
+          fileName: '01-main.md',
+        }],
+        updatedAt: new Date().toISOString(),
+      });
+      harness.assistant.decisions.push({ kind: 'tool_call', toolCall: { name: 'show_status', arguments: {} } });
+
+      const turn = await harness.agent.handleMessage({
+        chatId: 'task-chat',
+        senderOpenId: 'user-open-id',
+        text: '现在做到哪一步了',
+        ...activeTaskChat(taskId),
+        runningJob: { taskId, label: 'implementing', startedAt: new Date().toISOString() },
+      });
+
+      expect(harness.assistant.inputs[0]?.liveProcesses?.[0]?.label).toBe('developer:implementer');
+      expect(turn.kind).toBe('reply');
+      if (turn.kind === 'reply') {
+        const text = turn.messages[0]?.text ?? '';
+        expect(text).toContain('实时观察');
+        expect(text).toContain('developer:implementer');
+        expect(text).toContain('Fix reader overlay');
+        expect(text).toContain('Running focused tests');
+      }
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('marks internal task status as orphaned when no running job or worker exists', async () => {
+    const harness = await makeHarness(() => []);
+    try {
+      const taskId = await createTaskAtDifficultyGate(harness);
+      const state = await harness.store.loadState(taskId);
+      await harness.store.saveState({
+        ...state,
+        status: 'execution_unit_implementing',
+        difficulty: 'low',
+        currentExecutionIndex: 0,
+        executionQueue: [{
+          index: 1,
+          slug: 'main',
+          name: 'Main',
+          status: 'In Progress',
+          fileName: '01-main.md',
+        }],
+        updatedAt: new Date().toISOString(),
+      });
+      harness.assistant.decisions.push({ kind: 'tool_call', toolCall: { name: 'show_status', arguments: {} } });
+
+      const turn = await harness.agent.handleMessage({
+        chatId: 'task-chat',
+        senderOpenId: 'user-open-id',
+        text: '当前进度',
+        ...activeTaskChat(taskId),
+      });
+
+      expect(turn.kind).toBe('reply');
+      if (turn.kind === 'reply') {
+        const text = turn.messages[0]?.text ?? '';
+        expect(text).toContain('后台任务未运行');
+        expect(text).toContain('可能是上次 Manager 重启或进程中断');
+        expect(text).toContain('restart');
+        expect(text).not.toContain('后台任务：implementing');
       }
     } finally {
       await cleanup([harness.root, harness.targetDir]);
@@ -454,8 +558,132 @@ describe('BridgeAgentService', () => {
       });
 
       expect(turn.kind).toBe('reply');
-      if (turn.kind === 'reply') expect(turn.messages[0]?.text).toContain('没有执行');
+      if (turn.kind === 'reply') {
+        expect(turn.messages[0]?.text).toContain('不是权限问题');
+        expect(turn.messages[0]?.text).toContain('final-report.md 现在还没生成');
+      }
       expect((await harness.store.loadState(taskId)).status).toBe('awaiting_user_acceptance');
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('explains missing implementation logs while a task is still implementing', async () => {
+    const harness = await makeHarness();
+    try {
+      const taskId = await createTaskAtDifficultyGate(harness);
+      const state = await harness.store.loadState(taskId);
+      await harness.store.saveState({
+        ...state,
+        status: 'execution_unit_implementing',
+        difficulty: 'high',
+        updatedAt: new Date().toISOString(),
+      });
+      harness.assistant.decisions.push({
+        kind: 'tool_call',
+        toolCall: { name: 'show_artifact', arguments: { artifact: 'implementation-log' } },
+      });
+
+      const turn = await harness.agent.handleMessage({
+        chatId: 'task-chat',
+        senderOpenId: 'user-open-id',
+        text: '你确定他没卡住执行',
+        ...activeTaskChat(taskId),
+        runningJob: { taskId, label: 'implementing', startedAt: new Date().toISOString() },
+      });
+
+      expect(turn.kind).toBe('reply');
+      if (turn.kind === 'reply') {
+        expect(turn.messages[0]?.text).toContain('不是权限问题');
+        expect(turn.messages[0]?.text).toContain('implementation-log.md 现在还没生成');
+        expect(turn.messages[0]?.text).toContain('Developer 还在执行');
+      }
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('forwards recentMessages and chatSummary into the bridge input', async () => {
+    const harness = await makeHarness();
+    try {
+      harness.assistant.decisions.push({ kind: 'reply', text: '好的，正在创建。' });
+      await harness.agent.handleMessage({
+        chatId: 'control-chat',
+        senderOpenId: 'user-open-id',
+        text: '现在创建吧',
+        chatKind: 'control',
+        canCreateTask: true,
+        recentMessages: [
+          { role: 'assistant', text: '要为 IReader 创建 Project Chat 吗？', at: '2025-01-01T00:00:00Z' },
+        ],
+        chatSummary: {
+          summary: '用户正在为 IReader 配置 Project Chat',
+          messageCountCovered: 4,
+          updatedAt: '2025-01-01T00:00:00Z',
+        },
+      });
+
+      const input = harness.assistant.inputs[0];
+      expect(input?.recentMessages?.[0]?.text).toBe('要为 IReader 创建 Project Chat 吗？');
+      expect(input?.chatSummary?.summary).toBe('用户正在为 IReader 配置 Project Chat');
+      expect(input?.latestUserMessage).toBe('现在创建吧');
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('omits recentMessages key when there is no prior history', async () => {
+    const harness = await makeHarness();
+    try {
+      harness.assistant.decisions.push({ kind: 'reply', text: 'hi' });
+      await harness.agent.handleMessage({
+        chatId: 'control-chat',
+        senderOpenId: 'user-open-id',
+        text: 'hello',
+        chatKind: 'control',
+        canCreateTask: true,
+      });
+      expect(harness.assistant.inputs[0]?.recentMessages).toBeUndefined();
+      expect(harness.assistant.inputs[0]?.chatSummary).toBeUndefined();
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('retrieves long-term memory snippets via ProjectKnowledgeService when configured', async () => {
+    const harness = await makeHarness();
+    try {
+      const docs = join(harness.root, 'project-docs', 'default');
+      await mkdir(docs, { recursive: true });
+      await readFile;
+      const { writeFile } = await import('node:fs/promises');
+      await writeFile(
+        join(docs, 'memory.md'),
+        '# Project Chat 决策\n之前决定 Project Chat 不绑定 task，因为 task 只是 Project Chat 内的短期 active 状态。\n',
+        'utf8',
+      );
+      const agentWithKnowledge = new BridgeAgentService(
+        harness.workflow,
+        harness.store,
+        harness.assistant,
+        harness.config,
+        new ProjectKnowledgeService(harness.root),
+      );
+
+      harness.assistant.decisions.push({ kind: 'reply', text: '让我看看以前的决定。' });
+      await agentWithKnowledge.handleMessage({
+        chatId: 'control-chat',
+        senderOpenId: 'user-open-id',
+        text: '之前我们为什么决定 Project Chat 不绑定 task？',
+        chatKind: 'control',
+        canCreateTask: true,
+        activeProjectId: 'default',
+      });
+
+      const input = harness.assistant.inputs[0];
+      expect(input?.retrievedMemory?.snippets?.length).toBeGreaterThan(0);
+      expect(input?.retrievedMemory?.snippets?.[0]?.source).toBe('memory.md');
+      expect(input?.retrievedMemory?.snippets?.[0]?.text).toContain('Project Chat 不绑定 task');
     } finally {
       await cleanup([harness.root, harness.targetDir]);
     }

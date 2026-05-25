@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path';
 
 import { getDefaultAssistantRoot } from './config.js';
 import { sanitizeTextForArtifact } from './textSanitizer.js';
+import { runFile } from './processRunner.js';
 import type {
   AgentPromptRecord,
   AgentProfileConfig,
@@ -32,7 +33,6 @@ import type {
   TaskState,
   WorkflowDifficulty,
 } from './types.js';
-import { runFile } from './processRunner.js';
 
 export interface AssistantAdapter {
   decideBridgeAction?(input: BridgeAgentInput): Promise<BridgeAgentDecision>;
@@ -118,12 +118,12 @@ export interface HeavyAgentAdapter {
   }): Promise<FinalReviewResult>;
 }
 
-interface DeepSeekMessage {
+interface ChatCompletionMessage {
   role: 'system' | 'user';
   content: string;
 }
 
-interface DeepSeekTool {
+interface ChatCompletionTool {
   type: 'function';
   function: {
     name: string;
@@ -390,7 +390,7 @@ function stringArrayValue(value: unknown): string[] | undefined {
   return undefined;
 }
 
-function bridgeTools(input?: BridgeAgentInput): DeepSeekTool[] {
+function bridgeTools(input?: BridgeAgentInput): ChatCompletionTool[] {
   const availableToolNames = bridgeToolNamesForInput(input);
   const object = (properties: Record<string, unknown>, required: string[] = []) => ({
     type: 'object',
@@ -572,7 +572,7 @@ function bridgeTools(input?: BridgeAgentInput): DeepSeekTool[] {
         }, ['prompt']),
       },
     },
-  ] as DeepSeekTool[]).filter((tool) => availableToolNames.has(tool.function.name as BridgeToolName));
+  ] as ChatCompletionTool[]).filter((tool) => availableToolNames.has(tool.function.name as BridgeToolName));
 }
 
 function bridgeToolNamesForInput(input?: BridgeAgentInput): Set<BridgeToolName> {
@@ -582,6 +582,53 @@ function bridgeToolNamesForInput(input?: BridgeAgentInput): Set<BridgeToolName> 
     return input.chat.boundTaskId ? ACTIVE_PROJECT_CHAT_TOOL_NAMES : IDLE_PROJECT_CHAT_TOOL_NAMES;
   }
   return CONTROL_BRIDGE_TOOL_NAMES;
+}
+
+function renderBridgeUserPrompt(input: BridgeAgentInput): string {
+  const systemState = {
+    chat: input.chat,
+    projectChatsSummary: input.projectChatsSummary,
+    task: input.task,
+    runningJob: input.runningJob,
+    liveProcesses: input.liveProcesses,
+    projects: input.projects,
+  };
+  const sections: string[] = [];
+  sections.push(`## Real system state (highest priority)\n${JSON.stringify(systemState, null, 2)}`);
+  if (input.chatSummary) {
+    sections.push([
+      '## Chat summary (mid-term memory)',
+      `Updated at ${input.chatSummary.updatedAt}. Covers ${input.chatSummary.messageCountCovered} earlier messages.`,
+      '',
+      input.chatSummary.summary,
+    ].join('\n'));
+  }
+  if (input.recentMessages && input.recentMessages.length > 0) {
+    sections.push([
+      '## Recent messages (short-term memory, oldest first; the latest user message below is NOT in this list)',
+      ...input.recentMessages.map((entry) => {
+        const speaker = entry.role === 'user' ? 'User' : 'Assistant';
+        return `- [${entry.at}] ${speaker}: ${truncateForPrompt(entry.text, 800)}`;
+      }),
+    ].join('\n'));
+  }
+  if (input.retrievedMemory && input.retrievedMemory.snippets.length > 0) {
+    sections.push([
+      '## Retrieved long-term memory (background; never override the latest user message)',
+      `Query: ${input.retrievedMemory.query}`,
+      input.retrievedMemory.projectId ? `Project: ${input.retrievedMemory.projectId}` : '',
+      ...input.retrievedMemory.snippets.map((snippet) => {
+        const header = snippet.heading ? `${snippet.source}#${snippet.heading}` : snippet.source;
+        return `### ${header}\n${truncateForPrompt(snippet.text, 1200)}`;
+      }),
+    ].filter(Boolean).join('\n'));
+  }
+  sections.push(`## Latest user message\n${input.latestUserMessage}`);
+  return sections.join('\n\n');
+}
+
+function truncateForPrompt(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 20)).trimEnd()}\n[truncated]`;
 }
 
 function controlChatFromContent(content: string): ControlChatResult {
@@ -632,22 +679,67 @@ export async function loadAssistantSkill(name: string): Promise<string> {
   }
 }
 
-export class DeepSeekAssistantAdapter implements AssistantAdapter {
-  constructor(private readonly profile: AgentProfileConfig, private readonly env: NodeJS.ProcessEnv = process.env) {}
+function normalizedBaseUrl(baseUrl: string): string {
+  return baseUrl.replace(/\/+$/, '');
+}
+
+const COMMAND_PROFILE_KINDS = new Set(['command', 'codex', 'claude']);
+
+function isCommandBackedProfile(profile: AgentProfileConfig): boolean {
+  return COMMAND_PROFILE_KINDS.has(profile.kind.trim().toLowerCase()) || Boolean(profile.command?.trim());
+}
+
+interface AssistantApiRequestConfig {
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+}
+
+export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
+  constructor(
+    private readonly profile: AgentProfileConfig,
+    private readonly env: NodeJS.ProcessEnv = process.env,
+    private readonly profileName = 'assistant',
+  ) {}
 
   private async elonMaSystem(): Promise<string> {
     return loadAssistantSkill('elon-ma-assistant');
   }
 
-  private async chat(messages: DeepSeekMessage[], jsonMode = false): Promise<string> {
-    const apiKeyEnv = this.profile.apiKeyEnv ?? 'DEEPSEEK_API_KEY';
+  private requestConfig(): AssistantApiRequestConfig {
+    if (isCommandBackedProfile(this.profile)) {
+      throw new Error(
+        `Assistant profile "${this.profileName}" is command-backed, but assistant chat requires an OpenAI-compatible API profile with model, baseUrl, and apiKeyEnv.`,
+      );
+    }
+    const apiKeyEnv = this.profile.apiKeyEnv?.trim();
+    if (!apiKeyEnv) {
+      throw new Error(
+        `Assistant profile "${this.profileName}" is missing apiKeyEnv. Configure profiles.${this.profileName}.apiKeyEnv and set that variable in .env.local or process env.`,
+      );
+    }
     const apiKey = this.env[apiKeyEnv]?.trim();
     if (!apiKey) {
-      throw new Error(`${apiKeyEnv} is required for Elon Ma agent calls.`);
+      throw new Error(
+        `Assistant profile "${this.profileName}" expects API key env var ${apiKeyEnv}, but it is not set. Set ${apiKeyEnv} in .env.local or process env.`,
+      );
     }
+    const model = this.profile.model?.trim();
+    if (!model) {
+      throw new Error(`Assistant profile "${this.profileName}" is missing model.`);
+    }
+    const baseUrl = this.profile.baseUrl?.trim();
+    if (!baseUrl) {
+      throw new Error(`Assistant profile "${this.profileName}" is missing baseUrl for the OpenAI-compatible /chat/completions endpoint.`);
+    }
+    return { apiKey, baseUrl: normalizedBaseUrl(baseUrl), model };
+  }
+
+  private async chat(messages: ChatCompletionMessage[], jsonMode = false): Promise<string> {
+    const requestConfig = this.requestConfig();
 
     const body: Record<string, unknown> = {
-      model: this.profile.model ?? 'deepseek-v4-flash',
+      model: requestConfig.model,
       messages,
       temperature: 0.1,
     };
@@ -655,10 +747,10 @@ export class DeepSeekAssistantAdapter implements AssistantAdapter {
       body.response_format = { type: 'json_object' };
     }
 
-    const response = await fetch(`${this.profile.baseUrl ?? 'https://api.deepseek.com/v1'}/chat/completions`, {
+    const response = await fetch(`${requestConfig.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${apiKey}`,
+        Authorization: `Bearer ${requestConfig.apiKey}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
@@ -673,25 +765,21 @@ export class DeepSeekAssistantAdapter implements AssistantAdapter {
     return stringValue(message.content) ?? responseText;
   }
 
-  private async chatWithTools(messages: DeepSeekMessage[], tools: DeepSeekTool[]): Promise<BridgeAgentDecision> {
-    const apiKeyEnv = this.profile.apiKeyEnv ?? 'DEEPSEEK_API_KEY';
-    const apiKey = this.env[apiKeyEnv]?.trim();
-    if (!apiKey) {
-      throw new Error(`${apiKeyEnv} is required for Elon Ma agent calls.`);
-    }
+  private async chatWithTools(messages: ChatCompletionMessage[], tools: ChatCompletionTool[]): Promise<BridgeAgentDecision> {
+    const requestConfig = this.requestConfig();
 
     const body: Record<string, unknown> = {
-      model: this.profile.model ?? 'deepseek-v4-flash',
+      model: requestConfig.model,
       messages,
       temperature: 0.1,
       tools,
       tool_choice: 'auto',
     };
 
-    const response = await fetch(`${this.profile.baseUrl ?? 'https://api.deepseek.com/v1'}/chat/completions`, {
+    const response = await fetch(`${requestConfig.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${apiKey}`,
+        Authorization: `Bearer ${requestConfig.apiKey}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
@@ -747,21 +835,19 @@ export class DeepSeekAssistantAdapter implements AssistantAdapter {
           'Use add_project only when the user provided a local targetDir. If targetDir is missing, ask for the project location. id, name, docsDir, and taskRecordRoot are optional.',
           'Use list_projects when the user asks about registered projects, current project context, project paths, or available project groups.',
           'Use switch_project only to set Control/Private Chat temporary project context; Project Chat project binding is fixed by its registration.',
+          'If the user asks what stage the task is in, whether it is stuck, why it is taking long, or whether it is still running, use show_status first. show_status can reveal the current live worker process, its role, and its latest stdout/stderr tail when available.',
+          'Only use show_artifact for artifacts listed in task.generatedArtifacts. If an artifact is not listed, explain that it has not been generated yet instead of trying to read it.',
+          'In particular, do not read implementation-log while the task is still implementing; it is created after the developer step finishes.',
           'Do not narrate state-machine menus. If you cannot execute an action, explain the reason in plain language.',
+          'Context priority, highest first: real system state (chat, projectChatsSummary, task, runningJob, liveProcesses), chatSummary, recentMessages, retrievedMemory, latestUserMessage. If they conflict, real system state wins.',
+          'recentMessages is the short-term memory of the most recent turns in this exact chat (up to ~20). Use it to resolve short references like "现在创建吧", "继续", "两个都创建", or "刚才那个" by reading what you and the user just said.',
+          'chatSummary is mid-term memory; it captures earlier conversation that is no longer in recentMessages. Use it for context but never let it override the latest user message or current system state.',
+          'retrievedMemory is long-term memory pulled from project docs. Use it only for cross-task or cross-day background knowledge. Do not let it override what the user just said.',
         ].join(' '),
       },
       {
         role: 'user',
-        content: [
-          `Bridge input:\n${JSON.stringify({
-            latestUserMessage: input.latestUserMessage,
-            chat: input.chat,
-            task: input.task,
-            runningJob: input.runningJob,
-            projects: input.projects,
-            projectChatsSummary: input.projectChatsSummary,
-          }, null, 2)}`,
-        ].join('\n\n'),
+        content: renderBridgeUserPrompt(input),
       },
     ], bridgeTools(input));
   }
@@ -1161,12 +1247,32 @@ export function buildClaudeProfileArgs(profile: AgentProfileConfig | undefined):
   return args;
 }
 
+function profileProviderKey(profile: AgentProfileConfig): string {
+  return (profile.provider ?? profile.kind).trim().toLowerCase();
+}
+
+function requireProfileCommand(
+  profileName: string,
+  role: HeavyWorkflowRoleName,
+  profile: AgentProfileConfig,
+): string {
+  const command = profile.command?.trim();
+  if (command) return command;
+  throw new Error(`Workflow role ${role} uses profile "${profileName}", but profiles.${profileName}.command is missing.`);
+}
+
 class CliHeavyAgentAdapter implements HeavyAgentAdapter {
   constructor(private readonly config: AssistantConfig) {}
 
-  private async codex(prompt: string, profileName: string, role: HeavyWorkflowRoleName, config = this.config): Promise<string> {
-    const profile = config.profiles[profileName];
-    const command = profile?.command ?? 'codex';
+  private async codex(
+    prompt: string,
+    profileName: string,
+    role: HeavyWorkflowRoleName,
+    profile: AgentProfileConfig,
+    taskId: string,
+    config = this.config,
+  ): Promise<string> {
+    const command = requireProfileCommand(profileName, role, profile);
     const sandbox = role === 'developer' ? 'danger-full-access' : 'read-only';
     const outputDir = await mkdtemp(join(tmpdir(), 'assistant-codex-'));
     const outputPath = join(outputDir, 'last-message.md');
@@ -1186,7 +1292,13 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
         sandbox,
         '--skip-git-repo-check',
         '-',
-      ], config.workspace.targetDir, prompt);
+      ], config.workspace.targetDir, prompt, {
+        taskId,
+        role,
+        profileName,
+        label: `${role}:${profileName}`,
+        outputPath,
+      });
       const lastMessage = await readFile(outputPath, 'utf8').catch(() => '');
       return sanitizeTextForArtifact(lastMessage.trim() || [result.stdout, result.stderr].filter(Boolean).join('\n'));
     } finally {
@@ -1194,9 +1306,15 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
     }
   }
 
-  private async claude(prompt: string, profileName: string, config = this.config): Promise<string> {
-    const profile = config.profiles[profileName];
-    const command = profile?.command ?? 'claude';
+  private async claude(
+    prompt: string,
+    profileName: string,
+    role: HeavyWorkflowRoleName,
+    profile: AgentProfileConfig,
+    taskId: string,
+    config = this.config,
+  ): Promise<string> {
+    const command = requireProfileCommand(profileName, role, profile);
     const result = await runFile(command, [
       '-p',
       ...buildClaudeProfileArgs(profile),
@@ -1204,7 +1322,30 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
       'bypassPermissions',
       '--add-dir',
       config.workspace.targetDir,
-    ], config.workspace.targetDir, prompt);
+    ], config.workspace.targetDir, prompt, {
+      taskId,
+      role,
+      profileName,
+      label: `${role}:${profileName}`,
+    });
+    return sanitizeTextForArtifact([result.stdout, result.stderr].filter(Boolean).join('\n'));
+  }
+
+  private async genericCommand(
+    prompt: string,
+    profileName: string,
+    role: HeavyWorkflowRoleName,
+    profile: AgentProfileConfig,
+    taskId: string,
+    config = this.config,
+  ): Promise<string> {
+    const command = requireProfileCommand(profileName, role, profile);
+    const result = await runFile(command, [], config.workspace.targetDir, prompt, {
+      taskId,
+      role,
+      profileName,
+      label: `${role}:${profileName}`,
+    });
     return sanitizeTextForArtifact([result.stdout, result.stderr].filter(Boolean).join('\n'));
   }
 
@@ -1213,19 +1354,24 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
     difficulty: WorkflowDifficulty,
     role: HeavyWorkflowRoleName,
     config: AssistantConfig,
+    state: Pick<TaskState, 'taskId'>,
   ): Promise<string> {
     const profileName = config.workflowRoles[difficulty][role];
     const profile = config.profiles[profileName];
     if (!profile) {
       throw new Error(`Workflow role ${difficulty}.${role} references missing profile ${profileName}.`);
     }
-    if (profile.kind === 'codex') {
-      return this.codex(prompt, profileName, role, config);
+    if (!isCommandBackedProfile(profile)) {
+      throw new Error(`Workflow role ${difficulty}.${role} uses profile "${profileName}", but workflow agents require a command-backed profile.`);
     }
-    if (profile.kind === 'claude') {
-      return this.claude(prompt, profileName, config);
+    const providerKey = profileProviderKey(profile);
+    if (providerKey === 'codex') {
+      return this.codex(prompt, profileName, role, profile, state.taskId, config);
     }
-    throw new Error(`Workflow role ${difficulty}.${role} uses unsupported heavy agent profile kind ${profile.kind}.`);
+    if (providerKey === 'claude') {
+      return this.claude(prompt, profileName, role, profile, state.taskId, config);
+    }
+    return this.genericCommand(prompt, profileName, role, profile, state.taskId, config);
   }
 
   private agentPromptRecord(
@@ -1255,7 +1401,7 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
 
   async createInitialPlan(input: { task: string; projectContext: string; difficulty: WorkflowDifficulty; state: TaskState; config: AssistantConfig }): Promise<PlanResult> {
     const prompt = buildInitialPlanPrompt(input);
-    const markdown = await this.runWorkflowRole(prompt, input.difficulty, 'architect', input.config);
+    const markdown = await this.runWorkflowRole(prompt, input.difficulty, 'architect', input.config, input.state);
     return {
       markdown,
       verificationCommands: extractVerificationCommands(markdown),
@@ -1273,7 +1419,7 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
       `Initial plan:\n${input.initialPlan}`,
     ].join('\n\n');
     return {
-      markdown: await this.runWorkflowRole(prompt, input.difficulty, 'planReviewer', input.config),
+      markdown: await this.runWorkflowRole(prompt, input.difficulty, 'planReviewer', input.config, input.state),
       agentPrompt: this.agentPromptRecord(prompt, input.difficulty, 'planReviewer', input.state, input.config),
     };
   }
@@ -1300,7 +1446,7 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
       `Assistant revision instructions:\n${input.revisionInstructions}`,
       'End with a "Verification Commands" section listing only commands to run.',
     ].join('\n\n');
-    const markdown = await this.runWorkflowRole(prompt, input.difficulty, 'architect', input.config);
+    const markdown = await this.runWorkflowRole(prompt, input.difficulty, 'architect', input.config, input.state);
     return {
       markdown,
       verificationCommands: extractVerificationCommands(markdown),
@@ -1329,7 +1475,7 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
       'Run focused tests when practical and include the Test Result details for this execution unit.',
       'When reading Markdown or other text files, preserve UTF-8 text. On Windows PowerShell, use Get-Content -Raw -Encoding utf8 for file content, and keep command output free of ANSI color codes.',
     ].join('\n\n');
-    const markdown = await this.runWorkflowRole(prompt, difficulty, 'developer', input.config);
+    const markdown = await this.runWorkflowRole(prompt, difficulty, 'developer', input.config, input.state);
     return {
       markdown,
       changedFiles: [],
@@ -1355,7 +1501,7 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
       `Implementation log:\n${input.implementationLog}`,
       `Verification:\n${input.verificationLog}`,
     ].join('\n\n');
-    const markdown = await this.runWorkflowRole(prompt, difficulty, 'finalReviewer', input.config);
+    const markdown = await this.runWorkflowRole(prompt, difficulty, 'finalReviewer', input.config, input.state);
     return {
       markdown,
       passed: !/\b(blocking|must fix|failed|regression)\b/i.test(markdown),
@@ -1405,10 +1551,10 @@ function firstNonHeadingParagraph(markdown: string): string | undefined {
 export function createAssistantAdapter(config: AssistantConfig, env: NodeJS.ProcessEnv = process.env): AssistantAdapter {
   const profileName = config.workflowRoles.assistant;
   const profile = config.profiles[profileName];
-  if (!profile || profile.kind !== 'deepseek') {
-    throw new Error(`Workflow role assistant references unsupported or missing profile ${profileName}. Current assistant adapter supports deepseek profiles.`);
+  if (!profile) {
+    throw new Error(`Workflow role assistant references missing profile ${profileName}.`);
   }
-  return new DeepSeekAssistantAdapter(profile, env);
+  return new OpenAICompatibleAssistantAdapter(profile, env, profileName);
 }
 
 export function createHeavyAgentAdapter(config: AssistantConfig, allowAgentCalls: boolean): HeavyAgentAdapter {

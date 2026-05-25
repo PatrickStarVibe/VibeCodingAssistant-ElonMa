@@ -12,7 +12,7 @@ cd <assistant-workspace>
 npm run assistant -- create --title "feedback-ui-unification" --task-file tasks/follow-up-feedback-ui.md
 ```
 
-然后跑 `plan`（不带 `--allow-agent-calls`，因为 brief 阶段只用 DeepSeek，几分钱就出来）：
+然后跑 `plan`（不带 `--allow-agent-calls`，只使用当前配置的 assistant API profile；真实 key 放在 `.env.local` 或环境变量里）：
 
 ```bash
 npm run assistant -- plan --task <task-id-from-create>

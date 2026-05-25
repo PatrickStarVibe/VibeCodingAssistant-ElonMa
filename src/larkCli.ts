@@ -1,12 +1,17 @@
 #!/usr/bin/env node
 
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
 import { ArtifactStore } from './artifacts.js';
 import { BridgeAgentService } from './bridgeAgent.js';
-import { createHeavyAgentAdapter, createAssistantAdapter } from './adapters.js';
+import { createHeavyAgentAdapter, createAssistantAdapter, type AssistantAdapter } from './adapters.js';
 import { getDefaultAssistantRoot, loadConfig } from './config.js';
 import { LarkTransport } from './larkBridge.js';
 import { LarkBridgeStateStore } from './larkBridgeState.js';
 import { LarkSdkClient } from './larkSdkClient.js';
+import { ProjectKnowledgeService } from './projectKnowledge.js';
+import type { AssistantConfig } from './types.js';
 import { WorkflowService } from './workflow.js';
 
 interface LarkCliOptions {
@@ -29,8 +34,24 @@ function parseCli(argv: string[]): LarkCliOptions {
   return { configPath, stubHeavyAgents };
 }
 
-async function main(): Promise<void> {
-  const options = parseCli(process.argv.slice(2));
+export function createBridgeAgentService(
+  assistantRoot: string,
+  workflow: WorkflowService,
+  store: ArtifactStore,
+  assistant: AssistantAdapter,
+  config: AssistantConfig,
+): BridgeAgentService {
+  return new BridgeAgentService(
+    workflow,
+    store,
+    assistant,
+    config,
+    new ProjectKnowledgeService(assistantRoot),
+  );
+}
+
+export async function main(argv = process.argv.slice(2)): Promise<void> {
+  const options = parseCli(argv);
   const assistantRoot = getDefaultAssistantRoot();
   const config = await loadConfig(assistantRoot, options.configPath);
   const store = new ArtifactStore(assistantRoot, config);
@@ -41,7 +62,7 @@ async function main(): Promise<void> {
     assistant,
     createHeavyAgentAdapter(config, !options.stubHeavyAgents),
   );
-  const bridgeAgent = new BridgeAgentService(workflow, store, assistant, config);
+  const bridgeAgent = createBridgeAgentService(assistantRoot, workflow, store, assistant, config);
   const transport = new LarkTransport(
     config,
     store,
@@ -61,7 +82,9 @@ async function main(): Promise<void> {
   });
 }
 
-main().catch((error: unknown) => {
-  console.error(error instanceof Error ? error.message : error);
-  process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  main().catch((error: unknown) => {
+    console.error(error instanceof Error ? error.message : error);
+    process.exitCode = 1;
+  });
+}
