@@ -18,20 +18,13 @@
     "platform": "lark",
     "appIdEnv": "LARK_APP_ID",
     "appSecretEnv": "LARK_APP_SECRET",
-    "allowedOpenIds": [],
+    "allowedOpenIds": ["ou_your_open_id_here"],
     "taskMemberOpenIds": [],
-    "controlChatIds": [],
-    "watchIntervalSeconds": 10
+    "controlChatIds": []
   },
   "maxRevisionRounds": 3,
-  "roles": {
-    "manager": "deepseek-manager",
-    "planner": "codex-planner",
-    "reviewer": "claude-reviewer",
-    "implementer": "codex-implementer",
-    "finalReviewer": "claude-final-reviewer"
-  },
   "workflowRoles": {
+    "assistant": "assistant-elon-ma",
     "low": {
       "architect": "codex-architect",
       "planReviewer": "codex-plan-reviewer",
@@ -52,50 +45,52 @@
     }
   },
   "profiles": {
-    "deepseek-manager": {
+    "assistant-elon-ma": {
       "kind": "deepseek",
       "model": "deepseek-v4-flash",
       "baseUrl": "https://api.deepseek.com/v1",
       "apiKeyEnv": "DEEPSEEK_API_KEY"
     },
-    "codex-planner": {
-      "kind": "codex",
-      "command": "codex"
-    },
     "codex-architect": {
       "kind": "codex",
+      "model": "gpt-5.5",
+      "effort": "xhigh",
       "command": "codex"
     },
     "codex-plan-reviewer": {
       "kind": "codex",
-      "command": "codex"
-    },
-    "codex-implementer": {
-      "kind": "codex",
+      "model": "gpt-5.5",
+      "effort": "xhigh",
       "command": "codex"
     },
     "codex-developer": {
       "kind": "codex",
+      "model": "gpt-5.5",
+      "effort": "xhigh",
       "command": "codex"
     },
     "codex-final-reviewer": {
       "kind": "codex",
+      "model": "gpt-5.5",
+      "effort": "xhigh",
       "command": "codex"
-    },
-    "claude-reviewer": {
-      "kind": "claude",
-      "command": "claude"
     },
     "claude-architect": {
       "kind": "claude",
+      "model": "claude-opus-4-7",
+      "effort": "high",
       "command": "claude"
     },
     "claude-plan-reviewer": {
       "kind": "claude",
+      "model": "claude-opus-4-7",
+      "effort": "high",
       "command": "claude"
     },
     "claude-final-reviewer": {
       "kind": "claude",
+      "model": "claude-opus-4-7",
+      "effort": "high",
       "command": "claude"
     }
   },

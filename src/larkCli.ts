@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
 import { ArtifactStore } from './artifacts.js';
-import { createHeavyAgentAdapter, createManagerAdapter } from './adapters.js';
-import { getDefaultManagerRoot, loadConfig } from './config.js';
-import { ManagerConversationService } from './conversation.js';
-import { LarkBridge } from './larkBridge.js';
+import { BridgeAgentService } from './bridgeAgent.js';
+import { createHeavyAgentAdapter, createAssistantAdapter } from './adapters.js';
+import { getDefaultAssistantRoot, loadConfig } from './config.js';
+import { LarkTransport } from './larkBridge.js';
 import { LarkBridgeStateStore } from './larkBridgeState.js';
 import { LarkSdkClient } from './larkSdkClient.js';
 import { WorkflowService } from './workflow.js';
@@ -31,32 +31,32 @@ function parseCli(argv: string[]): LarkCliOptions {
 
 async function main(): Promise<void> {
   const options = parseCli(process.argv.slice(2));
-  const managerRoot = getDefaultManagerRoot();
-  const config = await loadConfig(managerRoot, options.configPath);
-  const store = new ArtifactStore(managerRoot, config);
-  const manager = createManagerAdapter(config);
+  const assistantRoot = getDefaultAssistantRoot();
+  const config = await loadConfig(assistantRoot, options.configPath);
+  const store = new ArtifactStore(assistantRoot, config);
+  const assistant = createAssistantAdapter(config);
   const workflow = new WorkflowService(
     store,
     config,
-    manager,
+    assistant,
     createHeavyAgentAdapter(config, !options.stubHeavyAgents),
   );
-  const conversation = new ManagerConversationService(workflow, store, manager, config);
-  const bridge = new LarkBridge(
+  const bridgeAgent = new BridgeAgentService(workflow, store, assistant, config);
+  const transport = new LarkTransport(
     config,
     store,
     new LarkSdkClient(config),
-    conversation,
-    new LarkBridgeStateStore(managerRoot, config),
+    bridgeAgent,
+    new LarkBridgeStateStore(assistantRoot, config),
   );
 
-  await bridge.start();
+  await transport.start();
   process.once('SIGINT', () => {
-    bridge.stop();
+    transport.stop();
     process.exit(0);
   });
   process.once('SIGTERM', () => {
-    bridge.stop();
+    transport.stop();
     process.exit(0);
   });
 }

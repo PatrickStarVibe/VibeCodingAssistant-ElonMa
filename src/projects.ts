@@ -1,8 +1,8 @@
 import { isAbsolute, resolve } from 'node:path';
 
-import type { ManagerConfig, ProjectConfig } from './types.js';
+import type { AssistantConfig, ProjectConfig } from './types.js';
 
-export function listProjects(config: ManagerConfig): ProjectConfig[] {
+export function listProjects(config: AssistantConfig): ProjectConfig[] {
   const projects = config.projects ?? [];
   if (projects.length > 0) return projects;
   const id = config.defaultProjectId ?? 'default';
@@ -15,17 +15,17 @@ export function listProjects(config: ManagerConfig): ProjectConfig[] {
   }];
 }
 
-export function getDefaultProjectId(config: ManagerConfig): string {
+export function getDefaultProjectId(config: AssistantConfig): string {
   return config.defaultProjectId ?? listProjects(config)[0]?.id ?? 'default';
 }
 
-export function findProject(config: ManagerConfig, projectId: string | undefined): ProjectConfig | undefined {
+export function findProject(config: AssistantConfig, projectId: string | undefined): ProjectConfig | undefined {
   const projects = listProjects(config);
   if (projectId) return projects.find((project) => project.id === projectId);
   return projects.find((project) => project.id === getDefaultProjectId(config)) ?? projects[0];
 }
 
-export function requireProject(config: ManagerConfig, projectId: string | undefined): ProjectConfig {
+export function requireProject(config: AssistantConfig, projectId: string | undefined): ProjectConfig {
   const project = findProject(config, projectId);
   if (!project) {
     throw new Error(`Unknown project: ${projectId ?? getDefaultProjectId(config)}`);
@@ -33,11 +33,11 @@ export function requireProject(config: ManagerConfig, projectId: string | undefi
   return project;
 }
 
-export function resolveProjectDocsDir(managerRoot: string, project: ProjectConfig): string {
-  return isAbsolute(project.docsDir) ? project.docsDir : resolve(managerRoot, project.docsDir);
+export function resolveProjectDocsDir(assistantRoot: string, project: ProjectConfig): string {
+  return isAbsolute(project.docsDir) ? project.docsDir : resolve(assistantRoot, project.docsDir);
 }
 
-export function configForProject(config: ManagerConfig, project: ProjectConfig): ManagerConfig {
+export function configForProject(config: AssistantConfig, project: ProjectConfig): AssistantConfig {
   return {
     ...config,
     workspace: {
@@ -47,7 +47,7 @@ export function configForProject(config: ManagerConfig, project: ProjectConfig):
   };
 }
 
-export function renderProjectList(config: ManagerConfig, activeProjectId?: string): string {
+export function renderProjectList(config: AssistantConfig, activeProjectId?: string): string {
   const defaultProjectId = getDefaultProjectId(config);
   return listProjects(config)
     .map((project) => {

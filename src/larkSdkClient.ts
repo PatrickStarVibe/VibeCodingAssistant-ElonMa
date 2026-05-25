@@ -2,7 +2,7 @@ import { createReadStream } from 'node:fs';
 
 import * as lark from '@larksuiteoapi/node-sdk';
 
-import type { ManagerConfig } from './types.js';
+import type { AssistantConfig } from './types.js';
 import type { LarkClientPort, LarkIncomingMessage } from './larkBridge.js';
 
 interface LarkApiClient {
@@ -29,7 +29,7 @@ export class LarkSdkClient implements LarkClientPort {
   private readonly client: LarkApiClient;
   private readonly wsClient: LarkWsClient;
 
-  constructor(config: ManagerConfig, env: NodeJS.ProcessEnv = process.env) {
+  constructor(config: AssistantConfig, env: NodeJS.ProcessEnv = process.env) {
     const appId = env[config.lark.appIdEnv]?.trim();
     const appSecret = env[config.lark.appSecretEnv]?.trim();
     if (!appId || !appSecret) {
@@ -43,7 +43,7 @@ export class LarkSdkClient implements LarkClientPort {
       domain,
       appType: lark.AppType.SelfBuild,
       loggerLevel: lark.LoggerLevel.warn,
-      source: 'manager-ai-workflow',
+      source: 'assistant-ai-workflow',
     };
     this.client = new lark.Client(baseConfig) as unknown as LarkApiClient;
     this.wsClient = new lark.WSClient(baseConfig) as unknown as LarkWsClient;

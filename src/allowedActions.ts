@@ -7,18 +7,10 @@ const ASK_STATUS_SUMMARY: AllowedAction[] = [
 ];
 
 const STOP: AllowedAction = { id: 'stop', description: '停止当前任务。' };
+const RESTART: AllowedAction = { id: 'restart', description: '用新的指令或 prompt 从规划阶段重新开始当前任务。' };
 
 export function getAllowedActions(state: { status: WorkflowStatus }): AllowedAction[] {
   switch (state.status) {
-    case 'awaiting_brief_confirmation':
-      return [
-        { id: 'approve', description: '确认 brief，进入难度选择；可以附带给后续 agent 的执行约束或原文使用要求。' },
-        { id: 'difficulty', description: '确认 brief 并直接选择 low、medium 或 high 难度；可以附带给后续 agent 的执行约束。' },
-        { id: 'revise', description: '指出 brief 中需要修正的地方。' },
-        { id: 'reject', description: '拒绝 brief 并停止任务。' },
-        STOP,
-        ...ASK_STATUS_SUMMARY,
-      ];
     case 'awaiting_difficulty_selection':
       return [
         { id: 'difficulty', description: '选择 low、medium 或 high 难度；可以附带给后续 agent 的执行约束。' },
@@ -30,6 +22,7 @@ export function getAllowedActions(state: { status: WorkflowStatus }): AllowedAct
       return [
         { id: 'approve', description: '批准当前方案并继续推进；可以附带后续实现约束。' },
         { id: 'revise', description: '提出修改意见，回到规划阶段。' },
+        RESTART,
         { id: 'reject', description: '拒绝当前方案并停止任务。' },
         STOP,
         ...ASK_STATUS_SUMMARY,
@@ -47,12 +40,13 @@ export function getAllowedActions(state: { status: WorkflowStatus }): AllowedAct
         { id: 'note', description: '记录验收备注但暂不完成。' },
         ...ASK_STATUS_SUMMARY,
       ];
-    case 'completed':
     case 'stopped':
+      return [RESTART, ...ASK_STATUS_SUMMARY];
+    case 'planning_requested':
+      return [RESTART, STOP, ...ASK_STATUS_SUMMARY];
+    case 'completed':
       return ASK_STATUS_SUMMARY;
     case 'created':
-    case 'briefing':
-    case 'planning_requested':
     case 'planning':
     case 'task_artifacts_persisting':
     case 'execution_queue_ready':
@@ -73,10 +67,6 @@ export function humanStageName(status: WorkflowStatus): string {
   switch (status) {
     case 'created':
       return '任务已创建';
-    case 'briefing':
-      return '生成 brief';
-    case 'awaiting_brief_confirmation':
-      return '等你确认 brief';
     case 'awaiting_difficulty_selection':
       return '等你选择难度';
     case 'planning_requested':
@@ -102,7 +92,7 @@ export function humanStageName(status: WorkflowStatus): string {
     case 'execution_unit_result_recording':
       return '记录执行结果';
     case 'next_execution_unit_or_all_done':
-      return '检查下一执行单元';
+      return '检查下一个执行单元';
     case 'implemented':
       return '实现已完成';
     case 'final_reviewing':

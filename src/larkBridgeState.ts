@@ -1,56 +1,66 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 
-import type { ManagerConfig, TaskProposal, WorkflowStatus } from './types.js';
+import type { AssistantConfig } from './types.js';
 
-export interface LarkTaskBinding {
+export interface ProjectChatRegistration {
+  chatId: string;
+  projectId: string;
+  name?: string;
+  activeTaskId?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ActiveTaskBinding {
+  chatId: string;
   taskId: string;
   title: string;
-  createdAt: string;
+  startedAt: string;
 }
 
 export interface LarkRunningJob {
   taskId: string;
   label: string;
   startedAt: string;
-  lastNotifiedAt?: string;
-}
-
-export interface LarkPendingTaskProposal extends TaskProposal {
-  originalMessage: string;
-  requesterOpenId: string;
-  updatedAt: string;
 }
 
 export interface LarkBridgeState {
-  pairingCode: string;
-  pairedOpenIds: string[];
+  projectChatsByChatId: Record<string, ProjectChatRegistration>;
+  activeTaskByChatId: Record<string, ActiveTaskBinding>;
   activeProjectIdByChatId: Record<string, string>;
-  bindingsByChatId: Record<string, LarkTaskBinding>;
   runningJobsByTaskId: Record<string, LarkRunningJob>;
-  notifiedStatusByTaskId: Record<string, WorkflowStatus>;
-  notifiedStatusAtByTaskId: Record<string, string>;
-  lastReminderHashByTaskId: Record<string, string>;
   processedEventIds: string[];
-  pendingProposalsByChatId: Record<string, LarkPendingTaskProposal>;
+}
+
+interface LegacyTaskBinding {
+  taskId: string;
+  title: string;
+  createdAt: string;
+  projectId?: string;
 }
 
 export class LarkBridgeStateStore {
   constructor(
-    private readonly managerRoot: string,
-    private readonly config: ManagerConfig,
+    private readonly assistantRoot: string,
+    private readonly config: AssistantConfig,
   ) {}
 
   statePath(): string {
-    return resolve(this.managerRoot, this.config.artifactsDir, 'lark-bridge-state.json');
+    return resolve(this.assistantRoot, this.config.artifactsDir, 'lark-bridge-state.json');
   }
 
   async load(): Promise<LarkBridgeState> {
     try {
-      return normalizeState(JSON.parse(await readFile(this.statePath(), 'utf8')) as unknown, this.config);
+      const raw = JSON.parse(await readFile(this.statePath(), 'utf8')) as unknown;
+      const state = normalizeState(raw);
+      if (hasLegacyOrUnknownKeys(raw)) {
+        await this.save(state);
+      }
+      return state;
     } catch (error) {
       if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
-        const state = normalizeState(undefined, this.config);
+        const state = normalizeState(undefined);
         await this.save(state);
         return state;
       }
@@ -65,8 +75,8 @@ export class LarkBridgeStateStore {
   }
 }
 
-export function isAuthorizedOpenId(state: LarkBridgeState, config: ManagerConfig, openId: string): boolean {
-  return config.lark.allowedOpenIds.includes(openId) || state.pairedOpenIds.includes(openId);
+export function isAuthorizedOpenId(config: AssistantConfig, openId: string): boolean {
+  return config.lark.allowedOpenIds.includes(openId);
 }
 
 export function rememberEvent(state: LarkBridgeState, eventId: string): LarkBridgeState {
@@ -74,26 +84,128 @@ export function rememberEvent(state: LarkBridgeState, eventId: string): LarkBrid
   return { ...state, processedEventIds: ids };
 }
 
-export function addPairedOpenId(state: LarkBridgeState, openId: string): LarkBridgeState {
-  return state.pairedOpenIds.includes(openId)
-    ? state
-    : { ...state, pairedOpenIds: [...state.pairedOpenIds, openId] };
+export function listProjectChats(state: LarkBridgeState, projectId: string): ProjectChatRegistration[] {
+  return Object.values(state.projectChatsByChatId)
+    .filter((chat) => chat.projectId === projectId)
+    .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt));
 }
 
-function normalizeState(raw: unknown, config: ManagerConfig): LarkBridgeState {
-  const value = record(raw);
-  return {
-    pairingCode: config.lark.pairingCode ?? stringValue(value.pairingCode) ?? makePairingCode(),
-    pairedOpenIds: stringArray(value.pairedOpenIds),
-    activeProjectIdByChatId: recordOfStrings(value.activeProjectIdByChatId),
-    bindingsByChatId: recordOfBindings(value.bindingsByChatId),
-    runningJobsByTaskId: recordOfRunningJobs(value.runningJobsByTaskId),
-    notifiedStatusByTaskId: recordOfStatuses(value.notifiedStatusByTaskId),
-    notifiedStatusAtByTaskId: recordOfStrings(value.notifiedStatusAtByTaskId),
-    lastReminderHashByTaskId: recordOfStrings(value.lastReminderHashByTaskId),
-    processedEventIds: stringArray(value.processedEventIds).slice(0, 200),
-    pendingProposalsByChatId: recordOfPendingProposals(value.pendingProposalsByChatId),
+export function findIdleProjectChat(state: LarkBridgeState, projectId: string): ProjectChatRegistration | undefined {
+  return listProjectChats(state, projectId)
+    .find((chat) => !chat.activeTaskId && !state.activeTaskByChatId[chat.chatId]);
+}
+
+export function registerProjectChat(
+  state: LarkBridgeState,
+  input: { chatId: string; projectId: string; name?: string; now?: string },
+): ProjectChatRegistration {
+  const now = input.now ?? new Date().toISOString();
+  const existing = state.projectChatsByChatId[input.chatId];
+  const name = input.name ?? existing?.name;
+  const registration: ProjectChatRegistration = {
+    chatId: input.chatId,
+    projectId: input.projectId,
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now,
   };
+  if (name) registration.name = name;
+  if (existing?.activeTaskId) registration.activeTaskId = existing.activeTaskId;
+  state.projectChatsByChatId[input.chatId] = registration;
+  return registration;
+}
+
+export function bindTaskToProjectChat(
+  state: LarkBridgeState,
+  chatId: string,
+  task: { taskId: string; title: string; projectId: string; chatName?: string; now?: string },
+): void {
+  const now = task.now ?? new Date().toISOString();
+  const existing = state.projectChatsByChatId[chatId];
+  const name = task.chatName ?? existing?.name;
+  const registration: ProjectChatRegistration = {
+    chatId,
+    projectId: existing?.projectId ?? task.projectId,
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now,
+    activeTaskId: task.taskId,
+  };
+  if (name) registration.name = name;
+  state.projectChatsByChatId[chatId] = registration;
+  state.activeTaskByChatId[chatId] = {
+    chatId,
+    taskId: task.taskId,
+    title: task.title,
+    startedAt: now,
+  };
+}
+
+export function releaseProjectChatTask(
+  state: LarkBridgeState,
+  chatId: string,
+  taskId?: string,
+): void {
+  const registration = state.projectChatsByChatId[chatId];
+  const activeTask = state.activeTaskByChatId[chatId];
+  const activeTaskId = taskId ?? activeTask?.taskId ?? registration?.activeTaskId;
+  if (activeTaskId) {
+    delete state.runningJobsByTaskId[activeTaskId];
+  }
+  if (activeTask && (!taskId || activeTask.taskId === taskId)) {
+    delete state.activeTaskByChatId[chatId];
+  }
+  if (registration && (!taskId || registration.activeTaskId === taskId || activeTask?.taskId === taskId)) {
+    const { activeTaskId: _activeTaskId, ...rest } = registration;
+    state.projectChatsByChatId[chatId] = {
+      ...rest,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+}
+
+function normalizeState(raw: unknown): LarkBridgeState {
+  const value = record(raw);
+  const activeProjectIdByChatId = recordOfStrings(value.activeProjectIdByChatId);
+  const projectChatsByChatId = recordOfProjectChats(value.projectChatsByChatId);
+  const activeTaskByChatId = recordOfActiveTasks(value.activeTaskByChatId);
+  const legacyBindings = recordOfLegacyBindings(value.bindingsByChatId);
+
+  for (const [chatId, binding] of Object.entries(legacyBindings)) {
+    const projectId = binding.projectId ?? activeProjectIdByChatId[chatId];
+    if (!projectId || projectChatsByChatId[chatId]) continue;
+    projectChatsByChatId[chatId] = {
+      chatId,
+      projectId,
+      activeTaskId: binding.taskId,
+      createdAt: binding.createdAt,
+      updatedAt: binding.createdAt,
+    };
+    activeTaskByChatId[chatId] = {
+      chatId,
+      taskId: binding.taskId,
+      title: binding.title,
+      startedAt: binding.createdAt,
+    };
+  }
+
+  return {
+    projectChatsByChatId,
+    activeTaskByChatId,
+    activeProjectIdByChatId,
+    runningJobsByTaskId: recordOfRunningJobs(value.runningJobsByTaskId),
+    processedEventIds: stringArray(value.processedEventIds).slice(0, 200),
+  };
+}
+
+function hasLegacyOrUnknownKeys(raw: unknown): boolean {
+  const allowed = new Set([
+    'projectChatsByChatId',
+    'activeTaskByChatId',
+    'activeProjectIdByChatId',
+    'runningJobsByTaskId',
+    'processedEventIds',
+  ]);
+  const keys = Object.keys(record(raw));
+  return keys.some((key) => !allowed.has(key)) || keys.includes('bindingsByChatId');
 }
 
 function record(value: unknown): Record<string, unknown> {
@@ -114,18 +226,48 @@ function recordOfStrings(value: unknown): Record<string, string> {
   )));
 }
 
-function stringList(value: unknown): string[] {
-  if (Array.isArray(value)) return value.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0);
-  return [];
+function recordOfProjectChats(value: unknown): Record<string, ProjectChatRegistration> {
+  return Object.fromEntries(Object.entries(record(value)).flatMap(([chatId, rawChat]) => {
+    const chat = record(rawChat);
+    const projectId = stringValue(chat.projectId);
+    const createdAt = stringValue(chat.createdAt);
+    const updatedAt = stringValue(chat.updatedAt);
+    if (!projectId || !createdAt || !updatedAt) return [];
+    const name = stringValue(chat.name);
+    const activeTaskId = stringValue(chat.activeTaskId);
+    return [[chatId, {
+      chatId: stringValue(chat.chatId) ?? chatId,
+      projectId,
+      ...(name ? { name } : {}),
+      ...(activeTaskId ? { activeTaskId } : {}),
+      createdAt,
+      updatedAt,
+    }]];
+  }));
 }
 
-function recordOfBindings(value: unknown): Record<string, LarkTaskBinding> {
+function recordOfActiveTasks(value: unknown): Record<string, ActiveTaskBinding> {
+  return Object.fromEntries(Object.entries(record(value)).flatMap(([chatId, rawBinding]) => {
+    const binding = record(rawBinding);
+    const taskId = stringValue(binding.taskId);
+    const title = stringValue(binding.title);
+    const startedAt = stringValue(binding.startedAt);
+    return taskId && title && startedAt
+      ? [[chatId, { chatId: stringValue(binding.chatId) ?? chatId, taskId, title, startedAt }]]
+      : [];
+  }));
+}
+
+function recordOfLegacyBindings(value: unknown): Record<string, LegacyTaskBinding> {
   return Object.fromEntries(Object.entries(record(value)).flatMap(([chatId, rawBinding]) => {
     const binding = record(rawBinding);
     const taskId = stringValue(binding.taskId);
     const title = stringValue(binding.title);
     const createdAt = stringValue(binding.createdAt);
-    return taskId && title && createdAt ? [[chatId, { taskId, title, createdAt }]] : [];
+    const projectId = stringValue(binding.projectId);
+    return taskId && title && createdAt
+      ? [[chatId, { taskId, title, createdAt, ...(projectId ? { projectId } : {}) }]]
+      : [];
   }));
 }
 
@@ -134,72 +276,6 @@ function recordOfRunningJobs(value: unknown): Record<string, LarkRunningJob> {
     const job = record(rawJob);
     const label = stringValue(job.label);
     const startedAt = stringValue(job.startedAt);
-    const lastNotifiedAt = stringValue(job.lastNotifiedAt);
-    return label && startedAt ? [[taskId, { taskId, label, startedAt, ...(lastNotifiedAt ? { lastNotifiedAt } : {}) }]] : [];
+    return label && startedAt ? [[taskId, { taskId, label, startedAt }]] : [];
   }));
-}
-
-function recordOfStatuses(value: unknown): Record<string, WorkflowStatus> {
-  return Object.fromEntries(Object.entries(record(value)).flatMap(([taskId, status]) => (
-    isWorkflowStatus(status) ? [[taskId, status]] : []
-  )));
-}
-
-function recordOfPendingProposals(value: unknown): Record<string, LarkPendingTaskProposal> {
-  return Object.fromEntries(Object.entries(record(value)).flatMap(([chatId, rawProposal]) => {
-    const proposal = record(rawProposal);
-    const interpretedIntent = stringValue(proposal.interpretedIntent);
-    const title = stringValue(proposal.title);
-    const task = stringValue(proposal.task);
-    const suggestedNextAction = stringValue(proposal.suggestedNextAction);
-    const originalMessage = stringValue(proposal.originalMessage);
-    const requesterOpenId = stringValue(proposal.requesterOpenId);
-    const updatedAt = stringValue(proposal.updatedAt);
-    if (!interpretedIntent || !title || !task || !suggestedNextAction || !originalMessage || !requesterOpenId || !updatedAt) {
-      return [];
-    }
-    return [[chatId, {
-      interpretedIntent,
-      title,
-      task,
-      wouldDo: stringList(proposal.wouldDo),
-      wouldNotDo: stringList(proposal.wouldNotDo),
-      suggestedNextAction,
-      originalMessage,
-      requesterOpenId,
-      updatedAt,
-    }]];
-  }));
-}
-
-function isWorkflowStatus(value: unknown): value is WorkflowStatus {
-  return typeof value === 'string' && [
-    'created',
-    'briefing',
-    'awaiting_brief_confirmation',
-    'awaiting_difficulty_selection',
-    'planning_requested',
-    'planning',
-    'task_artifacts_persisting',
-    'execution_queue_ready',
-    'waiting_user_direction',
-    'ready_for_decision',
-    'implementation_approved',
-    'implementing',
-    'execution_unit_implementing',
-    'execution_unit_testing',
-    'execution_unit_result_recording',
-    'next_execution_unit_or_all_done',
-    'implemented',
-    'final_reviewing',
-    'final_review_routing',
-    'awaiting_user_acceptance',
-    'task_recording',
-    'completed',
-    'stopped',
-  ].includes(value);
-}
-
-function makePairingCode(): string {
-  return String(Math.floor(100000 + Math.random() * 900000));
 }

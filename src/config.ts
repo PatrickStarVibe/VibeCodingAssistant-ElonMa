@@ -2,7 +2,8 @@ import { readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import type { ManagerConfig, ProjectConfig, RoleName, WorkflowDifficulty, WorkflowRoleName, WorkflowRoleProfiles } from './types.js';
+import { loadDynamicProjects, mergeProjectLists } from './projectRegistry.js';
+import type { HeavyWorkflowRoleName, AssistantConfig, ProjectConfig, WorkflowDifficulty, WorkflowRoleProfiles } from './types.js';
 
 export const DEFAULT_VERIFICATION_ALLOWLIST = [
   'npm test',
@@ -13,15 +14,8 @@ export const DEFAULT_VERIFICATION_ALLOWLIST = [
   'npx tsc --noEmit',
 ];
 
-const DEFAULT_ROLES: Record<RoleName, string> = {
-  manager: 'deepseek-manager',
-  planner: 'codex-planner',
-  reviewer: 'claude-reviewer',
-  implementer: 'codex-implementer',
-  finalReviewer: 'claude-final-reviewer',
-};
-
 const DEFAULT_WORKFLOW_ROLES: WorkflowRoleProfiles = {
+  assistant: 'assistant-elon-ma',
   low: {
     architect: 'codex-architect',
     planReviewer: 'codex-plan-reviewer',
@@ -42,11 +36,11 @@ const DEFAULT_WORKFLOW_ROLES: WorkflowRoleProfiles = {
   },
 };
 
-export function getDefaultManagerRoot(): string {
+export function getDefaultAssistantRoot(): string {
   return resolve(dirname(fileURLToPath(import.meta.url)), '..');
 }
 
-export function defaultConfig(): ManagerConfig {
+export function defaultConfig(): AssistantConfig {
   return {
     workspace: {
       targetDir: 'E:/GameDeveloping/IReader/my-reader',
@@ -69,56 +63,56 @@ export function defaultConfig(): ManagerConfig {
       allowedOpenIds: [],
       taskMemberOpenIds: [],
       controlChatIds: [],
-      watchIntervalSeconds: 10,
     },
     maxRevisionRounds: 3,
-    roles: DEFAULT_ROLES,
     workflowRoles: DEFAULT_WORKFLOW_ROLES,
     profiles: {
-      'deepseek-manager': {
+      'assistant-elon-ma': {
         kind: 'deepseek',
         model: 'deepseek-v4-flash',
         baseUrl: 'https://api.deepseek.com/v1',
         apiKeyEnv: 'DEEPSEEK_API_KEY',
       },
-      'codex-planner': {
-        kind: 'codex',
-        command: 'codex',
-      },
       'codex-architect': {
         kind: 'codex',
+        model: 'gpt-5.5',
+        effort: 'xhigh',
         command: 'codex',
       },
       'codex-plan-reviewer': {
         kind: 'codex',
-        command: 'codex',
-      },
-      'codex-implementer': {
-        kind: 'codex',
+        model: 'gpt-5.5',
+        effort: 'xhigh',
         command: 'codex',
       },
       'codex-developer': {
         kind: 'codex',
+        model: 'gpt-5.5',
+        effort: 'xhigh',
         command: 'codex',
       },
       'codex-final-reviewer': {
         kind: 'codex',
+        model: 'gpt-5.5',
+        effort: 'xhigh',
         command: 'codex',
-      },
-      'claude-reviewer': {
-        kind: 'claude',
-        command: 'claude',
       },
       'claude-architect': {
         kind: 'claude',
+        model: 'claude-opus-4-7',
+        effort: 'high',
         command: 'claude',
       },
       'claude-plan-reviewer': {
         kind: 'claude',
+        model: 'claude-opus-4-7',
+        effort: 'high',
         command: 'claude',
       },
       'claude-final-reviewer': {
         kind: 'claude',
+        model: 'claude-opus-4-7',
+        effort: 'high',
         command: 'claude',
       },
     },
@@ -192,8 +186,8 @@ function normalizeProjects(rawProjects: unknown, workspaceTargetDir: string, def
 function normalizeWorkflowRoles(raw: unknown, base: WorkflowRoleProfiles): WorkflowRoleProfiles {
   const root = objectValue(raw);
   const difficulties: WorkflowDifficulty[] = ['low', 'medium', 'high'];
-  const roleNames: WorkflowRoleName[] = ['architect', 'planReviewer', 'developer', 'finalReviewer'];
-  const normalized = { ...base } as WorkflowRoleProfiles;
+  const roleNames: HeavyWorkflowRoleName[] = ['architect', 'planReviewer', 'developer', 'finalReviewer'];
+  const normalized = { ...base, assistant: stringValue(root.assistant) ?? base.assistant } as WorkflowRoleProfiles;
 
   for (const difficulty of difficulties) {
     const rawRoles = objectValue(root[difficulty]);
@@ -206,24 +200,16 @@ function normalizeWorkflowRoles(raw: unknown, base: WorkflowRoleProfiles): Workf
   return normalized;
 }
 
-export function normalizeConfig(raw: unknown, base = defaultConfig()): ManagerConfig {
+export function normalizeConfig(raw: unknown, base = defaultConfig()): AssistantConfig {
   const root = objectValue(raw);
   const workspace = objectValue(root.workspace);
-  const roles = objectValue(root.roles);
   const workflowRoles = objectValue(root.workflowRoles);
   const profiles = objectValue(root.profiles);
   const verification = objectValue(root.verification);
   const lark = objectValue(root.lark);
-  const larkPairingCode = stringValue(lark.pairingCode);
-  const roleNames = Object.keys(base.roles) as RoleName[];
-  const normalizedRoles = { ...base.roles };
   const workspaceTargetDir = stringValue(workspace.targetDir) ?? base.workspace.targetDir;
   const defaultProjectId = stringValue(root.defaultProjectId) ?? base.defaultProjectId ?? 'default';
   const projects = normalizeProjects(root.projects, workspaceTargetDir, defaultProjectId);
-
-  for (const role of roleNames) {
-    normalizedRoles[role] = stringValue(roles[role]) ?? base.roles[role];
-  }
 
   return {
     workspace: {
@@ -239,24 +225,24 @@ export function normalizeConfig(raw: unknown, base = defaultConfig()): ManagerCo
       allowedOpenIds: stringArrayValue(lark.allowedOpenIds) ?? base.lark.allowedOpenIds,
       taskMemberOpenIds: stringArrayValue(lark.taskMemberOpenIds) ?? base.lark.taskMemberOpenIds,
       controlChatIds: stringArrayValue(lark.controlChatIds) ?? base.lark.controlChatIds,
-      watchIntervalSeconds: numberValue(lark.watchIntervalSeconds) ?? base.lark.watchIntervalSeconds,
-      ...(larkPairingCode ? { pairingCode: larkPairingCode } : {}),
     },
     maxRevisionRounds: numberValue(root.maxRevisionRounds) ?? base.maxRevisionRounds,
-    roles: normalizedRoles,
     workflowRoles: normalizeWorkflowRoles(workflowRoles, base.workflowRoles),
     profiles: {
       ...base.profiles,
       ...Object.fromEntries(Object.entries(profiles).map(([name, profile]) => [name, { ...objectValue(profile) }])),
-    } as ManagerConfig['profiles'],
+    } as AssistantConfig['profiles'],
     verification: {
       allowlist: stringArrayValue(verification.allowlist) ?? base.verification.allowlist,
     },
   };
 }
 
-export async function loadConfig(managerRoot: string, configPath?: string): Promise<ManagerConfig> {
-  const example = await readJsonFile(resolve(managerRoot, 'manager.config.example.json'));
-  const local = await readJsonFile(configPath ? resolve(managerRoot, configPath) : resolve(managerRoot, 'manager.config.local.json'));
-  return normalizeConfig(local ?? example);
+export async function loadConfig(assistantRoot: string, configPath?: string): Promise<AssistantConfig> {
+  const example = await readJsonFile(resolve(assistantRoot, 'assistant.config.example.json'));
+  const local = await readJsonFile(configPath ? resolve(assistantRoot, configPath) : resolve(assistantRoot, 'assistant.config.local.json'));
+  const config = normalizeConfig(local ?? example);
+  const dynamicProjects = await loadDynamicProjects(assistantRoot, config.workspace.targetDir);
+  config.projects = mergeProjectLists(config.projects ?? [], dynamicProjects);
+  return config;
 }

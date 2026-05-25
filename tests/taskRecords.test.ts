@@ -34,8 +34,6 @@ function makeState(taskId: string): TaskState {
     revisionRound: 0,
     reviewerRunCount: 0,
     executionQueue: [],
-    briefConfirmed: false,
-    briefRevisionRequests: [],
     userAcceptanceNotes: [],
     artifacts: {},
     requestedChanges: [],
@@ -70,7 +68,6 @@ describe('TaskRecordStore', () => {
       });
 
       const parentDir = join(taskRoot, state.taskId);
-      await expect(readFile(join(parentDir, 'brief.md'), 'utf8')).resolves.toContain('Pending');
       await expect(readFile(join(parentDir, 'plan.md'), 'utf8')).resolves.toContain('Pending');
       await expect(readFile(join(parentDir, 'task-record.md'), 'utf8')).resolves.toContain('Pending');
       await expect(readFile(join(parentDir, 'token-usage.json'), 'utf8')).resolves.toContain('"entries": []');
@@ -102,7 +99,7 @@ describe('TaskRecordStore', () => {
       const units = await store.persistApprovedPlan({
         state,
         project,
-        planMarkdown: '# Plan\n\nCategory: Manager / Workflow',
+    planMarkdown: '# Plan\n\nCategory: Assistant / Workflow',
         reviewMarkdown: 'Reviewed.',
       });
 

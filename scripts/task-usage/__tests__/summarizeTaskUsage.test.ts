@@ -15,8 +15,8 @@ import {
 function usageLedger(overrides: Partial<TaskUsageLedger> = {}): TaskUsageLedger {
   return {
     schemaVersion: 1,
-    taskId: 'manager-token-ledger',
-    taskTitle: 'Manager token ledger',
+    taskId: 'assistant-token-ledger',
+    taskTitle: 'Assistant token ledger',
     createdAt: '2026-05-21T12:00:00.000Z',
     updatedAt: '2026-05-21T12:30:00.000Z',
     currency: 'USD',
@@ -46,7 +46,7 @@ function usageLedger(overrides: Partial<TaskUsageLedger> = {}): TaskUsageLedger 
       },
       {
         subtaskId: '02',
-        role: 'manager_planning',
+        role: 'assistant_planning',
         stepId: '02-a',
         stepTitle: 'Plan usage schema',
         provider: 'openai',
@@ -93,7 +93,7 @@ async function writeLedger(taskDir: string, ledger: TaskUsageLedger): Promise<st
 describe('task usage summary', () => {
   it('summarizes total tokens, cost, and accuracy mix from entries', () => {
     const summary = summarizeTaskUsageLedger(usageLedger(), {
-      usagePath: 'task/manager-token-ledger/token-usage.json',
+      usagePath: 'task/assistant-token-ledger/token-usage.json',
     });
 
     expect(summary.totals).toMatchObject({
@@ -126,7 +126,7 @@ describe('task usage summary', () => {
     });
 
     expect(byRole.breakdown?.rows.map((row) => [row.key, row.totalTokens])).toEqual([
-      ['manager_planning', 350],
+      ['assistant_planning', 350],
       ['implementation', 150],
       ['verification', 15],
     ]);
@@ -134,13 +134,13 @@ describe('task usage summary', () => {
     expect(byStep.breakdown?.rows.map((row) => row.key)).toContain('03-a Run tests');
   });
 
-  it('formats a readable report for Manager answers', () => {
+  it('formats a readable report for Assistant answers', () => {
     const report = formatTaskUsageSummary(summarizeTaskUsageLedger(usageLedger(), {
-      usagePath: 'task/manager-token-ledger/token-usage.json',
+      usagePath: 'task/assistant-token-ledger/token-usage.json',
       by: 'role',
     }));
 
-    expect(report).toContain('Task: Manager token ledger (manager-token-ledger)');
+    expect(report).toContain('Task: Assistant token ledger (assistant-token-ledger)');
     expect(report).toContain('tokens: total=515, input=310, output=155, reasoning=50, cached=20');
     expect(report).toContain('cost: USD 0.012000 (1 entries unknown)');
     expect(report).toContain('actual 33.3%, estimated 33.3%, unknown 33.3%');
@@ -149,7 +149,7 @@ describe('task usage summary', () => {
 
   it('includes entry details in the default report for role-step lookups', () => {
     const report = formatTaskUsageSummary(summarizeTaskUsageLedger(usageLedger(), {
-      usagePath: 'task/manager-token-ledger/token-usage.json',
+      usagePath: 'task/assistant-token-ledger/token-usage.json',
     }));
 
     expect(report).toContain('Entries');
@@ -160,7 +160,7 @@ describe('task usage summary', () => {
     const report = formatTaskUsageSummary(summarizeTaskUsageLedger(usageLedger({
       entries: [],
     }), {
-      usagePath: 'task/manager-token-ledger/token-usage.json',
+      usagePath: 'task/assistant-token-ledger/token-usage.json',
     }));
 
     expect(report).toContain('entries: 0');
@@ -172,13 +172,13 @@ describe('task usage summary', () => {
     const tempRoot = await mkdtemp(join(tmpdir(), 'task-usage-'));
 
     try {
-      const taskDir = join(tempRoot, 'task', 'manager-token-ledger');
+      const taskDir = join(tempRoot, 'task', 'assistant-token-ledger');
       await mkdir(taskDir, { recursive: true });
       await writeLedger(taskDir, usageLedger());
 
       const output = await summarizeTaskUsageFromCliArgs([
         '--task',
-        join('task', 'manager-token-ledger'),
+        join('task', 'assistant-token-ledger'),
         '--by',
         'subtask',
       ], { cwd: tempRoot });

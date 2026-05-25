@@ -2,8 +2,8 @@
 import { resolve } from 'node:path';
 
 import { ArtifactStore } from './artifacts.js';
-import { createHeavyAgentAdapter, createManagerAdapter } from './adapters.js';
-import { getDefaultManagerRoot, loadConfig } from './config.js';
+import { createHeavyAgentAdapter, createAssistantAdapter } from './adapters.js';
+import { getDefaultAssistantRoot, loadConfig } from './config.js';
 import { getDefaultProjectId, renderProjectList, requireProject } from './projects.js';
 import type { ArtifactName } from './types.js';
 import type { TaskUsageBreakdownKey } from './taskUsage.js';
@@ -20,12 +20,11 @@ interface CliOptions {
 
 const ARTIFACT_NAMES: ArtifactName[] = [
   'original-task',
-  'manager-brief',
   'initial-plan',
   'review',
   'revision-instructions',
   'revised-plan',
-  'manager-explanation',
+  'assistant-explanation',
   'qa-log',
   'decision-log',
   'implementation-log',
@@ -93,7 +92,7 @@ function positional(args: string[]): string[] {
 
 function printHelp(): void {
   console.log([
-    'Manager AI workflow orchestrator',
+    'Assistant workflow orchestrator',
     '',
     'Commands:',
     '  create --title "..." --task "..."',
@@ -111,7 +110,7 @@ function printHelp(): void {
     '  reply --task latest --text-file path/to/reply.txt   # for long/non-ASCII replies on Windows',
     '',
     'Flags:',
-    '  --config manager.config.local.json',
+    '  --config assistant.config.local.json',
     '  --allow-agent-calls',
   ].join('\n'));
 }
@@ -123,12 +122,12 @@ function parseUsageBreakdown(value: string | undefined): TaskUsageBreakdownKey |
 }
 
 async function makeWorkflow(options: CliOptions): Promise<WorkflowService> {
-  const managerRoot = getDefaultManagerRoot();
-  const config = await loadConfig(managerRoot, options.configPath);
-  const store = new ArtifactStore(managerRoot, config);
-  const manager = createManagerAdapter(config);
+  const assistantRoot = getDefaultAssistantRoot();
+  const config = await loadConfig(assistantRoot, options.configPath);
+  const store = new ArtifactStore(assistantRoot, config);
+  const assistant = createAssistantAdapter(config);
   const heavyAgents = createHeavyAgentAdapter(config, options.allowAgentCalls);
-  return new WorkflowService(store, config, manager, heavyAgents);
+  return new WorkflowService(store, config, assistant, heavyAgents);
 }
 
 async function main(): Promise<void> {
@@ -139,9 +138,9 @@ async function main(): Promise<void> {
   }
 
   if (options.command === 'create') {
-    const managerRoot = getDefaultManagerRoot();
-    const config = await loadConfig(managerRoot, options.configPath);
-    const store = new ArtifactStore(managerRoot, config);
+    const assistantRoot = getDefaultAssistantRoot();
+    const config = await loadConfig(assistantRoot, options.configPath);
+    const store = new ArtifactStore(assistantRoot, config);
     const title = valueAfter(options.args, '--title');
     const inlineTask = valueAfter(options.args, '--task');
     const taskFile = valueAfter(options.args, '--task-file');
@@ -153,7 +152,7 @@ async function main(): Promise<void> {
     const service = new WorkflowService(
       store,
       config,
-      createManagerAdapter(config),
+      createAssistantAdapter(config),
       createHeavyAgentAdapter(config, options.allowAgentCalls),
     );
     const result = await service.createTask({ title, task, projectId });
@@ -163,8 +162,8 @@ async function main(): Promise<void> {
   }
 
   if (options.command === 'projects' || (options.command === 'project' && options.args[0] === 'list')) {
-    const managerRoot = getDefaultManagerRoot();
-    const config = await loadConfig(managerRoot, options.configPath);
+    const assistantRoot = getDefaultAssistantRoot();
+    const config = await loadConfig(assistantRoot, options.configPath);
     console.log(renderProjectList(config, getDefaultProjectId(config)));
     return;
   }

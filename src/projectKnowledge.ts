@@ -2,7 +2,7 @@ import { readdir, readFile, stat } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
 
 import { requireProject, resolveProjectDocsDir } from './projects.js';
-import type { ManagerConfig } from './types.js';
+import type { AssistantConfig } from './types.js';
 
 const DEFAULT_ALWAYS_BUDGET = 8_000;
 const DEFAULT_RETRIEVED_BUDGET = 12_000;
@@ -25,11 +25,11 @@ export interface ProjectContextOptions {
 }
 
 export class ProjectKnowledgeService {
-  constructor(private readonly managerRoot: string) {}
+  constructor(private readonly assistantRoot: string) {}
 
-  async buildContextPacket(config: ManagerConfig, options: ProjectContextOptions): Promise<string> {
+  async buildContextPacket(config: AssistantConfig, options: ProjectContextOptions): Promise<string> {
     const project = requireProject(config, options.projectId);
-    const docsRoot = resolveProjectDocsDir(this.managerRoot, project);
+    const docsRoot = resolveProjectDocsDir(this.assistantRoot, project);
     const files = await listMarkdownFiles(docsRoot).catch(() => []);
     const alwaysPaths = new Set((project.alwaysRead ?? []).map((path) => normalizeRelativePath(path)));
     const chunks = (await Promise.all(files.map((file) => readMarkdownChunks(docsRoot, file)))).flat();
@@ -58,7 +58,7 @@ export class ProjectKnowledgeService {
   }
 }
 
-export function renderProjectContextSummary(config: ManagerConfig, projectId: string | undefined): string {
+export function renderProjectContextSummary(config: AssistantConfig, projectId: string | undefined): string {
   const project = requireProject(config, projectId);
   return [
     `Project: ${project.name} (${project.id})`,

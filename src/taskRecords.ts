@@ -31,18 +31,17 @@ export const SUPPORTED_TASK_CATEGORIES = [
   'Backend / API',
   'Data / Dictionary Pipeline',
   'Evaluation / Benchmark',
-  'Manager / Workflow',
+  'Assistant / Workflow',
   'Docs / Task Record',
   'UI / Frontend',
   'Other',
 ] as const satisfies readonly TaskCategory[];
 
-const GLOBAL_START = '<!-- manager-task-records:start -->';
-const GLOBAL_END = '<!-- manager-task-records:end -->';
+const GLOBAL_START = '<!-- assistant-task-records:start -->';
+const GLOBAL_END = '<!-- assistant-task-records:end -->';
 const PENDING = 'Pending';
 
 const STANDARD_PARENT_FILES = [
-  'brief.md',
   'plan.md',
   'plan-review.md',
   'implementation-log.md',
@@ -163,12 +162,6 @@ export class TaskRecordStore {
     await writeInitialTokenUsageLedger(input.project, input.state);
     await this.writeParentReadme(input);
     await this.updateGlobalReadme(input.project, input.state);
-  }
-
-  async writeBrief(project: ProjectConfig, state: TaskState, brief: string): Promise<void> {
-    const parentDir = parentTaskDir(project, state.taskId);
-    await mkdir(parentDir, { recursive: true });
-    await writeFile(join(parentDir, 'brief.md'), ensureTrailingNewline(sanitizeTextForArtifact(brief)), 'utf8');
   }
 
   async persistApprovedPlan(input: ApprovedPlanInput): Promise<ExecutionUnitState[]> {
@@ -439,7 +432,7 @@ async function renderTokenUsageSection(project: ProjectConfig, state: TaskState)
       '',
       'No token usage entries recorded yet. Usage is unknown, not zero.',
       '',
-      `Query from the Manager repo: \`npm run manager -- usage --task ${state.taskId} --by role\``,
+      `Query usage from this workflow repo: \`npm run assistant -- usage --task ${state.taskId} --by role\``,
     ].join('\n');
   }
 
@@ -450,7 +443,7 @@ async function renderTokenUsageSection(project: ProjectConfig, state: TaskState)
     '|---:|---:|---:|---:|---:|---:|---:|---:|---|',
     `| ${summary.totals.entries} | ${summary.totals.totalTokens} | ${summary.totals.inputTokens} | ${summary.totals.outputTokens} | ${summary.totals.reasoningTokens} | ${summary.totals.cachedInputTokens} | ${summary.currency} ${summary.totals.knownCost.toFixed(6)} | ${summary.totals.costUnknownEntries} | ${formatAccuracy(summary.totals)} |`,
     '',
-    `Query from the Manager repo: \`npm run manager -- usage --task ${state.taskId} --by role\``,
+    `Query usage from this workflow repo: \`npm run assistant -- usage --task ${state.taskId} --by role\``,
   ].join('\n');
 }
 
@@ -537,7 +530,7 @@ function renderTaskRecord(input: TaskRecordFinalizeInput): string {
     '',
     '## Summary',
     '',
-    state.planSummary ?? 'The approved Manager task was implemented and accepted.',
+    state.planSummary ?? 'The approved assistant task was implemented and accepted.',
     '',
     '## User Acceptance',
     '',
@@ -546,7 +539,7 @@ function renderTaskRecord(input: TaskRecordFinalizeInput): string {
     '',
     '## Implementation Process',
     '',
-    'Brief, plan, sequential execution, final review, and user acceptance were completed through Manager.',
+    'Plan, sequential execution, final review, and user acceptance were completed through Assistant Elon Ma.',
     '',
     '## Files Changed',
     '',
@@ -558,7 +551,7 @@ function renderTaskRecord(input: TaskRecordFinalizeInput): string {
     '',
     '## Algorithm Logic',
     '',
-    'No specific product algorithm was recorded by Manager for this task unless noted in the implementation log.',
+    'No specific product algorithm was recorded by Assistant Elon Ma for this task unless noted in the implementation log.',
     '',
     '## Connected Systems',
     '',
@@ -611,7 +604,7 @@ function renderGlobalReadme(rows: GlobalTaskRow[], legacy: string): string {
     '',
     '## Token Usage Ledgers',
     '',
-    `New Manager task folders include a \`${TOKEN_USAGE_FILE_NAME}\` file for machine-readable token and cost accounting.`,
+    `New assistant task folders include a \`${TOKEN_USAGE_FILE_NAME}\` file for machine-readable token and cost accounting.`,
     '',
     '- Treat the ledger as the source of truth for token/cost questions.',
     '- Record usage by role, subtask, and step when usage is available.',

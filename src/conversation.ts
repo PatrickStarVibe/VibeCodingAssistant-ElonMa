@@ -1,8 +1,9 @@
 import { basename } from 'node:path';
 
 import { ArtifactStore } from './artifacts.js';
-import type { ManagerAdapter } from './adapters.js';
+import type { AssistantAdapter } from './adapters.js';
 import { getAllowedActions, humanStageName } from './allowedActions.js';
+import { orchestrateTaskMessage, type OrchestratorTurn } from './orchestrator.js';
 import { ProjectKnowledgeService } from './projectKnowledge.js';
 import { getDefaultProjectId } from './projects.js';
 import type {
@@ -10,7 +11,7 @@ import type {
   ArtifactName,
   ControlChatResult,
   IntentResult,
-  ManagerConfig,
+  AssistantConfig,
   TaskProposal,
   TaskState,
 } from './types.js';
@@ -18,12 +19,11 @@ import type { WorkflowResult, WorkflowService } from './workflow.js';
 
 const ARTIFACT_NAMES: ArtifactName[] = [
   'original-task',
-  'manager-brief',
   'initial-plan',
   'review',
   'revision-instructions',
   'revised-plan',
-  'manager-explanation',
+  'assistant-explanation',
   'qa-log',
   'decision-log',
   'implementation-log',
@@ -77,26 +77,27 @@ export type ControlConversationTurn =
   | { kind: 'confirm_pending_proposal'; message?: OutboundMessage }
   | { kind: 'cancel_pending_proposal'; message?: OutboundMessage };
 
-export class ManagerConversationService {
+export class AssistantConversationService {
   private readonly projectKnowledge: ProjectKnowledgeService;
 
   constructor(
     private readonly workflow: WorkflowService,
     private readonly store: ArtifactStore,
-    private readonly manager?: ManagerAdapter,
-    private readonly config?: ManagerConfig,
+    private readonly assistant?: AssistantAdapter,
+    private readonly config?: AssistantConfig,
+    private readonly options: { orchestratorEnabled?: boolean } = {},
   ) {
-    this.projectKnowledge = new ProjectKnowledgeService(store.managerRoot);
+    this.projectKnowledge = new ProjectKnowledgeService(store.assistantRoot);
   }
 
   async createTask(input: TaskRequest): Promise<WorkflowResult> {
     return this.workflow.createTask(input);
   }
 
-  startBrief(taskId: string): BackgroundConversationTurn {
+  startPlanning(taskId: string): BackgroundConversationTurn {
     return {
       kind: 'background',
-      startedMessage: { text: '任务已创建，我开始整理 brief。跑完会把需要你确认的内容发到这里。' },
+      startedMessage: { text: '任务已创建，请先选择工作难度：low、medium 或 high。' },
       run: () => this.workflow.planTask(taskId),
     };
   }
@@ -113,6 +114,28 @@ export class ManagerConversationService {
     }
 
     const state = await this.store.loadState(taskId);
+    const explicitCommand = parseExplicitWorkflowCommand(trimmed, state);
+    if (this.options.orchestratorEnabled && this.assistant && this.config) {
+      if (explicitCommand && ['status', 'summary', 'stop'].includes(explicitCommand.intent)) {
+        return this.executeExplicitWorkflowCommand(taskId, state, explicitCommand);
+      }
+      return this.orchestratorTurnToConversationTurn(await orchestrateTaskMessage({
+        taskId,
+        state,
+        userMessage: trimmed,
+        ...(explicitCommand ? { ruleHint: explicitCommand } : {}),
+      }, {
+        assistant: this.assistant,
+        workflow: this.workflow,
+        store: this.store,
+        config: this.config,
+      }));
+    }
+
+    if (explicitCommand) {
+      return this.executeExplicitWorkflowCommand(taskId, state, explicitCommand);
+    }
+
     const classified = await this.classifyTaskIntent(trimmed, state);
     if ('turn' in classified) return classified.turn;
 
@@ -120,6 +143,10 @@ export class ManagerConversationService {
     const allowedActions = getAllowedActions(state);
     const allowed = allowedActions.some((action) => action.id === intent.intent);
     if (!allowed) {
+      const fallbackQuestion = conversationalFallbackIntent(trimmed, intent, allowedActions);
+      if (fallbackQuestion) {
+        return this.executeIntent(taskId, trimmed, state, fallbackQuestion);
+      }
       return {
         kind: 'reply',
         auditAction: `intent:${intent.intent}:blocked`,
@@ -133,6 +160,10 @@ export class ManagerConversationService {
           state,
         })],
       };
+    }
+
+    if (intent.intent === 'ask') {
+      return this.executeIntent(taskId, trimmed, state, intent);
     }
 
     if (intent.requiresClarification || intent.confidence < 0.6) {
@@ -151,6 +182,72 @@ export class ManagerConversationService {
     }
 
     return this.executeIntent(taskId, trimmed, state, intent);
+  }
+
+  private async executeExplicitWorkflowCommand(
+    taskId: string,
+    state: TaskState,
+    explicitCommand: ExplicitWorkflowCommand,
+  ): Promise<ConversationTurn> {
+    const allowedActions = getAllowedActions(state);
+    const allowed = allowedActions.some((action) => action.id === explicitCommand.intent);
+    if (!allowed) {
+      return {
+        kind: 'reply',
+        auditAction: `intent:${explicitCommand.intent}:blocked`,
+        auditMetadata: { intent: explicitCommand.intent },
+        messages: [await this.composeMessage({
+          rawMessage: [
+            `收到 ${explicitCommand.intent} 指令，但当前阶段还不能执行这个动作。`,
+            `当前阶段是「${humanStageName(state.status)}」。`,
+            `现在可以：${formatAllowedActions(allowedActions)}`,
+          ].join('\n'),
+          state,
+        })],
+      };
+    }
+    if (explicitCommand.intent === 'status' || explicitCommand.intent === 'summary') {
+      const result = await this.workflow.reply(taskId, explicitCommand.reply);
+      return {
+        kind: 'reply',
+        auditAction: `intent:${explicitCommand.intent}`,
+        auditMetadata: { intent: explicitCommand.intent },
+        messages: [await this.composeWorkflowResult(result)],
+      };
+    }
+    return {
+      kind: 'background',
+      auditAction: `intent:${explicitCommand.intent}`,
+      auditMetadata: { intent: explicitCommand.intent, ...(explicitCommand.instruction ? { instruction: explicitCommand.instruction } : {}) },
+      startedMessage: { text: renderExplicitCommandStartedMessage(explicitCommand) },
+      run: () => this.workflow.reply(taskId, explicitCommand.reply),
+    };
+  }
+
+  private async orchestratorTurnToConversationTurn(turn: OrchestratorTurn): Promise<ConversationTurn> {
+    if (turn.kind === 'reply') {
+      return {
+        kind: 'reply',
+        ...(turn.auditAction ? { auditAction: turn.auditAction } : {}),
+        ...(turn.auditMetadata ? { auditMetadata: turn.auditMetadata } : {}),
+        messages: [await this.composeMessage({
+          rawMessage: turn.rawMessage,
+          state: turn.state,
+          ...(turn.files ? { files: turn.files } : {}),
+        })],
+      };
+    }
+    return {
+      kind: 'background',
+      ...(turn.auditAction ? { auditAction: turn.auditAction } : {}),
+      ...(turn.auditMetadata ? { auditMetadata: turn.auditMetadata } : {}),
+      startedMessage: await this.composeMessage({
+        rawMessage: turn.startedMessage,
+        state: turn.state,
+        includePendingPrompt: false,
+      }),
+      run: turn.run,
+    };
   }
 
   async notifyForState(taskId: string): Promise<OutboundMessage> {
@@ -187,12 +284,12 @@ export class ManagerConversationService {
   }
 
   private async classifyTaskIntent(message: string, state: TaskState): Promise<{ intent: IntentResult } | { turn: ConversationTurn }> {
-    if (!this.manager || !this.config) {
+    if (!this.assistant || !this.config) {
       return {
         turn: {
           kind: 'reply',
           auditAction: 'intent:missing_manager',
-          messages: [{ text: '当前没有配置 Manager 对话分类器，所以我没有推进 workflow。' }],
+        messages: [{ text: '当前没有配置 Assistant Elon Ma 对话分类器，所以我没有推进 workflow。' }],
         },
       };
     }
@@ -201,7 +298,7 @@ export class ManagerConversationService {
     try {
       const recentContext = await this.buildTaskChatContext(state);
       return {
-        intent: await this.manager.classifyIntent({
+      intent: await this.assistant.classifyIntent({
           userMessage: message,
           state,
           allowedActions,
@@ -287,6 +384,7 @@ export class ManagerConversationService {
           '这个动作已通过当前 workflow gate，我现在开始执行；跑完会把下一步发到这里。',
         ].join('\n'),
         state,
+        includePendingPrompt: false,
       }),
       run: () => this.workflow.reply(taskId, reply),
     };
@@ -308,7 +406,7 @@ export class ManagerConversationService {
     mode: 'message' | 'edit',
     projectId: string | undefined,
   ): Promise<ControlChatResult> {
-    if (this.manager && this.config) {
+    if (this.assistant && this.config) {
       const query = [
         message,
         pendingProposal?.title,
@@ -319,7 +417,7 @@ export class ManagerConversationService {
         projectId: projectId ?? getDefaultProjectId(this.config),
         query,
       });
-      return this.manager.handleControlChat({
+      return this.assistant.handleControlChat({
         message,
         mode,
         config: this.config,
@@ -348,14 +446,17 @@ export class ManagerConversationService {
     pendingPrompt?: string;
     userQuestion?: string;
     files?: OutboundFile[];
+    includePendingPrompt?: boolean;
   }): Promise<OutboundMessage> {
-    const fallback = fallbackComposeReply(input.rawMessage, input.state, input.pendingPrompt);
-    if (!this.manager || !this.config) {
+    const fallback = fallbackComposeReply(input.rawMessage, input.state, input.pendingPrompt, input.includePendingPrompt);
+    if (!this.assistant || !this.config) {
       return { text: fallback, ...(input.files ? { files: input.files } : {}) };
     }
     try {
-      const pendingPrompt = input.pendingPrompt ?? input.state.pendingUserPrompt;
-      const composed = await this.manager.composeReply({
+      const pendingPrompt = input.includePendingPrompt === false
+        ? undefined
+        : input.pendingPrompt ?? input.state.pendingUserPrompt;
+    const composed = await this.assistant.composeReply({
         rawMessage: input.rawMessage,
         state: input.state,
         ...(pendingPrompt ? { pendingPrompt } : {}),
@@ -380,15 +481,38 @@ export function parseExplicitTaskRequest(text: string): TaskRequest | undefined 
   if (!body) return undefined;
 
   const lines = body.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  const firstLine = lines[0] ?? 'Manager task';
+    const firstLine = lines[0] ?? 'Assistant task';
   const title = makeTitle(firstLine);
   const task = slashCreate && lines.length > 1 ? body.slice(body.indexOf(firstLine) + firstLine.length).trim() : body;
 
   return { title, task: task || body };
 }
 
+export function parseDirectPromptTaskRequest(text: string): TaskRequest | undefined {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.startsWith('/')) return undefined;
+  if (parseGlobalCommand(trimmed)) return undefined;
+  if (/^(?:create\s+task|new\s+task|confirm|yes\s+create)$/i.test(trimmed)) return undefined;
+  if (looksLikePromptGeneration(trimmed) && !/^(?:task|prompt)\s*:/i.test(trimmed)) return undefined;
+
+  const taskLike = (
+    /\r?\n/.test(trimmed) ||
+    trimmed.length >= 80 ||
+    /^(?:task|prompt|goal|problem)\s*:/i.test(trimmed) ||
+    /^(?:帮我|请|实现|检查|修复|重构|implement\b|fix\b|build\b|redesign\b|create\b|add\b|update\b|refactor\b)/i.test(trimmed)
+  );
+  if (!taskLike) return undefined;
+
+  const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const firstLine = lines[0] ?? 'Assistant task';
+  const titleSource = firstLine.replace(/^(?:task|prompt|goal|problem)\s*:\s*/i, '').trim()
+    || lines[1]
+      || 'Assistant task';
+  return { title: makeTitle(titleSource), task: trimmed };
+}
+
 export function parseTaskRequest(text: string): TaskRequest | undefined {
-  return parseExplicitTaskRequest(text);
+  return parseExplicitTaskRequest(text) ?? parseDirectPromptTaskRequest(text);
 }
 
 export function filesForState(state: TaskState): OutboundFile[] | undefined {
@@ -401,8 +525,7 @@ export function filesForState(state: TaskState): OutboundFile[] | undefined {
 }
 
 function artifactsForStatus(status: TaskState['status']): ArtifactName[] {
-  if (status === 'awaiting_brief_confirmation') return ['manager-brief'];
-  if (status === 'ready_for_decision') return ['manager-explanation', 'revised-plan'];
+    if (status === 'ready_for_decision') return ['assistant-explanation', 'revised-plan'];
   if (status === 'awaiting_user_acceptance') return ['final-review', 'test-build-log'];
   if (status === 'completed') return ['final-report'];
   return [];
@@ -414,12 +537,71 @@ function parseShowArtifact(text: string): ArtifactName | undefined {
   return ARTIFACT_NAMES.includes(artifact as ArtifactName) ? artifact as ArtifactName : undefined;
 }
 
+export interface ExplicitWorkflowCommand {
+  intent: IntentResult['intent'];
+  reply: string;
+  instruction?: string;
+}
+
+export function parseExplicitWorkflowCommand(text: string, state: TaskState): ExplicitWorkflowCommand | undefined {
+  const compact = text.trim().replace(/\s+/g, ' ');
+  if (!compact) return undefined;
+  if (/^status$/i.test(compact)) return { intent: 'status', reply: 'status' };
+  if (/^summary$/i.test(compact)) return { intent: 'summary', reply: 'summary' };
+  if (isStopCommand(compact)) return { intent: 'stop', reply: 'stop' };
+
+  const acceptMatch = compact.match(/^(?:accept|accepted)(?:\s*:\s*(.+))?$/i);
+  if (acceptMatch) return { intent: 'accept', reply: compact, ...(acceptMatch[1]?.trim() ? { instruction: acceptMatch[1].trim() } : {}) };
+
+  const difficultyMatch = compact.match(/^(low|medium|high)(?:\s*:\s*(.+))?$/i);
+  if (difficultyMatch?.[1]) {
+    return {
+      intent: 'difficulty',
+      reply: compact,
+      ...(difficultyMatch[2]?.trim() ? { instruction: difficultyMatch[2].trim() } : {}),
+    };
+  }
+
+  const approveMatch = compact.match(/^(?:approve A|approve|approved|A|yes|y)(?:\s*:\s*(.+))?$/i);
+  if (approveMatch) {
+    const intent = state.status === 'awaiting_user_acceptance' ? 'accept' : 'approve';
+    return { intent, reply: compact, ...(approveMatch[1]?.trim() ? { instruction: approveMatch[1].trim() } : {}) };
+  }
+
+  if (/^(?:reject B|reject|B|no|n)$/i.test(compact)) return { intent: 'reject', reply: compact };
+
+  const noteMatch = compact.match(/^note\s*:\s*(.+)$/i);
+  if (noteMatch?.[1]?.trim()) return { intent: 'note', reply: compact, instruction: noteMatch[1].trim() };
+
+  const reviseMatch = compact.match(/^(?:revise\s+c|revise|c)\s*:\s*(.+)$/i);
+  if (reviseMatch?.[1]?.trim()) return { intent: 'revise', reply: compact, instruction: reviseMatch[1].trim() };
+
+  const match = text.match(/^(?:restart|redesign|rerun|start over|重新开始|重跑|从头跑|重新规划|重新设计|重启)\s*[:：]\s*([\s\S]+)$/i);
+  const instruction = match?.[1]?.trim();
+  return instruction ? { intent: 'restart', instruction, reply: `restart: ${instruction}` } : undefined;
+}
+
 export function parseGlobalCommand(text: string): GlobalCommand | undefined {
   const normalized = text.trim().replace(/^\//, '').toLocaleLowerCase();
-  if (normalized === 'status' || normalized === 'summary' || normalized === 'help' || normalized === 'stop') {
+  if (normalized === 'status' || normalized === 'summary' || normalized === 'help') {
     return normalized;
   }
+  if (isStopCommand(normalized)) return 'stop';
   return undefined;
+}
+
+export function isStopCommand(text: string): boolean {
+  const compact = text.trim().replace(/^\//, '').replace(/\s+/g, ' ').toLocaleLowerCase();
+  const noSpaces = compact.replace(/\s+/g, '');
+  if (/^(?:do not|don't|dont)\s+(?:stop|cancel|abort)\b/i.test(compact)) return false;
+  if (/^(?:不要|别|別).*(?:取消|停止|中止|终止)/.test(noSpaces)) return false;
+  return /^(?:stop|cancel|abort|cancel task|cancel this task|stop task|stop this task)$/i.test(compact)
+    || /^(?:please\s+)?(?:cancel|abort|stop)(?:\s+(?:this|the|current))?(?:\s+(?:task|workflow|job))?$/i.test(compact)
+    || /^(?:(?:i\s+(?:want|wanna|need)\s+to)|please|can you|could you|help me)\s+(?:cancel|abort|stop)\b/i.test(compact)
+    || /^(?:取消|取消task|取消任务|停止|停止task|停止任务|中止|中止任务|终止|终止任务|结束任务|别做了|別做了|不做了|先别做了|先別做了)$/.test(noSpaces)
+    || /^(?:我想|我要|帮我|请|麻烦)?(?:取消|停止|中止|终止|结束)(?:这个|当前|这条|该)?(?:task|任务|workflow|流程)?$/.test(noSpaces)
+    || /(?:取消|停止|中止|终止|结束)(?:这个|当前|这条|该)?(?:task|任务|workflow|流程)/.test(noSpaces)
+    || /^(?:别|別|先别|先別)(?:再)?(?:做|跑|执行|继续|繼續)(?:了|这个|这个任务|这任务|task)?$/.test(noSpaces);
 }
 
 export function looksTaskLikeRequest(text: string): boolean {
@@ -512,10 +694,10 @@ function fallbackControlChat(
     return {
       kind: 'proposal',
       proposal: {
-        interpretedIntent: `把这条请求整理成一个可能的 Manager workflow 任务：${shorten(trimmed, 120)}`,
+      interpretedIntent: `把这条请求整理成一个可能的 assistant workflow 任务：${shorten(trimmed, 120)}`,
         title: makeTitle(trimmed),
         task: trimmed,
-        wouldDo: ['在你确认后，把这段内容创建成一个 Manager workflow 任务。'],
+      wouldDo: ['在你确认后，把这段内容创建成一个 assistant workflow 任务。'],
         wouldNotDo: ['不会在你确认前启动规划、实现或 agent 调用。'],
         suggestedNextAction: '可以说「创建任务」确认，或继续补充修改。',
       },
@@ -551,7 +733,7 @@ function localizeKnownProposalText(text: string): string {
     return '可以说「创建任务」确认，或继续补充修改。';
   }
   return text
-    .replace(/^Turn this request into a possible Manager workflow task:\s*/i, '把这条请求整理成一个可能的 Manager workflow 任务：')
+    .replace(/^Turn this request into a possible assistant workflow task:\s*/i, '把这条请求整理成一个可能的 assistant workflow 任务：')
     .replace(/^intent:\s*/i, '理解为：')
     .replace(/^Task prompt:\s*/i, '')
     .replace(/\n\nRevision request:\n/gi, '\n\n修改要求：\n');
@@ -562,6 +744,31 @@ function normalizeIntentForState(intent: IntentResult, state: TaskState): Intent
     return { ...intent, intent: 'accept' };
   }
   return intent;
+}
+
+function conversationalFallbackIntent(
+  message: string,
+  intent: IntentResult,
+  allowedActions: AllowedAction[],
+): IntentResult | undefined {
+  if (intent.intent !== 'unknown') return undefined;
+  if (!allowedActions.some((action) => action.id === 'ask')) return undefined;
+  if (!looksConversational(message)) return undefined;
+  return {
+    ...intent,
+    intent: 'ask',
+    confidence: Math.max(intent.confidence, 0.6),
+    requiresClarification: false,
+    userFacingInterpretation: intent.userFacingInterpretation || '我把这当成你在和我讨论当前任务。',
+  };
+}
+
+function looksConversational(message: string): boolean {
+  const trimmed = message.trim();
+  if (!trimmed) return false;
+  if (/^[abcyn]$/i.test(trimmed)) return false;
+  if (/^(?:yes|no|ok|okay)$/i.test(trimmed)) return false;
+  return trimmed.length >= 2;
 }
 
 function workflowReplyForIntent(intent: IntentResult, originalMessage: string, state: TaskState): string | undefined {
@@ -581,12 +788,30 @@ function workflowReplyForIntent(intent: IntentResult, originalMessage: string, s
       return 'accept';
     case 'note':
       return `note: ${intent.note ?? originalMessage}`;
+    case 'restart':
+      return `restart: ${intent.instruction ?? originalMessage}`;
     case 'status':
     case 'summary':
     case 'ask':
     case 'unknown':
       return undefined;
   }
+}
+
+function renderExplicitCommandStartedMessage(command: ExplicitWorkflowCommand): string {
+  if (command.intent === 'difficulty') {
+    return `收到 ${command.reply}，开始规划。跑完我会把计划和下一步发到这里；不用重复发送难度。`;
+  }
+  if (command.intent === 'approve') {
+    return '收到批准，开始执行。跑完我会把结果发到这里。';
+  }
+  if (command.intent === 'accept') {
+    return '收到验收通过，开始生成 task-record。跑完我会发最终结果。';
+  }
+  if (command.intent === 'revise' || command.intent === 'restart') {
+    return '收到修改要求，开始重新规划。跑完我会把新计划发到这里。';
+  }
+  return `收到 ${command.intent} 指令，开始处理。跑完我会把下一步发到这里。`;
 }
 
 function intentAuditMetadata(intent: IntentResult): Record<string, unknown> {
@@ -617,16 +842,28 @@ function renderStateNotificationText(state: TaskState): string {
   ].filter(Boolean).join('\n');
 }
 
-function fallbackComposeReply(rawMessage: string, state: TaskState, pendingPrompt?: string): string {
-  const prompt = pendingPrompt ?? state.pendingUserPrompt;
+function fallbackComposeReply(
+  rawMessage: string,
+  state: TaskState,
+  pendingPrompt?: string,
+  includePendingPrompt = true,
+): string {
+  const prompt = includePendingPrompt ? pendingPrompt ?? state.pendingUserPrompt : undefined;
   const cleaned = sanitizeUserFacingText(rawMessage);
+  const notificationState = includePendingPrompt ? state : stateWithoutPendingPrompt(state);
   const base = isWorkflowBoilerplate(rawMessage) || !cleaned
-    ? renderStateNotificationText(state)
+    ? renderStateNotificationText(notificationState)
     : cleaned;
   return [
     base,
     prompt && !base.includes(localizePendingPrompt(prompt)) ? `现在需要你处理：${localizePendingPrompt(prompt)}` : undefined,
   ].filter(Boolean).join('\n');
+}
+
+function stateWithoutPendingPrompt(state: TaskState): TaskState {
+  const copy = { ...state };
+  delete copy.pendingUserPrompt;
+  return copy;
 }
 
 function sanitizeUserFacingText(text: string): string {
@@ -641,13 +878,10 @@ function sanitizeUserFacingText(text: string): string {
 function isWorkflowBoilerplate(text: string): boolean {
   const trimmed = text.trim();
   if (/^(?:Task|Task ID|Status|Pending):\s*/im.test(trimmed)) return true;
-  return /^(?:Brief is ready|Brief approved|Revised plan is ready|Final review passed|Task accepted|Task stopped|Choose workflow difficulty|Plan revision limit reached|Revised plan rejected)/i.test(trimmed);
+  return /^(?:Revised plan is ready|Final review passed|Task accepted|Task stopped|Choose workflow difficulty|Plan revision limit reached|Revised plan rejected)/i.test(trimmed);
 }
 
 function localizePendingPrompt(prompt: string): string {
-  if (/Review the brief:/i.test(prompt)) {
-    return '请确认 brief：可以说「同意」进入难度选择；也可以说明要修哪里，或说「拒绝/停止」。';
-  }
   if (/Choose workflow difficulty/i.test(prompt)) {
     return '请选择难度：低/中/高。也可以直接说「默认难度」或「高难度」。';
   }
@@ -661,7 +895,7 @@ function localizePendingPrompt(prompt: string): string {
 }
 
 function makeTitle(text: string): string {
-  return shorten(text.replace(/^#+\s*/, '').trim() || 'Manager task', 80);
+  return shorten(text.replace(/^#+\s*/, '').trim() || 'Assistant task', 80);
 }
 
 function shorten(text: string, maxLength: number): string {

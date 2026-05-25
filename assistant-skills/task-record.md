@@ -6,7 +6,7 @@ Every approved plan is a parent task. A parent task may have one execution unit 
 
 `TASK_RECORD_ROOT` is configurable per project with `project.taskRecordRoot`.
 
-If it is missing, Manager uses:
+If it is missing, Assistant Elon Ma uses:
 
 ```text
 <project.targetDir>/task
@@ -26,7 +26,6 @@ task/
 
   <task-id-or-slug>/
     README.md
-    brief.md
     plan.md
     plan-review.md
     implementation-log.md
@@ -59,17 +58,16 @@ Supported values:
 - Backend / API
 - Data / Dictionary Pipeline
 - Evaluation / Benchmark
-- Manager / Workflow
+- Assistant / Workflow
 - Docs / Task Record
 - UI / Frontend
 - Other
 
-Architect may suggest Category. Manager stores it. Missing or unknown Category becomes `Other`.
+Architect may suggest Category. Assistant Elon Ma stores it. Missing or unknown Category becomes `Other`.
 
 ## Lifecycle Timing
 
-- On task creation, Manager may initialize `task/<task-id>/` with README and standard placeholder files.
-- `brief.md` is filled after brief generation.
+- On task creation, Assistant Elon Ma may initialize `task/<task-id>/` with README and standard placeholder files.
 - `plan.md`, `plan-review.md`, and `subtasks/*.md` are formalized only after the plan is reviewed where applicable and approved by the user.
 - Single tasks use `subtasks/01-main.md`.
 - Decomposed tasks use multiple `subtasks/NN-*.md` files under the same parent task folder.

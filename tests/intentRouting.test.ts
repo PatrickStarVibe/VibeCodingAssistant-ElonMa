@@ -5,23 +5,26 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { ArtifactStore } from '../src/artifacts.js';
-import type { HeavyAgentAdapter, ManagerAdapter } from '../src/adapters.js';
-import { ManagerConversationService } from '../src/conversation.js';
-import { LarkBridge, type LarkClientPort } from '../src/larkBridge.js';
-import { LarkBridgeStateStore } from '../src/larkBridgeState.js';
+import type { HeavyAgentAdapter, AssistantAdapter } from '../src/adapters.js';
+import { AssistantConversationService } from '../src/conversation.js';
 import type {
   ControlChatResult,
   IntentResult,
-  ManagerConfig,
-  ManagerRouteResult,
-  ManagerTextResult,
+  AssistantConfig,
+  AssistantRouteResult,
+  AssistantTextResult,
+  OrchestratorDecision,
   PlanResult,
   TaskProposal,
   WorkflowDifficulty,
 } from '../src/types.js';
 import { WorkflowService } from '../src/workflow.js';
 
-class FakeManager implements ManagerAdapter {
+class FakeAssistant implements AssistantAdapter {
+  async decideNextAction(): Promise<OrchestratorDecision> {
+    return { action: 'wait_for_user', reason: 'test fallback', confidence: 1 };
+  }
+
   async classifyIntent(input: { userMessage: string; state: { status: string } }): Promise<IntentResult> {
     const text = input.userMessage.trim();
     if (text === 'high') return intent('difficulty', '选择高难度', { difficulty: 'high' });
@@ -37,15 +40,11 @@ class FakeManager implements ManagerAdapter {
     return { text: input.rawMessage };
   }
 
-  async createTaskBrief(): Promise<ManagerTextResult> {
-    return { markdown: 'brief', needsUserDecision: false };
-  }
-
-  async createRevisionInstructions(): Promise<ManagerTextResult> {
+  async createRevisionInstructions(): Promise<AssistantTextResult> {
     return { markdown: 'instructions', needsUserDecision: false };
   }
 
-  async explainRevisedPlan(): Promise<ManagerTextResult> {
+  async explainRevisedPlan(): Promise<AssistantTextResult> {
     return { markdown: 'explanation', needsUserDecision: false };
   }
 
@@ -62,7 +61,7 @@ class FakeManager implements ManagerAdapter {
     return { kind: 'answer', markdown: input.message };
   }
 
-  async routeAfterFinalReview(): Promise<ManagerRouteResult> {
+  async routeAfterFinalReview(): Promise<AssistantRouteResult> {
     return { route: 'complete', reason: 'ok' };
   }
 }
@@ -89,25 +88,6 @@ class FakeHeavyAgents implements HeavyAgentAdapter {
   }
 }
 
-class FakeLarkClient implements LarkClientPort {
-  sentTexts: { chatId: string; text: string }[] = [];
-  sentFiles: { chatId: string; path: string; name: string }[] = [];
-
-  async start(): Promise<void> {}
-
-  async sendText(chatId: string, text: string): Promise<void> {
-    this.sentTexts.push({ chatId, text });
-  }
-
-  async sendFile(chatId: string, file: { path: string; name: string }): Promise<void> {
-    this.sentFiles.push({ chatId, ...file });
-  }
-
-  async createTaskChat(): Promise<string> {
-    return 'task-chat-1';
-  }
-}
-
 function intent(
   name: IntentResult['intent'],
   userFacingInterpretation: string,
@@ -122,7 +102,7 @@ function intent(
   };
 }
 
-function makeConfig(targetDir: string): ManagerConfig {
+function makeConfig(targetDir: string): AssistantConfig {
   return {
     workspace: { targetDir },
     defaultProjectId: 'default',
@@ -141,24 +121,16 @@ function makeConfig(targetDir: string): ManagerConfig {
       allowedOpenIds: ['user-open-id'],
       taskMemberOpenIds: [],
       controlChatIds: [],
-      watchIntervalSeconds: 1,
-      pairingCode: '123456',
     },
     maxRevisionRounds: 3,
-    roles: {
-      manager: 'manager',
-      planner: 'planner',
-      reviewer: 'reviewer',
-      implementer: 'implementer',
-      finalReviewer: 'finalReviewer',
-    },
     workflowRoles: {
+      assistant: 'assistant',
       low: { architect: 'planner', planReviewer: 'planner', developer: 'implementer', finalReviewer: 'implementer' },
       medium: { architect: 'planner', planReviewer: 'reviewer', developer: 'implementer', finalReviewer: 'finalReviewer' },
       high: { architect: 'reviewer', planReviewer: 'planner', developer: 'implementer', finalReviewer: 'finalReviewer' },
     },
     profiles: {
-      manager: { kind: 'deepseek' },
+      assistant: { kind: 'deepseek' },
       planner: { kind: 'codex' },
       reviewer: { kind: 'claude' },
       implementer: { kind: 'codex' },
@@ -173,16 +145,16 @@ async function makeHarness(): Promise<{
   targetDir: string;
   store: ArtifactStore;
   service: WorkflowService;
-  conversation: ManagerConversationService;
-  config: ManagerConfig;
+  conversation: AssistantConversationService;
+  config: AssistantConfig;
 }> {
-  const root = await mkdtemp(join(tmpdir(), 'manager-root-'));
-  const targetDir = await mkdtemp(join(tmpdir(), 'manager-target-'));
+  const root = await mkdtemp(join(tmpdir(), 'assistant-root-'));
+  const targetDir = await mkdtemp(join(tmpdir(), 'assistant-target-'));
   const config = makeConfig(targetDir);
   const store = new ArtifactStore(root, config);
-  const manager = new FakeManager();
-  const service = new WorkflowService(store, config, manager, new FakeHeavyAgents(), { executeVerification: false });
-  const conversation = new ManagerConversationService(service, store, manager, config);
+  const assistant = new FakeAssistant();
+  const service = new WorkflowService(store, config, assistant, new FakeHeavyAgents(), { executeVerification: false });
+  const conversation = new AssistantConversationService(service, store, assistant, config);
   return { root, targetDir, store, service, conversation, config };
 }
 
@@ -211,7 +183,6 @@ describe('intent routing conversation layer', () => {
     try {
       const created = await harness.service.createTask({ title: 'Mention task', task: 'Build it.' });
       await harness.service.planTask(created.state.taskId);
-      await harness.service.reply(created.state.taskId, 'approve A');
 
       const turn = await harness.conversation.routeTaskMessage(created.state.taskId, '@_user_1 high');
 
@@ -226,7 +197,7 @@ describe('intent routing conversation layer', () => {
     }
   });
 
-  it('routes classifier approve through the brief gate', async () => {
+  it('does not treat approval as a difficulty choice', async () => {
     const harness = await makeHarness();
     try {
       const created = await harness.service.createTask({ title: 'Approve task', task: 'Build it.' });
@@ -234,11 +205,8 @@ describe('intent routing conversation layer', () => {
 
       const turn = await harness.conversation.routeTaskMessage(created.state.taskId, '同意');
 
-      expect(turn.kind).toBe('background');
-      if (turn.kind === 'background') {
-        const result = await turn.run();
-        expect(result.state.status).toBe('awaiting_difficulty_selection');
-      }
+      expect(turn.kind).toBe('reply');
+      expect((await harness.store.loadState(created.state.taskId)).status).toBe('awaiting_difficulty_selection');
     } finally {
       await cleanup([harness.root, harness.targetDir]);
     }
@@ -289,37 +257,4 @@ describe('intent routing conversation layer', () => {
     }
   });
 
-  it('does not resend the same pending notification block', async () => {
-    const harness = await makeHarness();
-    try {
-      const created = await harness.service.createTask({ title: 'Dedupe task', task: 'Build it.' });
-      const taskState = {
-        ...created.state,
-        status: 'awaiting_difficulty_selection' as const,
-        pendingUserPrompt: 'Choose low, medium, or high.',
-        updatedAt: new Date().toISOString(),
-      };
-      await harness.store.saveState(taskState);
-
-      const client = new FakeLarkClient();
-      const stateStore = new LarkBridgeStateStore(harness.root, harness.config);
-      const bridge = new LarkBridge(harness.config, harness.store, client, harness.conversation, stateStore);
-      const bridgeState = await stateStore.load();
-      bridgeState.bindingsByChatId['task-chat-1'] = {
-        taskId: created.state.taskId,
-        title: created.state.title,
-        createdAt: new Date().toISOString(),
-      };
-      await stateStore.save(bridgeState);
-
-      await bridge.watchTaskStatuses();
-      const sentAfterFirstWatch = client.sentTexts.length;
-      await bridge.watchTaskStatuses();
-
-      expect(sentAfterFirstWatch).toBe(1);
-      expect(client.sentTexts).toHaveLength(1);
-    } finally {
-      await cleanup([harness.root, harness.targetDir]);
-    }
-  });
 });

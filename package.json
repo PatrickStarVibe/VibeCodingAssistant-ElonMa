@@ -1,14 +1,14 @@
 {
-  "name": "manager-ai-workflow",
+  "name": "assistant-ai-workflow",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "bin": {
-    "manager": "./dist/cli.js"
+    "assistant": "./dist/cli.js"
   },
   "scripts": {
-    "manager": "tsx src/cli.ts",
-    "manager:lark": "tsx src/larkCli.ts",
+    "assistant": "tsx src/cli.ts",
+    "assistant:lark": "tsx src/larkCli.ts",
     "build": "tsc -p tsconfig.json",
     "task-usage:summarize": "tsx scripts/task-usage/summarizeTaskUsage.ts",
     "test": "vitest run",

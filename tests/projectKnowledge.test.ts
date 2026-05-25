@@ -5,9 +5,9 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { ProjectKnowledgeService } from '../src/projectKnowledge.js';
-import type { ManagerConfig } from '../src/types.js';
+import type { AssistantConfig } from '../src/types.js';
 
-function makeConfig(root: string): ManagerConfig {
+function makeConfig(root: string): AssistantConfig {
   return {
     workspace: { targetDir: join(root, 'target') },
     defaultProjectId: 'ireader',
@@ -26,17 +26,10 @@ function makeConfig(root: string): ManagerConfig {
       allowedOpenIds: [],
       taskMemberOpenIds: [],
       controlChatIds: [],
-      watchIntervalSeconds: 10,
     },
     maxRevisionRounds: 3,
-    roles: {
-      manager: 'manager',
-      planner: 'planner',
-      reviewer: 'reviewer',
-      implementer: 'implementer',
-      finalReviewer: 'finalReviewer',
-    },
     workflowRoles: {
+      assistant: 'assistant',
       low: {
         architect: 'planner',
         planReviewer: 'planner',
@@ -57,7 +50,7 @@ function makeConfig(root: string): ManagerConfig {
       },
     },
     profiles: {
-      manager: { kind: 'deepseek' },
+      assistant: { kind: 'deepseek' },
       planner: { kind: 'codex' },
       reviewer: { kind: 'claude' },
       implementer: { kind: 'codex' },
@@ -69,7 +62,7 @@ function makeConfig(root: string): ManagerConfig {
 
 describe('ProjectKnowledgeService', () => {
   it('reads Markdown, ignores non-Markdown, ranks by query, and respects budgets', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'manager-root-'));
+    const root = await mkdtemp(join(tmpdir(), 'assistant-root-'));
     try {
       const docs = join(root, 'project-docs', 'ireader');
       await mkdir(docs, { recursive: true });

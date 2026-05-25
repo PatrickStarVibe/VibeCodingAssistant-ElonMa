@@ -2,16 +2,15 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
 import { sanitizeTextForArtifact } from './textSanitizer.js';
-import type { ArtifactName, ManagerConfig, TaskState } from './types.js';
+import type { ArtifactName, AssistantConfig, TaskState, WorkflowStatus } from './types.js';
 
 const ARTIFACT_FILES: Record<ArtifactName, string> = {
   'original-task': 'original-task.md',
-  'manager-brief': 'manager-brief.md',
   'initial-plan': 'initial-plan.md',
   review: 'review.md',
   'revision-instructions': 'revision-instructions.md',
   'revised-plan': 'revised-plan.md',
-  'manager-explanation': 'manager-explanation.md',
+  'assistant-explanation': 'assistant-explanation.md',
   'qa-log': 'qa-log.md',
   'decision-log': 'decision-log.md',
   'implementation-log': 'implementation-log.md',
@@ -30,10 +29,10 @@ export class ArtifactStore {
   readonly baseDir: string;
 
   constructor(
-    readonly managerRoot: string,
-    readonly config: ManagerConfig,
+    readonly assistantRoot: string,
+    readonly config: AssistantConfig,
   ) {
-    this.baseDir = resolve(managerRoot, config.artifactsDir);
+    this.baseDir = resolve(assistantRoot, config.artifactsDir);
   }
 
   taskDir(taskId: string): string {
@@ -66,8 +65,9 @@ export class ArtifactStore {
   }
 
   async saveState(state: TaskState): Promise<void> {
+    const stateToSave = stripInternalPendingPrompt(state);
     await mkdir(this.taskDir(state.taskId), { recursive: true });
-    await writeFile(this.statePath(state.taskId), `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+    await writeFile(this.statePath(state.taskId), `${JSON.stringify(stateToSave, null, 2)}\n`, 'utf8');
   }
 
   async loadState(taskIdOrLatest: string): Promise<TaskState> {
@@ -99,4 +99,27 @@ export class ArtifactStore {
     const path = state.artifacts[artifact] ?? this.artifactPath(state.taskId, artifact);
     return readFile(path, 'utf8');
   }
+}
+
+const INTERNAL_TRANSITION_STATUSES = new Set<WorkflowStatus>([
+  'planning_requested',
+  'planning',
+  'task_artifacts_persisting',
+  'execution_queue_ready',
+  'implementing',
+  'execution_unit_implementing',
+  'execution_unit_testing',
+  'execution_unit_result_recording',
+  'next_execution_unit_or_all_done',
+  'implemented',
+  'final_reviewing',
+  'final_review_routing',
+  'task_recording',
+]);
+
+function stripInternalPendingPrompt(state: TaskState): TaskState {
+  if (!state.pendingUserPrompt || !INTERNAL_TRANSITION_STATUSES.has(state.status)) return state;
+  console.warn(`Clearing stale pendingUserPrompt from internal workflow state ${state.status} for task ${state.taskId}.`);
+  const { pendingUserPrompt: _pendingUserPrompt, ...rest } = state;
+  return rest;
 }

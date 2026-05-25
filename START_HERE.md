@@ -1,21 +1,21 @@
 # Codex 入口：从这里开始
 
-如果你（Codex）刚被用户拉进来接管这个 Manager workflow，**先读两个文件**：
+如果你（Codex）刚被用户拉进来接管这个 assistant workflow，**先读两个文件**：
 
-1. [docs/codex-handoff.md](docs/codex-handoff.md) — 你的角色、Manager 操作手册、并发多任务、已踩的坑
+1. [docs/codex-handoff.md](docs/codex-handoff.md) — 你的角色、Assistant 操作手册、并发多任务、已踩的坑
 2. [tasks/follow-up-feedback-ui.md](tasks/follow-up-feedback-ui.md) — 当前要跑的 follow-up 任务规格
 
 读完以后第一件要做的事：
 
 ```bash
-cd /c/Users/24600/OneDrive/文档/Manager
-npm run manager -- create --title "feedback-ui-unification" --task-file tasks/follow-up-feedback-ui.md
+cd <assistant-workspace>
+npm run assistant -- create --title "feedback-ui-unification" --task-file tasks/follow-up-feedback-ui.md
 ```
 
 然后跑 `plan`（不带 `--allow-agent-calls`，因为 brief 阶段只用 DeepSeek，几分钱就出来）：
 
 ```bash
-npm run manager -- plan --task <task-id-from-create>
+npm run assistant -- plan --task <task-id-from-create>
 ```
 
 把 brief 拿给用户看，等用户决定。后续按 [docs/codex-handoff.md](docs/codex-handoff.md) 的第 9 节执行流程走。

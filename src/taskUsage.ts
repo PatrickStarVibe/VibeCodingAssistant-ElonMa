@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url';
 export const TOKEN_USAGE_FILE_NAME = 'token-usage.json';
 
 export type TokenUsageRole =
-  | 'manager_planning'
+  | 'assistant_planning'
   | 'implementation'
   | 'review_debug'
   | 'verification'

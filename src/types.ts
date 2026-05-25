@@ -1,5 +1,3 @@
-export type RoleName = 'manager' | 'planner' | 'reviewer' | 'implementer' | 'finalReviewer';
-
 export type AgentProfileKind = 'deepseek' | 'codex' | 'claude' | 'stub';
 
 export type WorkflowDifficulty = 'low' | 'medium' | 'high';
@@ -14,6 +12,7 @@ export type IntentName =
   | 'summary'
   | 'accept'
   | 'note'
+  | 'restart'
   | 'ask'
   | 'unknown';
 
@@ -33,13 +32,117 @@ export interface IntentResult {
   userFacingInterpretation: string;
 }
 
+export type OrchestratorActionName =
+  | 'respond'
+  | 'approve_implementation'
+  | 'forward_to_workflow'
+  | 'show_artifact'
+  | 'ask_clarification'
+  | 'wait_for_user';
+
+export interface OrchestratorRuleHint {
+  intent: IntentName;
+  reply: string;
+  instruction?: string;
+}
+
+export interface OrchestratorDecision {
+  action: OrchestratorActionName;
+  intent?: IntentName;
+  difficulty?: WorkflowDifficulty;
+  instruction?: string;
+  text?: string;
+  artifact?: ArtifactName;
+  question?: string;
+  reason?: string;
+  reasoning?: string;
+  confidence: number;
+  userConsentForContinuation?: boolean;
+}
+
+export interface OrchestratorDecisionInput {
+  state: Pick<TaskState, 'taskId' | 'title' | 'status' | 'difficulty' | 'pendingUserPrompt' | 'revisionRound' | 'reviewerRunCount'>;
+  allowedActions: AllowedAction[];
+  requestedChanges: string[];
+  recentDecisionLog: string;
+  latestArtifactName?: ArtifactName;
+  latestUserMessage: string;
+  ruleHint?: OrchestratorRuleHint;
+  previousActionInThisTurn?: OrchestratorDecision;
+  rejectionReason?: string;
+  config: AssistantConfig;
+}
+
+export type BridgeToolName =
+  | 'reply_to_user'
+  | 'create_task'
+  | 'choose_difficulty'
+  | 'approve_plan'
+  | 'accept_task'
+  | 'revise_plan'
+  | 'stop_task'
+  | 'ask_task_question'
+  | 'show_status'
+  | 'show_artifact'
+  | 'switch_project'
+  | 'add_project'
+  | 'list_projects'
+  | 'schedule_task_to_project_chat'
+  | 'create_project_chat'
+  | 'create_new_task_from_task_chat';
+
+export interface BridgeToolCall {
+  name: BridgeToolName;
+  arguments: Record<string, unknown>;
+  reasoning?: string;
+}
+
+export type BridgeAgentDecision =
+  | { kind: 'reply'; text: string }
+  | { kind: 'tool_call'; toolCall: BridgeToolCall };
+
+export interface BridgeAgentInput {
+  latestUserMessage: string;
+  chat: {
+    chatId: string;
+    senderOpenId: string;
+    chatKind: 'control' | 'project';
+    activeProjectId?: string;
+    projectChat?: {
+      projectId: string;
+      name?: string;
+      hasActiveTask: boolean;
+    };
+    boundTaskId?: string;
+    canCreateTask: boolean;
+  };
+  projectChatsSummary?: Array<{
+    chatId: string;
+    projectId: string;
+    idle: boolean;
+    name?: string;
+  }>;
+  task?: Pick<TaskState, 'taskId' | 'title' | 'status' | 'difficulty' | 'pendingUserPrompt' | 'revisionRound' | 'reviewerRunCount' | 'requestedChanges'>;
+  runningJob?: {
+    taskId: string;
+    label: string;
+    startedAt: string;
+  };
+  projects: Array<Pick<ProjectConfig, 'id' | 'name'>>;
+  config: AssistantConfig;
+}
+
 export interface ComposedReply {
   text: string;
 }
 
-export type WorkflowRoleName = 'architect' | 'planReviewer' | 'developer' | 'finalReviewer';
+export type HeavyWorkflowRoleName = 'architect' | 'planReviewer' | 'developer' | 'finalReviewer';
 
-export type WorkflowRoleProfiles = Record<WorkflowDifficulty, Record<WorkflowRoleName, string>>;
+export type WorkflowRoleName = 'assistant' | HeavyWorkflowRoleName;
+
+export type WorkflowRoleProfiles = {
+  assistant: string;
+} & Record<WorkflowDifficulty, Record<HeavyWorkflowRoleName, string>>;
 
 export interface AgentPromptRecord {
   taskId: string;
@@ -47,6 +150,8 @@ export interface AgentPromptRecord {
   difficulty: WorkflowDifficulty;
   profileName: string;
   profileKind: AgentProfileKind;
+  model?: string;
+  effort?: string;
   createdAt: string;
   prompt: string;
 }
@@ -61,7 +166,7 @@ export type TaskCategory =
   | 'Backend / API'
   | 'Data / Dictionary Pipeline'
   | 'Evaluation / Benchmark'
-  | 'Manager / Workflow'
+  | 'Assistant / Workflow'
   | 'Docs / Task Record'
   | 'UI / Frontend'
   | 'Other';
@@ -93,6 +198,7 @@ export interface ExecutionUnitState {
 export interface AgentProfileConfig {
   kind: AgentProfileKind;
   model?: string;
+  effort?: string;
   baseUrl?: string;
   apiKeyEnv?: string;
   command?: string;
@@ -107,7 +213,7 @@ export interface ProjectConfig {
   alwaysRead?: string[];
 }
 
-export interface ManagerConfig {
+export interface AssistantConfig {
   workspace: {
     targetDir: string;
   };
@@ -121,11 +227,8 @@ export interface ManagerConfig {
     allowedOpenIds: string[];
     taskMemberOpenIds: string[];
     controlChatIds: string[];
-    watchIntervalSeconds: number;
-    pairingCode?: string;
   };
   maxRevisionRounds: number;
-  roles: Record<RoleName, string>;
   workflowRoles: WorkflowRoleProfiles;
   profiles: Record<string, AgentProfileConfig>;
   verification: {
@@ -135,8 +238,6 @@ export interface ManagerConfig {
 
 export type WorkflowStatus =
   | 'created'
-  | 'briefing'
-  | 'awaiting_brief_confirmation'
   | 'awaiting_difficulty_selection'
   | 'planning_requested'
   | 'planning'
@@ -160,12 +261,11 @@ export type WorkflowStatus =
 
 export type ArtifactName =
   | 'original-task'
-  | 'manager-brief'
   | 'initial-plan'
   | 'review'
   | 'revision-instructions'
   | 'revised-plan'
-  | 'manager-explanation'
+  | 'assistant-explanation'
   | 'qa-log'
   | 'decision-log'
   | 'implementation-log'
@@ -193,8 +293,6 @@ export interface TaskState {
   executionMode?: ExecutionMode;
   executionQueue: ExecutionUnitState[];
   currentExecutionIndex?: number;
-  briefConfirmed: boolean;
-  briefRevisionRequests: string[];
   approvedAt?: string;
   acceptedAt?: string;
   userAcceptanceNotes: string[];
@@ -232,7 +330,7 @@ export interface FinalReviewResult {
   agentPrompt?: AgentPromptRecord;
 }
 
-export interface ManagerTextResult {
+export interface AssistantTextResult {
   markdown: string;
   needsUserDecision: boolean;
   userPrompt?: string;
@@ -254,7 +352,7 @@ export type ControlChatResult =
   | { kind: 'cancel_pending_proposal'; markdown?: string }
   | { kind: 'clarify'; markdown: string };
 
-export interface ManagerRouteResult {
+export interface AssistantRouteResult {
   route: FinalReviewRoute;
   reason: string;
   userPrompt?: string;

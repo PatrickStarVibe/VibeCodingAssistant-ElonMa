@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { ArtifactStore } from './artifacts.js';
-import { buildInitialPlanPrompt, type HeavyAgentAdapter, type ManagerAdapter } from './adapters.js';
+import { buildInitialPlanPrompt, type HeavyAgentAdapter, type AssistantAdapter } from './adapters.js';
 import { diffStatusLines, readGitSnapshot } from './git.js';
 import { ProjectKnowledgeService } from './projectKnowledge.js';
 import { configForProject, getDefaultProjectId, requireProject } from './projects.js';
@@ -21,11 +21,12 @@ import {
   summarizeTaskUsageLedger,
   type TaskUsageBreakdownKey,
 } from './taskUsage.js';
-import type { AgentPromptRecord, ArtifactName, ExecutionUnitState, GitSnapshot, ManagerConfig, PlanResult, TaskState, VerificationCommandResult, WorkflowDifficulty } from './types.js';
+import type { AgentPromptRecord, ArtifactName, ExecutionUnitState, GitSnapshot, AssistantConfig, PlanResult, TaskState, VerificationCommandResult, WorkflowDifficulty } from './types.js';
 import { renderVerificationLog, runVerificationCommands } from './verification.js';
 
 export interface WorkflowOptions {
   executeVerification?: boolean;
+  orchestratorEnabled?: boolean;
 }
 
 export interface WorkflowResult {
@@ -36,11 +37,11 @@ export interface WorkflowResult {
 export class WorkflowService {
   constructor(
     private readonly store: ArtifactStore,
-    private readonly config: ManagerConfig,
-    private readonly manager: ManagerAdapter,
+    private readonly config: AssistantConfig,
+    private readonly assistant: AssistantAdapter,
     private readonly heavyAgents: HeavyAgentAdapter,
     private readonly options: WorkflowOptions = {},
-    private readonly projectKnowledge = new ProjectKnowledgeService(store.managerRoot),
+    private readonly projectKnowledge = new ProjectKnowledgeService(store.assistantRoot),
     private readonly taskRecords = new TaskRecordStore(),
   ) {}
 
@@ -59,8 +60,6 @@ export class WorkflowService {
       revisionRound: 0,
       reviewerRunCount: 0,
       executionQueue: [],
-      briefConfirmed: false,
-      briefRevisionRequests: [],
       userAcceptanceNotes: [],
       artifacts: {},
       requestedChanges: [],
@@ -79,7 +78,7 @@ export class WorkflowService {
 
   async planTask(taskIdOrLatest: string): Promise<WorkflowResult> {
     let state = await this.store.loadState(taskIdOrLatest);
-    if (!['created', 'briefing', 'awaiting_brief_confirmation', 'awaiting_difficulty_selection', 'planning_requested', 'waiting_user_direction', 'ready_for_decision'].includes(state.status)) {
+    if (!['created', 'awaiting_difficulty_selection', 'planning_requested', 'waiting_user_direction', 'ready_for_decision'].includes(state.status)) {
       throw new Error(`Cannot run planning from state ${state.status}.`);
     }
 
@@ -87,40 +86,15 @@ export class WorkflowService {
     const project = this.projectForState(state);
     const scopedConfig = configForProject(this.config, project);
 
-    // Phase 1: Brief generation and user confirmation gate.
-    if (!state.briefConfirmed) {
-      state = { ...state, status: 'briefing', updatedAt: new Date().toISOString() };
-      await this.store.saveState(state);
-
-      const projectContext = await this.buildProjectContext(state, task);
-      const brief = await this.manager.createTaskBrief({
-        task,
-        projectContext,
-        briefRevisionRequests: state.briefRevisionRequests,
-        state,
-        config: scopedConfig,
-      });
-      state = await this.store.writeArtifact(state, 'manager-brief', brief.markdown);
-      await this.taskRecords.writeBrief(project, state, brief.markdown);
-      state = {
-        ...state,
-        status: 'awaiting_brief_confirmation',
-        pendingUserPrompt: 'Review the brief: approve A to choose workflow difficulty, revise C: <correction> to refine, reject B to stop.',
-        updatedAt: new Date().toISOString(),
-      };
-      await this.store.saveState(state);
-      return { state, message: 'Brief is ready for your confirmation. Run: show --artifact manager-brief' };
-    }
-
     if (!state.difficulty) {
       state = {
-        ...state,
+        ...withoutPendingPrompt(state),
         status: 'awaiting_difficulty_selection',
         pendingUserPrompt: renderDifficultyPrompt(),
         updatedAt: new Date().toISOString(),
       };
       await this.store.saveState(state);
-      return { state, message: 'Brief approved. Choose a workflow difficulty: low, medium, or high.' };
+      return { state, message: 'Choose a workflow difficulty: low, medium, or high.' };
     }
     const difficulty = state.difficulty;
 
@@ -132,13 +106,11 @@ export class WorkflowService {
     state = { ...state, status: 'planning', revisionRound: state.revisionRound + 1, updatedAt: new Date().toISOString() };
     await this.store.saveState(state);
 
-    const briefMarkdown = await this.store.readArtifact(state, 'manager-brief');
-    const projectContext = await this.buildProjectContext(state, [task, briefMarkdown, state.requestedChanges.join('\n')].join('\n\n'));
+    const projectContext = await this.buildProjectContext(state, [task, state.requestedChanges.join('\n')].filter(Boolean).join('\n\n'));
 
     const initialPlan = await this.heavyAgents.createInitialPlan({
       task,
       projectContext,
-      brief: briefMarkdown,
       difficulty,
       state,
       config: scopedConfig,
@@ -150,7 +122,7 @@ export class WorkflowService {
       state = await this.store.writeArtifact(state, 'revised-plan', initialPlan.markdown);
       state = await this.writePlanMetadata(state, initialPlan);
 
-      const explanation = await this.manager.explainRevisedPlan({
+      const explanation = await this.assistant.explainRevisedPlan({
         task,
         projectContext,
         revisedPlan: initialPlan.markdown,
@@ -159,10 +131,10 @@ export class WorkflowService {
         state,
         config: scopedConfig,
       });
-      state = await this.store.writeArtifact(state, 'manager-explanation', explanation.markdown);
+      state = await this.store.writeArtifact(state, 'assistant-explanation', explanation.markdown);
       if (explanation.needsUserDecision) {
         state = await this.pauseForUserDirection(state, explanation.userPrompt ?? explanation.markdown);
-        return { state, message: 'Manager explanation needs a product-level decision.' };
+        return { state, message: 'Assistant Elon Ma explanation needs a product-level decision.' };
       }
 
       state = { ...withoutPendingPrompt(state), status: 'ready_for_decision', updatedAt: new Date().toISOString() };
@@ -190,7 +162,7 @@ export class WorkflowService {
       reviewMarkdown = await this.store.readArtifact(state, 'review');
     }
 
-    const revisionInstructions = await this.manager.createRevisionInstructions({
+    const revisionInstructions = await this.assistant.createRevisionInstructions({
       task,
       projectContext,
       initialPlan: initialPlan.markdown,
@@ -202,7 +174,7 @@ export class WorkflowService {
     state = await this.store.writeArtifact(state, 'revision-instructions', revisionInstructions.markdown);
     if (revisionInstructions.needsUserDecision) {
       state = await this.pauseForUserDirection(state, revisionInstructions.userPrompt ?? revisionInstructions.markdown);
-      return { state, message: 'Manager needs a product-level decision before the plan can be revised.' };
+      return { state, message: 'Assistant Elon Ma needs a product-level decision before the plan can be revised.' };
     }
 
     const revisedPlan = await this.heavyAgents.revisePlan({
@@ -219,7 +191,7 @@ export class WorkflowService {
     state = await this.store.writeArtifact(state, 'revised-plan', revisedPlan.markdown);
     state = await this.writePlanMetadata(state, revisedPlan);
 
-    const explanation = await this.manager.explainRevisedPlan({
+    const explanation = await this.assistant.explainRevisedPlan({
       task,
       projectContext,
       revisedPlan: revisedPlan.markdown,
@@ -228,10 +200,10 @@ export class WorkflowService {
       state,
       config: scopedConfig,
     });
-    state = await this.store.writeArtifact(state, 'manager-explanation', explanation.markdown);
+    state = await this.store.writeArtifact(state, 'assistant-explanation', explanation.markdown);
     if (explanation.needsUserDecision) {
       state = await this.pauseForUserDirection(state, explanation.userPrompt ?? explanation.markdown);
-      return { state, message: 'Manager explanation needs a product-level decision.' };
+      return { state, message: 'Assistant Elon Ma explanation needs a product-level decision.' };
     }
 
     state = { ...withoutPendingPrompt(state), status: 'ready_for_decision', updatedAt: new Date().toISOString() };
@@ -246,7 +218,7 @@ export class WorkflowService {
     const review = await this.store.readArtifact(state, 'review').catch(() => '');
     const revisionInstructions = await this.store.readArtifact(state, 'revision-instructions').catch(() => '');
     const projectContext = await this.buildProjectContext(state, [task, revisedPlan, review, revisionInstructions].join('\n\n'));
-    const explanation = await this.manager.explainRevisedPlan({
+    const explanation = await this.assistant.explainRevisedPlan({
       task,
       projectContext,
       revisedPlan,
@@ -255,7 +227,7 @@ export class WorkflowService {
       state,
       config: this.configForState(state),
     });
-    state = await this.store.writeArtifact(state, 'manager-explanation', explanation.markdown);
+    state = await this.store.writeArtifact(state, 'assistant-explanation', explanation.markdown);
     state = explanation.needsUserDecision
       ? {
         ...state,
@@ -265,14 +237,14 @@ export class WorkflowService {
       }
       : { ...withoutPendingPrompt(state), status: 'ready_for_decision', updatedAt: new Date().toISOString() };
     await this.store.saveState(state);
-    return { state, message: explanation.needsUserDecision ? 'Manager needs a product-level decision.' : 'Explanation updated.' };
+    return { state, message: explanation.needsUserDecision ? 'Assistant Elon Ma needs a product-level decision.' : 'Explanation updated.' };
   }
 
   async askQuestion(taskIdOrLatest: string, question: string): Promise<WorkflowResult> {
     let state = await this.store.loadState(taskIdOrLatest);
     const context = await this.buildContext(state, false);
     const projectContext = await this.buildProjectContext(state, [question, context].join('\n\n'));
-    const answer = await this.manager.answerQuestion({ question, context, projectContext, state, config: this.configForState(state) });
+    const answer = await this.assistant.answerQuestion({ question, context, projectContext, state, config: this.configForState(state) });
     state = await this.store.appendArtifact(state, 'qa-log', [
       `## ${new Date().toISOString()}`,
       '',
@@ -295,37 +267,18 @@ export class WorkflowService {
       if (!parsed.useLlmFallback) {
         return { state, message: `Ambiguous reply: ${parsed.reason}` };
       }
-      const confirmation = await this.manager.interpretAmbiguousReply({
+    const confirmation = await this.assistant.interpretAmbiguousReply({
         reply,
         context: await this.buildContext(state),
         state,
         config: this.configForState(state),
       });
-      state = await this.store.appendArtifact(state, 'decision-log', `Ambiguous reply: ${reply}\nManager confirmation: ${confirmation}`);
+    state = await this.store.appendArtifact(state, 'decision-log', `Ambiguous reply: ${reply}\nAssistant confirmation: ${confirmation}`);
       await this.store.saveState(state);
       return { state, message: confirmation };
     }
 
     if (parsed.kind === 'difficulty') {
-      if (state.status === 'awaiting_brief_confirmation') {
-        state = {
-          ...withoutPendingPrompt(state),
-          status: 'planning_requested',
-          briefConfirmed: true,
-          difficulty: parsed.level,
-          lastDecision: reply,
-          updatedAt: new Date().toISOString(),
-        };
-        state = appendWorkflowInstruction(state, parsed.instruction);
-        state = await this.store.appendArtifact(
-          state,
-          'decision-log',
-          [`brief approved with difficulty: ${parsed.level}`, parsed.instruction ? `Instruction: ${parsed.instruction}` : undefined].filter(Boolean).join('\n'),
-        );
-        await this.store.saveState(state);
-        await this.refreshParentTaskReadme(state, 'Brief approved with difficulty selected. Planning not finalized yet.');
-        return this.planTask(state.taskId);
-      }
       if (state.status !== 'awaiting_difficulty_selection') {
         throw new Error(`Cannot choose difficulty from state ${state.status}.`);
       }
@@ -395,22 +348,21 @@ export class WorkflowService {
       return this.recordAcceptedTask(state, reply);
     }
 
-    if (parsed.kind === 'revise') {
-      if (state.status === 'awaiting_brief_confirmation') {
-        state = {
-          ...state,
-          status: 'briefing',
-          briefRevisionRequests: [...state.briefRevisionRequests, parsed.instruction],
-          lastDecision: reply,
-          updatedAt: new Date().toISOString(),
-        };
-        state = await this.store.appendArtifact(state, 'decision-log', `revise C (brief): ${parsed.instruction}`);
-        await this.store.saveState(state);
-        return this.planTask(state.taskId);
+    if (parsed.kind === 'restart') {
+      if (!['stopped', 'planning_requested', 'ready_for_decision', 'waiting_user_direction'].includes(state.status)) {
+        throw new Error(`Cannot restart planning from state ${state.status}.`);
       }
+      state = restartFromPlanningState(state, parsed.instruction, reply);
+      state = await this.store.appendArtifact(state, 'decision-log', `restart from planning:\n${parsed.instruction}`);
+      await this.store.saveState(state);
+      await this.refreshParentTaskReadme(state, 'User restarted planning with a new prompt.');
+      return this.planTask(state.taskId);
+    }
+
+    if (parsed.kind === 'revise') {
       if (state.status === 'awaiting_user_acceptance') {
         state = {
-          ...state,
+          ...withoutPendingPrompt(state),
           status: 'implementation_approved',
           requestedChanges: [...state.requestedChanges, parsed.instruction],
           userAcceptanceNotes: [...state.userAcceptanceNotes, `Revision requested: ${parsed.instruction}`],
@@ -440,25 +392,6 @@ export class WorkflowService {
     if (parsed.kind === 'approve') {
       if (state.status === 'awaiting_user_acceptance') {
         return this.recordAcceptedTask(state, reply);
-      }
-      if (state.status === 'awaiting_brief_confirmation') {
-        state = {
-          ...state,
-          status: 'planning_requested',
-          briefConfirmed: true,
-          lastDecision: reply,
-          updatedAt: new Date().toISOString(),
-        };
-        state = appendWorkflowInstruction(state, parsed.instruction);
-        state = withoutPendingPrompt(state);
-        state = await this.store.appendArtifact(
-          state,
-          'decision-log',
-          [`approve A (brief): ${reply}`, parsed.instruction ? `Instruction: ${parsed.instruction}` : undefined].filter(Boolean).join('\n'),
-        );
-        await this.store.saveState(state);
-        await this.refreshParentTaskReadme(state, 'Brief approved. Planning not finalized yet.');
-        return this.planTask(state.taskId);
       }
       if (state.status === 'implementation_approved') {
         return this.implementApproved(state.taskId);
@@ -592,7 +525,7 @@ export class WorkflowService {
     state = await this.store.writeArtifact(state, 'final-review', finalReview.markdown);
     await this.taskRecords.writeFinalReview(this.projectForState(state), state, finalReview.markdown);
 
-    const route = await this.manager.routeAfterFinalReview({
+    const route = await this.assistant.routeAfterFinalReview({
       finalReview: finalReview.markdown,
       verificationLog,
       state,
@@ -605,7 +538,7 @@ export class WorkflowService {
       state = {
         ...state,
         status: 'awaiting_user_acceptance',
-        pendingUserPrompt: "等你验收：直接说'验收通过'/'accept'即可生成 task-record。",
+        pendingUserPrompt: "等你验收：直接说 '验收通过' / 'accept' 即可生成 task-record。",
         updatedAt: new Date().toISOString(),
       };
       await this.store.saveState(state);
@@ -614,31 +547,35 @@ export class WorkflowService {
     }
 
     if (route.route === 'route_to_implementer') {
+      const reroutePrompt = renderFinalReviewImplementationReroutePrompt(route.reason);
       state = {
         ...state,
         status: 'implementation_approved',
-        pendingUserPrompt: route.reason,
+        requestedChanges: [...state.requestedChanges, renderFinalReviewImplementationChange(route.reason)],
+        pendingUserPrompt: reroutePrompt,
         updatedAt: new Date().toISOString(),
       };
+      state = await this.store.appendArtifact(state, 'decision-log', `final review routed to implementation:\n${route.reason}`);
       await this.store.saveState(state);
-      return { state, message: `Manager routed back to implementation: ${route.reason}` };
+      return { state, message: reroutePrompt };
     }
 
     if (route.route === 'route_to_planner') {
+      const planningChange = renderFinalReviewPlanningChange(route.reason);
       state = {
         ...state,
         status: 'planning_requested',
-        requestedChanges: [...state.requestedChanges, route.reason],
-        pendingUserPrompt: route.reason,
+        requestedChanges: [...state.requestedChanges, planningChange],
         updatedAt: new Date().toISOString(),
       };
+      state = await this.store.appendArtifact(state, 'decision-log', `final review routed to planning:\n${route.reason}`);
       await this.store.saveState(state);
-      return { state, message: `Manager routed back to planning: ${route.reason}` };
+      return this.planTask(state.taskId);
     }
 
-    state = await this.pauseForUserDirection(state, route.userPrompt ?? route.reason);
-    const prompt = route.userPrompt ? `${route.reason}\n${route.userPrompt}` : route.reason;
-    return { state, message: `Manager needs your decision: ${prompt}` };
+    const prompt = renderFinalReviewUserDirectionPrompt(route.reason, route.userPrompt);
+    state = await this.pauseForUserDirection(state, prompt);
+    return { state, message: prompt };
   }
 
   async showArtifact(taskIdOrLatest: string, artifact: ArtifactName): Promise<string> {
@@ -677,12 +614,12 @@ export class WorkflowService {
   private async writePlanMetadata(state: TaskState, plan: PlanResult): Promise<TaskState> {
     return this.store.appendArtifact(state, 'revised-plan', [
       '',
-      '<!-- manager-plan-metadata',
+      '<!-- assistant-plan-metadata',
       JSON.stringify({
         verificationCommands: plan.verificationCommands,
         planPackDraft: plan.planPackDraft,
       }, null, 2),
-      'manager-plan-metadata -->',
+      'assistant-plan-metadata -->',
     ].join('\n'));
   }
 
@@ -693,8 +630,7 @@ export class WorkflowService {
 
   private async writeAgentPromptPreview(state: TaskState): Promise<{ state: TaskState; content: string }> {
     const task = await this.store.readArtifact(state, 'original-task');
-    const brief = await this.store.readArtifact(state, 'manager-brief').catch(() => '(No manager brief artifact exists yet.)');
-    const projectContext = await this.buildProjectContext(state, [task, brief, state.requestedChanges.join('\n')].join('\n\n'));
+    const projectContext = await this.buildProjectContext(state, [task, state.requestedChanges.join('\n')].filter(Boolean).join('\n\n'));
     const difficulties: WorkflowDifficulty[] = state.difficulty ? [state.difficulty] : ['low', 'medium', 'high'];
     const sections = difficulties.flatMap((difficulty) => [
       `## Architect Prompt - ${difficulty}`,
@@ -702,7 +638,6 @@ export class WorkflowService {
       buildInitialPlanPrompt({
         task,
         projectContext,
-        brief,
         difficulty,
         state,
       }),
@@ -714,6 +649,11 @@ export class WorkflowService {
       state.difficulty
         ? `Current difficulty: ${state.difficulty}. This uses the same prompt builder as the real Architect call.`
         : 'Difficulty has not been selected yet. The exact Architect call depends on the chosen difficulty, so this preview shows all currently possible Architect prompts.',
+      '',
+      '## Planning Input Decision',
+      '',
+      'Planning input mode: authoritative original prompt',
+      'Reason: Assistant prompt rewriting is disabled. The Architect prompt always uses the original user prompt as the source of truth.',
       '',
       ...sections,
     ].join('\n');
@@ -730,7 +670,7 @@ export class WorkflowService {
     return requireProject(this.config, state.projectId ?? getDefaultProjectId(this.config));
   }
 
-  private configForState(state: TaskState): ManagerConfig {
+  private configForState(state: TaskState): AssistantConfig {
     return configForProject(this.config, this.projectForState(state));
   }
 
@@ -744,12 +684,11 @@ export class WorkflowService {
   private async buildContext(state: TaskState, includeProjectContext = true): Promise<string> {
     const names: ArtifactName[] = [
       'original-task',
-      'manager-brief',
       'initial-plan',
       'review',
       'revision-instructions',
       'revised-plan',
-      'manager-explanation',
+      'assistant-explanation',
       'qa-log',
       'decision-log',
     ];
@@ -792,8 +731,8 @@ export class WorkflowService {
       `Reviewer runs: ${state.reviewerRunCount}`,
     ];
     if (state.pendingUserPrompt) lines.push(`Pending user prompt: ${state.pendingUserPrompt}`);
-    if (state.artifacts['manager-explanation']) {
-      lines.push('', '## Latest Manager Explanation', await this.store.readArtifact(state, 'manager-explanation'));
+    if (state.artifacts['assistant-explanation']) {
+      lines.push('', '## Latest Assistant Explanation', await this.store.readArtifact(state, 'assistant-explanation'));
     }
     if (state.artifacts['final-report']) {
       lines.push('', '## Final Report', await this.store.readArtifact(state, 'final-report'));
@@ -925,8 +864,8 @@ export class WorkflowService {
       '',
       `Task: ${state.title}`,
       `Task ID: ${state.taskId}`,
-      `Manager final route: complete`,
-      `Manager reason: ${managerReason}`,
+      `Assistant final route: complete`,
+      `Assistant reason: ${managerReason}`,
       '',
       '## 本次 implementation 产生的 diff',
       '',
@@ -964,6 +903,8 @@ function renderAgentPromptRecord(record: AgentPromptRecord): string {
     `- Difficulty: ${record.difficulty}`,
     `- Profile: ${record.profileName}`,
     `- Profile kind: ${record.profileKind}`,
+    ...(record.model ? [`- Model: ${record.model}`] : []),
+    ...(record.effort ? [`- Effort: ${record.effort}`] : []),
     '',
     'Prompt sent via stdin:',
     '',
@@ -983,6 +924,7 @@ type ParsedWorkflowReply =
   | { kind: 'approve'; instruction?: string }
   | { kind: 'reject' }
   | { kind: 'revise'; instruction: string }
+  | { kind: 'restart'; instruction: string }
   | { kind: 'difficulty'; level: 'low' | 'medium' | 'high'; instruction?: string }
   | { kind: 'stop' }
   | { kind: 'status' }
@@ -1015,6 +957,17 @@ function parseWorkflowReply(input: string): ParsedWorkflowReply {
   const noteMatch = text.match(/^note\s*:\s*(.+)$/i);
   if (noteMatch?.[1]?.trim()) return { kind: 'note', note: noteMatch[1].trim() };
 
+  const restartMatch = text.match(/^(?:restart|redesign|rerun|start over|重新开始|重跑|从头跑|重新规划|重新设计|重启)\s*[:：]\s*(.+)$/i);
+  if (restartMatch?.[1]?.trim()) return { kind: 'restart', instruction: restartMatch[1].trim() };
+
+  if (/^(?:restart|redesign|rerun|start over|重新开始|重跑|从头跑|重新规划|重新设计|重启)$/i.test(text)) {
+    return {
+      kind: 'ambiguous',
+      reason: 'Restart replies must include the new prompt after a colon, for example: restart: use the production code path in the verification report.',
+      useLlmFallback: false,
+    };
+  }
+
   const reviseMatch = text.match(/^(?:revise\s+c|revise|c)\s*:\s*(.+)$/i);
   if (reviseMatch?.[1]?.trim()) return { kind: 'revise', instruction: reviseMatch[1].trim() };
 
@@ -1046,7 +999,7 @@ export function renderStatus(state: TaskState): string {
 function renderDifficultyPrompt(): string {
   return [
     'Choose workflow difficulty:',
-    '- low: simple copy, text, color, or tiny changes. Skips plan review and revision.',
+    '- low: simple copy, text, color, or tiny changes. Runs the initial Architect plan, copies it to revised-plan, and skips only plan review and revision instructions.',
     '- medium: default flow. Codex plans, Claude reviews, Codex revises.',
     '- high: complex or risky work. Claude plans/revises, Codex reviews the plan.',
     'Reply with exactly one of: low, medium, high.',
@@ -1081,8 +1034,61 @@ function appendWorkflowInstruction(state: TaskState, instruction?: string): Task
   };
 }
 
+function restartFromPlanningState(state: TaskState, instruction: string, reply: string): TaskState {
+  const {
+    acceptedAt: _acceptedAt,
+    approvedAt: _approvedAt,
+    currentExecutionIndex: _currentExecutionIndex,
+    executionMode: _executionMode,
+    pendingUserPrompt: _pendingUserPrompt,
+    planSummary: _planSummary,
+    stoppedReason: _stoppedReason,
+    ...rest
+  } = state;
+  return {
+    ...rest,
+    status: 'planning_requested',
+    revisionRound: 0,
+    reviewerRunCount: 0,
+    executionQueue: [],
+    requestedChanges: [...state.requestedChanges, `Restart/redesign prompt:\n${instruction}`],
+    lastDecision: reply,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function renderFinalReviewImplementationChange(reason: string): string {
+  const trimmed = reason.trim() || 'Final review found blocking implementation issues.';
+  return `Final review requested implementation follow-up:\n${trimmed}`;
+}
+
+function renderFinalReviewImplementationReroutePrompt(reason: string): string {
+  const trimmed = reason.trim() || 'Final review found blocking implementation issues.';
+  return [
+    'Final review 未通过：Assistant final review 发现刚才的系统实现结果仍有阻塞问题。',
+    `返工输入：${trimmed}`,
+    '这不是要求你手动改代码；问题已经加入实现返工清单。',
+    '如果继续由系统修复，请回复 approve A、yes 或「继续修复」；也可以回复 stop 暂停。',
+  ].join('\n');
+}
+
+function renderFinalReviewPlanningChange(reason: string): string {
+  const trimmed = reason.trim() || 'Final review found a plan or verification-design issue.';
+  return `Final review requested planning follow-up:\n${trimmed}`;
+}
+
+function renderFinalReviewUserDirectionPrompt(reason: string, userPrompt?: string): string {
+  const trimmedReason = reason.trim() || 'Final review needs a user decision before the workflow can continue.';
+  const trimmedPrompt = userPrompt?.trim();
+  return [
+    'Final review 未通过：Assistant final review 发现需要你决定的产品/范围问题。',
+    `原因：${trimmedReason}`,
+    trimmedPrompt ? `需要你确认：${trimmedPrompt}` : undefined,
+  ].filter(Boolean).join('\n');
+}
+
 function readPlanMetadata(revisedPlan: string): { verificationCommands: string[]; planPackDraft?: PlanResult['planPackDraft'] } {
-  const match = revisedPlan.match(/<!-- manager-plan-metadata\s*([\s\S]*?)\s*manager-plan-metadata -->/);
+  const match = revisedPlan.match(/<!-- assistant-plan-metadata\s*([\s\S]*?)\s*assistant-plan-metadata -->/);
   if (!match?.[1]) return { verificationCommands: [] };
   try {
     const payload = JSON.parse(match[1]) as { verificationCommands?: unknown; planPackDraft?: PlanResult['planPackDraft'] };
@@ -1099,7 +1105,7 @@ function readPlanMetadata(revisedPlan: string): { verificationCommands: string[]
 }
 
 function stripPlanMetadata(markdown: string): string {
-  return markdown.replace(/\n*<!-- manager-plan-metadata[\s\S]*?manager-plan-metadata -->\s*$/m, '').trim();
+  return markdown.replace(/\n*<!-- assistant-plan-metadata[\s\S]*?assistant-plan-metadata -->\s*$/m, '').trim();
 }
 
 function summarizePlan(markdown: string): string {

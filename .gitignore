@@ -3,5 +3,6 @@ dist
 coverage
 logs
 project-docs
-manager.config.local.json
+assistant.config.local.json
+assistant.projects.local.json
 *.log
