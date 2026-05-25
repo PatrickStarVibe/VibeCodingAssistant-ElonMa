@@ -13,7 +13,7 @@
 - 允许使用 bridge 的用户 open ID，以及可选的控制群 chat ID。
 - 想使用的 LLM provider 连接方式：API endpoint 或本地命令、模型名、profile 名称。
 - 每个 API key 在环境变量中的名字，例如 `<YOUR_API_KEY_ENV>`。
-- 各角色使用哪个 profile：`assistant`、`architect`、`planReviewer`、`developer`、`finalReviewer`，以及 `low` / `medium` / `high` 难度对应关系。
+- 各角色使用哪个 profile：`assistant`、`architect`、`planReviewer`、`developer`、`finalReviewer`，以及 `low` / `medium` / `high` / `extra high` 难度对应关系。
 
 ## 2. 复制 example config 到 local config
 
@@ -157,7 +157,7 @@ npm run assistant -- show --config assistant.config.local.json --task <TASK_ID> 
 
 ### Plan difficulty selection 之后
 
-第一次 `plan` 会停在难度选择。选择 `low`、`medium` 或 `high` 后，workflow 才会真正生成计划：
+第一次 `plan` 会停在难度选择。选择 `low`、`medium`、`high` 或 `extra high` 后，workflow 才会真正生成计划：
 
 ```powershell
 npm run assistant -- reply --config assistant.config.local.json --task <TASK_ID> "low"
@@ -227,6 +227,7 @@ Provider/profile setup:
 - low roles: architect=<PROFILE>, planReviewer=<PROFILE>, developer=<PROFILE>, finalReviewer=<PROFILE>
 - medium roles: architect=<PROFILE>, planReviewer=<PROFILE>, developer=<PROFILE>, finalReviewer=<PROFILE>
 - high roles: architect=<PROFILE>, planReviewer=<PROFILE>, developer=<PROFILE>, finalReviewer=<PROFILE>
+- extra-high roles: architect=<PROFILE>, planReviewer=<PROFILE>, developer=<PROFILE>, finalReviewer=<PROFILE>
 - API key env names: <YOUR_API_KEY_ENV>, <OTHER_KEY_ENV_IF_ANY>
 - provider command, if command-backed: <YOUR_PROVIDER_COMMAND>
 - model names, if API-backed: <YOUR_MODEL_NAME>

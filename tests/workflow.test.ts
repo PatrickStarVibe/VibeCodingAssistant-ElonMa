@@ -10,6 +10,7 @@ import { ArtifactStore } from '../src/artifacts.js';
 import type { HeavyAgentAdapter, AssistantAdapter } from '../src/adapters.js';
 import type {
   AgentPromptRecord,
+  AssistantTextResult,
   ControlChatResult,
   FinalReviewResult,
   IntentResult,
@@ -22,7 +23,7 @@ import type {
   WorkflowRoleName,
 } from '../src/types.js';
 import { createHeavyAgentAdapter } from '../src/adapters.js';
-import { WorkflowService, type WorkflowResult } from '../src/workflow.js';
+import { WorkflowService, isReviewerApproval, type WorkflowResult } from '../src/workflow.js';
 
 const execFileAsync = promisify(execFile);
 const gb18030Decoder = new TextDecoder('gb18030');
@@ -35,13 +36,16 @@ function simulateUtf8ReadAsGbk(value: string): string {
 class FakeAssistant implements AssistantAdapter {
   route: AssistantRouteResult = { route: 'complete', reason: 'No blocking issues.' };
   fallbackReply = 'Please reply with approve A, reject B, or revise C: ...';
+  createRevisionInstructionsRuns = 0;
+  revisionInstructionsMarkdown = 'Revise the plan using reviewer feedback and user-requested changes.';
 
   async decideNextAction(): Promise<OrchestratorDecision> {
     return { action: 'wait_for_user', reason: 'test fallback', confidence: 1 };
   }
 
   async createRevisionInstructions(): Promise<AssistantTextResult> {
-    return { markdown: 'Revise the plan using reviewer feedback and user-requested changes.', needsUserDecision: false };
+    this.createRevisionInstructionsRuns += 1;
+    return { markdown: this.revisionInstructionsMarkdown, needsUserDecision: false };
   }
 
   async explainRevisedPlan(): Promise<AssistantTextResult> {
@@ -88,7 +92,9 @@ class FakeAssistant implements AssistantAdapter {
 }
 
 class FakeHeavyAgents implements HeavyAgentAdapter {
+  createInitialPlanRuns = 0;
   reviewerRuns = 0;
+  revisePlanRuns = 0;
   implementRuns = 0;
   finalReviewRuns = 0;
   difficultyCalls: WorkflowDifficulty[] = [];
@@ -98,6 +104,9 @@ class FakeHeavyAgents implements HeavyAgentAdapter {
   implementationMarkdown = 'Implementation completed by fake adapter.';
   implementationWritePath?: string;
   planPackDraft?: PlanResult['planPackDraft'];
+  initialPlanResults: Array<Pick<PlanResult, 'markdown'> & Partial<Omit<PlanResult, 'markdown'>>> = [];
+  revisedPlanResults: Array<Pick<PlanResult, 'markdown'> & Partial<Omit<PlanResult, 'markdown'>>> = [];
+  reviewMarkdowns: string[] = [];
 
   private makePromptRecord(input: { state?: { taskId?: string; difficulty?: WorkflowDifficulty }; difficulty?: WorkflowDifficulty }, role: WorkflowRoleName, prompt: string): AgentPromptRecord {
     return {
@@ -114,32 +123,39 @@ class FakeHeavyAgents implements HeavyAgentAdapter {
   }
 
   async createInitialPlan(input: { difficulty: WorkflowDifficulty; projectContext: string; state: { taskId: string } }): Promise<PlanResult> {
+    const fixture = this.initialPlanResults[this.createInitialPlanRuns];
+    this.createInitialPlanRuns += 1;
     this.difficultyCalls.push(input.difficulty);
     this.initialPlanProjectContexts.push(input.projectContext);
+    const planPackDraft = fixture?.planPackDraft ?? this.planPackDraft;
     return {
-      markdown: '# Initial Plan\n\n- Build the workflow.\n\n## Verification Commands\n- npm test',
-      verificationCommands: ['npm test'],
-      ...(this.planPackDraft ? { planPackDraft: this.planPackDraft } : {}),
-      agentPrompt: this.makePromptRecord(input, 'architect', 'fake architect prompt'),
+      markdown: fixture?.markdown ?? '# Initial Plan\n\n- Build the workflow.\n\n## Verification Commands\n- npm test',
+      verificationCommands: fixture?.verificationCommands ?? ['npm test'],
+      ...(planPackDraft ? { planPackDraft } : {}),
+      agentPrompt: fixture?.agentPrompt ?? this.makePromptRecord(input, 'architect', 'fake architect prompt'),
     };
   }
 
   async reviewPlan(input: { difficulty: WorkflowDifficulty; state: { taskId: string } }): Promise<{ markdown: string; agentPrompt: AgentPromptRecord }> {
+    const markdown = this.reviewMarkdowns[this.reviewerRuns] ?? 'Reviewer says the plan should clarify artifact boundaries.';
     this.reviewerRuns += 1;
     this.difficultyCalls.push(input.difficulty);
     return {
-      markdown: 'Reviewer says the plan should clarify artifact boundaries.',
+      markdown,
       agentPrompt: this.makePromptRecord(input, 'planReviewer', 'fake plan reviewer prompt'),
     };
   }
 
   async revisePlan(input: { difficulty: WorkflowDifficulty; state: { taskId: string } }): Promise<PlanResult> {
+    const fixture = this.revisedPlanResults[this.revisePlanRuns];
+    this.revisePlanRuns += 1;
     this.difficultyCalls.push(input.difficulty);
+    const planPackDraft = fixture?.planPackDraft ?? this.planPackDraft;
     return {
-      markdown: '# Revised Plan\n\n- Build the workflow with explicit artifact boundaries.\n\n## Verification Commands\n- npm test\n- node unsafe.js',
-      verificationCommands: ['npm test', 'node unsafe.js'],
-      ...(this.planPackDraft ? { planPackDraft: this.planPackDraft } : {}),
-      agentPrompt: this.makePromptRecord(input, 'architect', 'fake revised architect prompt'),
+      markdown: fixture?.markdown ?? '# Revised Plan\n\n- Build the workflow with explicit artifact boundaries.\n\n## Verification Commands\n- npm test\n- node unsafe.js',
+      verificationCommands: fixture?.verificationCommands ?? ['npm test', 'node unsafe.js'],
+      ...(planPackDraft ? { planPackDraft } : {}),
+      agentPrompt: fixture?.agentPrompt ?? this.makePromptRecord(input, 'architect', 'fake revised architect prompt'),
     };
   }
 
@@ -586,7 +602,10 @@ describe('WorkflowService', () => {
 
   it.each([
     ['extra high', []],
+    ['extra-high', []],
+    ['Extra High', []],
     ['Extra-High', []],
+    ['extra high: do X', ['do X']],
     ['EXTRA_HIGH: keep the original prompt', ['keep the original prompt']],
   ])('canonicalizes %s to extra-high difficulty', async (reply, expectedChanges) => {
     const { root, targetDir, service } = await makeService();
@@ -641,6 +660,133 @@ describe('WorkflowService', () => {
     }
   });
 
+  it('extra-high exits after round 1 approval and preserves plan metadata', async () => {
+    const { root, targetDir, service, assistant, heavy } = await makeService();
+    try {
+      heavy.initialPlanResults = [{
+        markdown: '# Extra Plan Round 1\n\n- Build carefully.\n\n## Verification Commands\n- npm test',
+        verificationCommands: ['npm test'],
+      }];
+      heavy.reviewMarkdowns = ['No blocking issues.'];
+
+      const created = await service.createTask({ title: 'Extra high approved task', task: 'Build a careful feature.' });
+      const planned = await planThroughDifficulty(service, created.state.taskId, 'extra-high');
+
+      expect(planned.state.status).toBe('ready_for_decision');
+      expect(planned.state.difficulty).toBe('extra-high');
+      expect(planned.state.reviewerRunCount).toBe(1);
+      expect(heavy.createInitialPlanRuns).toBe(1);
+      expect(heavy.reviewerRuns).toBe(1);
+      expect(heavy.revisePlanRuns).toBe(0);
+      expect(assistant.createRevisionInstructionsRuns).toBe(0);
+
+      const log = await service.showArtifact(planned.state.taskId, 'plan-rounds-log');
+      expect(log.match(/## Round /g)).toHaveLength(1);
+      expect(log).toContain('verdict: approved');
+      expect(log).toContain('revision-instructions: n/a');
+
+      const revisedPlan = await service.showArtifact(planned.state.taskId, 'revised-plan');
+      expect(revisedPlan.replace(/\n\n<!-- assistant-plan-metadata[\s\S]*$/, '')).toBe(heavy.initialPlanResults[0].markdown);
+      expect(revisedPlan).toContain('"verificationCommands"');
+      expect(revisedPlan).toContain('"npm test"');
+      await expect(service.showArtifact(planned.state.taskId, 'revision-instructions')).rejects.toThrow();
+    } finally {
+      await cleanup([root, targetDir]);
+    }
+  });
+
+  it('extra-high revises once and exits when round 2 is approved', async () => {
+    const { root, targetDir, service, assistant, heavy } = await makeService();
+    try {
+      assistant.revisionInstructionsMarkdown = 'Clarify artifact boundaries before the next review.';
+      heavy.initialPlanResults = [{
+        markdown: '# Extra Plan Round 1\n\n- Initial approach.',
+        verificationCommands: ['npm test'],
+      }];
+      heavy.revisedPlanResults = [{
+        markdown: '# Extra Plan Round 2\n\n- Clarified artifact boundaries.',
+        verificationCommands: ['npm test', 'npm run build'],
+      }];
+      heavy.reviewMarkdowns = [
+        'Must fix: artifact boundaries are unclear.',
+        'Approved.',
+      ];
+
+      const created = await service.createTask({ title: 'Extra high round two task', task: 'Build a careful feature.' });
+      const planned = await planThroughDifficulty(service, created.state.taskId, 'extra-high');
+
+      expect(planned.state.status).toBe('ready_for_decision');
+      expect(planned.state.reviewerRunCount).toBe(2);
+      expect(heavy.createInitialPlanRuns).toBe(1);
+      expect(heavy.reviewerRuns).toBe(2);
+      expect(heavy.revisePlanRuns).toBe(1);
+      expect(assistant.createRevisionInstructionsRuns).toBe(1);
+
+      const log = await service.showArtifact(planned.state.taskId, 'plan-rounds-log');
+      expect(log.match(/## Round /g)).toHaveLength(2);
+      expect(log).toContain('verdict: revision_requested');
+      expect(log).toContain('revision-instructions: Clarify artifact boundaries before the next review.');
+      expect(log).toContain('verdict: approved');
+
+      const revisedPlan = await service.showArtifact(planned.state.taskId, 'revised-plan');
+      expect(revisedPlan.replace(/\n\n<!-- assistant-plan-metadata[\s\S]*$/, '')).toBe(heavy.revisedPlanResults[0].markdown);
+      expect(revisedPlan).toContain('"npm run build"');
+    } finally {
+      await cleanup([root, targetDir]);
+    }
+  });
+
+  it('extra-high stops at the 3-round cap and records outstanding reviewer concerns', async () => {
+    const { root, targetDir, service, assistant, heavy } = await makeService();
+    try {
+      heavy.initialPlanResults = [{
+        markdown: '# Extra Plan Round 1\n\n- Initial approach.',
+        verificationCommands: ['npm test'],
+      }];
+      heavy.revisedPlanResults = [
+        {
+          markdown: '# Extra Plan Round 2\n\n- First revision.',
+          verificationCommands: ['npm test'],
+        },
+        {
+          markdown: '# Extra Plan Round 3\n\n- Latest capped plan.',
+          verificationCommands: ['npm test', 'npm run build'],
+        },
+      ];
+      heavy.reviewMarkdowns = [
+        'Must fix: missing migration path.',
+        'Blocking issue: verification is underspecified.',
+        'Approved with blockers: final review handoff remains unclear.',
+      ];
+
+      const created = await service.createTask({ title: 'Extra high capped task', task: 'Build a careful feature.' });
+      const planned = await planThroughDifficulty(service, created.state.taskId, 'extra-high');
+
+      expect(planned.state.status).toBe('ready_for_decision');
+      expect(planned.state.reviewerRunCount).toBe(3);
+      expect(heavy.createInitialPlanRuns).toBe(1);
+      expect(heavy.reviewerRuns).toBe(3);
+      expect(heavy.revisePlanRuns).toBe(2);
+      expect(assistant.createRevisionInstructionsRuns).toBe(2);
+
+      const log = await service.showArtifact(planned.state.taskId, 'plan-rounds-log');
+      expect(log.match(/## Round /g)).toHaveLength(3);
+      expect(log).toContain('verdict: issues_remain');
+      expect(log).toContain('## Outstanding Reviewer Concerns');
+      expect(log).toContain('Approved with blockers: final review handoff remains unclear.');
+
+      const decisionLog = await service.showArtifact(planned.state.taskId, 'decision-log');
+      expect(decisionLog).toContain('extra-high planning hit 3-round cap');
+
+      const revisedPlan = await service.showArtifact(planned.state.taskId, 'revised-plan');
+      expect(revisedPlan).toMatch(/^> Note: Reviewer still flagged issues at round 3/);
+      expect(revisedPlan).toContain('# Extra Plan Round 3');
+      expect(revisedPlan).toContain('"npm run build"');
+    } finally {
+      await cleanup([root, targetDir]);
+    }
+  });
+
   it('stops from the difficulty gate', async () => {
     const { root, targetDir, service } = await makeService();
     try {
@@ -657,5 +803,20 @@ describe('WorkflowService', () => {
   it('defaults heavy agents to stubs unless agent calls are explicitly enabled', () => {
     expect(createHeavyAgentAdapter(makeConfig(process.cwd()), false).constructor.name).toBe('StubHeavyAgentAdapter');
     expect(createHeavyAgentAdapter(makeConfig(process.cwd()), true).constructor.name).not.toBe('StubHeavyAgentAdapter');
+  });
+});
+
+describe('isReviewerApproval', () => {
+  it.each([
+    ['No blocking issues.', true],
+    ['LGTM', true],
+    ['Approved.', true],
+    ['Looks good, but must fix X', false],
+    ['Approved with blockers', false],
+    ['没有阻塞问题', true],
+    ['', false],
+    ['   ', false],
+  ])('classifies %s as %s', (markdown, expected) => {
+    expect(isReviewerApproval(markdown)).toBe(expected);
   });
 });

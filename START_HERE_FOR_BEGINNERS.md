@@ -228,7 +228,7 @@ npm run assistant -- show --config assistant.config.local.json --task <TASK_ID> 
 
 In the preview, check that `Target workspace` points to your project path, not the Manager repo path unless Manager itself is the project you are testing.
 
-When the task asks for difficulty, reply with one of `low`, `medium`, or `high`:
+When the task asks for difficulty, reply with one of `low`, `medium`, `high`, or `extra high`:
 
 ```powershell
 npm run assistant -- reply --config assistant.config.local.json --task <TASK_ID> "low"

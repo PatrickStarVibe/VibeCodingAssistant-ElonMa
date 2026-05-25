@@ -7,7 +7,7 @@
 | Task ID | 20260525-180600-extra-high-difficulty-plan |
 | Title | 新增 extra high difficulty 档位及多轮 Plan 打磨机制 |
 | Category | Assistant / Workflow |
-| Status | execution_unit_implementing |
+| Status | completed |
 | Execution Mode | decomposed |
 
 ## Original Request
@@ -22,15 +22,15 @@ Category: Assistant / Workflow
 
 ## Queue Summary
 
-Implementing execution unit 2/3.
+All execution units are done.
 
 ## Subtask Status
 
 | Subtask | Status |
 |---|---|
 | [01 - Type, config, parser, and prompt foundation](subtasks/01-type-config-parser-and-prompt-foundation.md) | Done |
-| [02 - Multi-round Planner ↔ Reviewer loop in `WorkflowService.planTask`](subtasks/02-multi-round-planner-reviewer-loop-in-wor.md) | In Progress |
-| [03 - Tests, prompt-routing tests, and documentation](subtasks/03-tests-prompt-routing-tests-and-documenta.md) | Not Started |
+| [02 - Multi-round Planner ↔ Reviewer loop in `WorkflowService.planTask`](subtasks/02-multi-round-planner-reviewer-loop-in-wor.md) | Done |
+| [03 - Tests, prompt-routing tests, and documentation](subtasks/03-tests-prompt-routing-tests-and-documenta.md) | Done |
 
 ## Token Usage
 
@@ -46,12 +46,12 @@ See `test-build-log.md` and subtask Test Result sections.
 
 ## Final Review Status
 
-Pending
+Final review recorded.
 
 ## User Acceptance Status
 
-Pending
+Accepted at 2026-05-25T18:56:24.527Z.
 
 ## Final Completion Status
 
-Pending
+Completed.

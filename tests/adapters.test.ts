@@ -333,6 +333,31 @@ describe('OpenAICompatibleAssistantAdapter', () => {
     });
   });
 
+  it.each([
+    'extra high',
+    'extra-high',
+    'Extra High',
+    'EXTRA_HIGH',
+  ])('canonicalizes orchestrator difficulty %s to extra-high', async (difficulty) => {
+    stubChatContent(JSON.stringify({
+      action: 'forward_to_workflow',
+      intent: 'difficulty',
+      difficulty,
+      instruction: 'do X',
+      confidence: 0.91,
+    }));
+    const adapter = makeAssistantAdapter();
+
+    const result = await adapter.decideNextAction(makeDecisionInput());
+
+    expect(result).toMatchObject({
+      action: 'forward_to_workflow',
+      intent: 'difficulty',
+      difficulty: 'extra-high',
+      instruction: 'do X',
+    });
+  });
+
   it('falls back safely when orchestrator decision JSON is invalid', async () => {
     stubChatContent('not-json');
     const adapter = makeAssistantAdapter();
@@ -372,6 +397,9 @@ describe('OpenAICompatibleAssistantAdapter', () => {
       ?.map((tool) => tool.function?.name);
     expect(toolNames).toEqual(expect.arrayContaining(['choose_difficulty', 'show_status', 'list_projects']));
     expect(toolNames).not.toContain('add_project');
+    const tools = requestBody?.tools as Array<{ function?: { name?: string; parameters?: { properties?: { difficulty?: { enum?: string[] } } } } }> | undefined;
+    const chooseDifficultyTool = tools?.find((tool) => tool.function?.name === 'choose_difficulty');
+    expect(chooseDifficultyTool?.function?.parameters?.properties?.difficulty?.enum).toContain('extra-high');
     expect(result).toEqual({
       kind: 'tool_call',
       toolCall: {

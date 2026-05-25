@@ -200,6 +200,36 @@ describe('orchestrator', () => {
     }
   });
 
+  it('dispatches an extra-high difficulty choice through the orchestrator path', async () => {
+    const harness = await makeHarness();
+    try {
+      const difficulty = await createAwaitingDifficulty(harness);
+      harness.assistant.decisions.push({
+        action: 'forward_to_workflow',
+        intent: 'difficulty',
+        difficulty: 'extra-high',
+        confidence: 0.95,
+      });
+
+      const turn = await orchestrateTaskMessage({
+        taskId: difficulty.state.taskId,
+        state: difficulty.state,
+        userMessage: 'extra high',
+        ruleHint: { intent: 'difficulty', reply: 'extra high' },
+      }, harness);
+
+      expect(turn.kind).toBe('background');
+      if (turn.kind !== 'background') return;
+      const result = await turn.run();
+
+      expect(result.state.status).toBe('ready_for_decision');
+      expect(result.state.difficulty).toBe('extra-high');
+      expect(result.state.reviewerRunCount).toBe(3);
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
   it('approves implementation only from a ready plan with high confidence', async () => {
     const harness = await makeHarness();
     try {

@@ -35,6 +35,30 @@ export interface WorkflowResult {
   message: string;
 }
 
+const MAX_EXTRA_HIGH_PLANNING_ROUNDS = 3;
+const EXTRA_HIGH_APPROVED_REVISION_INSTRUCTIONS = 'n/a — approved';
+const EXTRA_HIGH_CAP_REVISION_INSTRUCTIONS = 'n/a — round 3 cap with issues remaining';
+const EXTRA_HIGH_CAP_NOTE = '> Note: Reviewer still flagged issues at round 3 — see plan-rounds-log.md.';
+
+type ExtraHighCompletedLoopResult = {
+  state: TaskState;
+  finalPlan: PlanResult;
+  finalReview: string;
+  finalRevisionInstructions: string;
+  rounds: number;
+  capHitWithIssues: boolean;
+};
+
+type ExtraHighPausedLoopResult = {
+  state: TaskState;
+  paused: true;
+  message: string;
+};
+
+type ExtraHighLoopResult = ExtraHighCompletedLoopResult | ExtraHighPausedLoopResult;
+
+type PlanRoundVerdict = 'approved' | 'revision_requested' | 'issues_remain';
+
 export class WorkflowService {
   constructor(
     private readonly store: ArtifactStore,
@@ -108,6 +132,33 @@ export class WorkflowService {
     await this.store.saveState(state);
 
     const projectContext = await this.buildProjectContext(state, [task, state.requestedChanges.join('\n')].filter(Boolean).join('\n\n'));
+
+    if (difficulty === 'extra-high') {
+      const loop = await this.runExtraHighPlanningLoop(state, task, projectContext, scopedConfig);
+      if ('paused' in loop) return { state: loop.state, message: loop.message };
+
+      state = loop.state;
+      state = await this.writePlanMetadata(state, loop.finalPlan);
+
+      const explanation = await this.assistant.explainRevisedPlan({
+        task,
+        projectContext,
+        revisedPlan: loop.finalPlan.markdown,
+        review: loop.finalReview,
+        revisionInstructions: loop.finalRevisionInstructions,
+        state,
+        config: scopedConfig,
+      });
+      state = await this.store.writeArtifact(state, 'assistant-explanation', explanation.markdown);
+      if (explanation.needsUserDecision) {
+        state = await this.pauseForUserDirection(state, explanation.userPrompt ?? explanation.markdown);
+        return { state, message: 'Assistant Elon Ma explanation needs a product-level decision.' };
+      }
+
+      state = { ...withoutPendingPrompt(state), status: 'ready_for_decision', updatedAt: new Date().toISOString() };
+      await this.store.saveState(state);
+      return { state, message: 'Revised plan is ready for your decision.' };
+    }
 
     const initialPlan = await this.heavyAgents.createInitialPlan({
       task,
@@ -652,6 +703,150 @@ export class WorkflowService {
     return this.renderTaskUsage(await this.store.loadState(taskIdOrLatest), by);
   }
 
+  private async runExtraHighPlanningLoop(
+    state: TaskState,
+    task: string,
+    projectContext: string,
+    scopedConfig: AssistantConfig,
+  ): Promise<ExtraHighLoopResult> {
+    let currentPlan = await this.heavyAgents.createInitialPlan({
+      task,
+      projectContext,
+      difficulty: 'extra-high',
+      state,
+      config: scopedConfig,
+    });
+    state = await this.appendAgentPrompt(state, currentPlan.agentPrompt);
+    state = await this.store.writeArtifact(state, 'initial-plan', currentPlan.markdown);
+
+    let currentReview = '';
+    let currentRevisionInstructions = '';
+
+    for (let round = 1; round <= MAX_EXTRA_HIGH_PLANNING_ROUNDS; round += 1) {
+      if (round > 1) {
+        currentPlan = await this.heavyAgents.revisePlan({
+          task,
+          projectContext,
+          initialPlan: currentPlan.markdown,
+          review: currentReview,
+          revisionInstructions: currentRevisionInstructions,
+          difficulty: 'extra-high',
+          state,
+          config: scopedConfig,
+        });
+        state = await this.appendAgentPrompt(state, currentPlan.agentPrompt);
+        state = await this.store.writeArtifact(state, 'initial-plan', currentPlan.markdown);
+      }
+
+      const review = await this.heavyAgents.reviewPlan({
+        task,
+        projectContext,
+        initialPlan: currentPlan.markdown,
+        difficulty: 'extra-high',
+        state,
+        config: scopedConfig,
+      });
+      currentReview = review.markdown;
+      state = await this.appendAgentPrompt(state, review.agentPrompt);
+      state = {
+        ...await this.store.writeArtifact(state, 'review', currentReview),
+        reviewerRunCount: state.reviewerRunCount + 1,
+      };
+
+      if (isReviewerApproval(currentReview)) {
+        const finalRevisionInstructions = EXTRA_HIGH_APPROVED_REVISION_INSTRUCTIONS;
+        state = await this.appendPlanRoundLog(state, {
+          round,
+          planMarkdown: currentPlan.markdown,
+          reviewMarkdown: currentReview,
+          verdict: 'approved',
+          revisionInstructions: finalRevisionInstructions,
+        });
+        state = await this.store.writeArtifact(state, 'revised-plan', currentPlan.markdown);
+        return {
+          state,
+          finalPlan: currentPlan,
+          finalReview: currentReview,
+          finalRevisionInstructions,
+          rounds: round,
+          capHitWithIssues: false,
+        };
+      }
+
+      if (round === MAX_EXTRA_HIGH_PLANNING_ROUNDS) {
+        const finalRevisionInstructions = EXTRA_HIGH_CAP_REVISION_INSTRUCTIONS;
+        state = await this.appendPlanRoundLog(state, {
+          round,
+          planMarkdown: currentPlan.markdown,
+          reviewMarkdown: currentReview,
+          verdict: 'issues_remain',
+          revisionInstructions: finalRevisionInstructions,
+        });
+        state = await this.store.appendArtifact(state, 'plan-rounds-log', [
+          '## Outstanding Reviewer Concerns',
+          '',
+          currentReview,
+        ].join('\n'));
+        state = await this.store.appendArtifact(
+          state,
+          'decision-log',
+          'extra-high planning hit 3-round cap; outstanding reviewer concerns recorded in plan-rounds-log.md',
+        );
+        const finalPlan = {
+          ...currentPlan,
+          markdown: [EXTRA_HIGH_CAP_NOTE, '', currentPlan.markdown].join('\n'),
+        };
+        state = await this.store.writeArtifact(state, 'revised-plan', finalPlan.markdown);
+        return {
+          state,
+          finalPlan,
+          finalReview: currentReview,
+          finalRevisionInstructions,
+          rounds: round,
+          capHitWithIssues: true,
+        };
+      }
+
+      const revisionInstructions = await this.assistant.createRevisionInstructions({
+        task,
+        projectContext,
+        initialPlan: currentPlan.markdown,
+        review: currentReview,
+        requestedChanges: state.requestedChanges,
+        state,
+        config: scopedConfig,
+      });
+      currentRevisionInstructions = revisionInstructions.markdown;
+      state = await this.store.writeArtifact(state, 'revision-instructions', currentRevisionInstructions);
+      state = await this.appendPlanRoundLog(state, {
+        round,
+        planMarkdown: currentPlan.markdown,
+        reviewMarkdown: currentReview,
+        verdict: 'revision_requested',
+        revisionInstructions: currentRevisionInstructions,
+      });
+      if (revisionInstructions.needsUserDecision) {
+        state = await this.pauseForUserDirection(state, revisionInstructions.userPrompt ?? revisionInstructions.markdown);
+        return { state, paused: true, message: 'Assistant Elon Ma needs a product-level decision before the plan can be revised.' };
+      }
+    }
+
+    throw new Error('extra-high planning loop exited without a final plan.');
+  }
+
+  private async appendPlanRoundLog(
+    state: TaskState,
+    input: {
+      round: number;
+      planMarkdown: string;
+      reviewMarkdown: string;
+      verdict: PlanRoundVerdict;
+      revisionInstructions: string;
+    },
+  ): Promise<TaskState> {
+    return this.store.appendArtifact(state, 'plan-rounds-log', renderPlanRoundLogEntry(input));
+  }
+
   private async pauseForUserDirection(state: TaskState, prompt: string): Promise<TaskState> {
     const next = {
       ...state,
@@ -971,6 +1166,50 @@ function markdownFence(content: string): string {
   const runs = content.match(/`{3,}/g) ?? [];
   const longest = runs.reduce((max, run) => Math.max(max, run.length), 2);
   return '`'.repeat(longest + 1);
+}
+
+function renderPlanRoundLogEntry(input: {
+  round: number;
+  planMarkdown: string;
+  reviewMarkdown: string;
+  verdict: PlanRoundVerdict;
+  revisionInstructions: string;
+}): string {
+  const revisionInstructions = input.revisionInstructions.trim() || 'n/a';
+  return [
+    `## Round ${input.round}`,
+    '',
+    `verdict: ${input.verdict}`,
+    `revision-instructions: ${revisionInstructions}`,
+    '',
+    '### Planner Output',
+    '',
+    input.planMarkdown,
+    '',
+    '### Reviewer Output',
+    '',
+    input.reviewMarkdown,
+    '',
+    '### Revision Instructions',
+    '',
+    revisionInstructions,
+  ].join('\n');
+}
+
+export function isReviewerApproval(markdown: string): boolean {
+  const text = markdown.toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!text) return false;
+
+  const stripped = text
+    .replace(/no\s+blocking\s+issues?/g, ' ')
+    .replace(/no\s+blockers?/g, ' ')
+    .replace(/no\s+must[-\s]?fix/g, ' ');
+
+  const blockerRe = /\b(must[-\s]?fix|blockers?|blocking issues?)\b/;
+  if (blockerRe.test(stripped)) return false;
+
+  const approvalRe = /(no blocking issues?|no blockers?|no issues?|approved|looks good|lgtm|no further (comments|changes)|通过|没有?问题|没有?阻塞|无阻塞|批准)/;
+  return approvalRe.test(text);
 }
 
 type ParsedWorkflowReply =
