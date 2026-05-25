@@ -1,7 +1,11 @@
 import { basename } from 'node:path';
 
 import type { ArtifactStore } from './artifacts.js';
-import type { AssistantAdapter } from './adapters.js';
+import {
+  bridgeToolNamesForInput,
+  bridgeToolNamesForTaskStatus,
+  type AssistantAdapter,
+} from './adapters.js';
 import { addProjectToRegistry, type AddProjectInput } from './projectRegistry.js';
 import { getDefaultProjectId, renderProjectList, requireProject } from './projects.js';
 import type { ProjectKnowledgeService } from './projectKnowledge.js';
@@ -13,6 +17,7 @@ import type {
   BridgeChatSummary,
   BridgeRetrievedMemory,
   BridgeToolCall,
+  BridgeToolName,
   BridgeLiveProcessSnapshot,
   AssistantConfig,
   TaskState,
@@ -52,6 +57,34 @@ export interface BridgeAgentRequest {
 }
 
 type LiveProcessProvider = (taskId: string) => BridgeLiveProcessSnapshot[];
+type ToolStateCheck = { ok: true } | { ok: false; reason: string };
+type NoOpState = Pick<TaskState, 'status'>;
+
+const FAKE_STATE_CLAIM_PATTERN = /已记录|已推进|已启动|已停止|已进入验收|已验收|已批准|已通过|已接受|已反馈给.*?(workflow|工作流)|我会推进|我会反馈给.*?(workflow|工作流)|工作流.*?已|流程.*?已推进|已经推进|帮你推进/;
+
+const BRIDGE_TOOL_USER_LABELS: Record<BridgeToolName, string> = {
+  reply_to_user: '普通对话回复（reply_to_user，不推进 workflow）',
+  create_task: '创建新 task（create_task）',
+  choose_difficulty: '选择工作难度（choose_difficulty）',
+  approve_plan: '批准计划并启动实现（approve_plan）',
+  accept_task: '验收当前 task（accept_task）',
+  answer_user_direction: '回答 pending 问题（answer_user_direction）',
+  revise_plan: '要求修改计划或返工（revise_plan）',
+  stop_task: '停止当前 task（stop_task）',
+  ask_task_question: '围绕当前 task 提问（ask_task_question）',
+  show_status: '查看当前 task 状态（show_status）',
+  show_artifact: '查看 task artifact（show_artifact）',
+  switch_project: '切换默认项目（switch_project）',
+  add_project: '添加本地项目（add_project）',
+  list_projects: '列出项目（list_projects）',
+  schedule_task_to_project_chat: '派发 task 到 Project Chat（schedule_task_to_project_chat）',
+  create_project_chat: '创建 Project Chat（create_project_chat）',
+  create_new_task_from_task_chat: '从当前 task chat 新建后续 task（create_new_task_from_task_chat）',
+};
+
+export function isFakeStateClaim(text: string): boolean {
+  return FAKE_STATE_CLAIM_PATTERN.test(text);
+}
 
 export type BridgeAgentTurn =
   | {
@@ -120,9 +153,9 @@ export class BridgeAgentService {
     }));
 
     if (decision.kind === 'reply') {
-      return this.reply(decision.text);
+      return this.replyGuarded(input, decision.text);
     }
-    return this.executeTool(request, decision.toolCall);
+    return this.executeTool(request, input, decision.toolCall);
   }
 
   async stopTask(taskId: string): Promise<BridgeAgentTurn> {
@@ -215,11 +248,11 @@ export class BridgeAgentService {
     }
   }
 
-  private async executeTool(request: BridgeAgentRequest, toolCall: BridgeToolCall): Promise<BridgeAgentTurn> {
+  private async executeTool(request: BridgeAgentRequest, input: BridgeAgentInput, toolCall: BridgeToolCall): Promise<BridgeAgentTurn> {
     try {
       switch (toolCall.name) {
         case 'reply_to_user':
-          return this.reply(requiredString(toolCall, 'text'));
+          return this.replyGuarded(input, requiredString(toolCall, 'text'));
         case 'create_task':
           return await this.createTask(request, toolCall, false);
         case 'create_new_task_from_task_chat':
@@ -229,17 +262,59 @@ export class BridgeAgentService {
         case 'create_project_chat':
           return this.requestProjectChatCreation(toolCall);
         case 'choose_difficulty': {
+          const taskId = this.resolveTaskId(request, toolCall);
+          const state = await this.store.loadState(taskId);
+          const allowed = this.assertToolAllowedForState(toolCall.name, state);
+          if (!allowed.ok) {
+            return this.replyNoOp({
+              state,
+              input,
+              intendedAction: describeIntendedToolAction(toolCall.name),
+              reason: allowed.reason,
+              auditAction: 'guard:state-mismatch',
+            });
+          }
           const difficulty = requiredDifficulty(toolCall);
           return this.workflowBackground(request, toolCall, 'planning', (taskId) => {
             return this.workflow.reply(taskId, instructionReply(difficulty, optionalString(toolCall, 'instruction')));
           });
         }
-        case 'approve_plan':
+        case 'approve_plan': {
+          const taskId = this.resolveTaskId(request, toolCall);
+          const state = await this.store.loadState(taskId);
+          if (state.status === 'waiting_user_direction') {
+            return this.answerUserDirection(taskId, optionalString(toolCall, 'instruction') ?? request.text);
+          }
+          const allowed = this.assertToolAllowedForState(toolCall.name, state);
+          if (!allowed.ok) {
+            return this.replyNoOp({
+              state,
+              input,
+              intendedAction: describeIntendedToolAction(toolCall.name),
+              reason: allowed.reason,
+              auditAction: 'guard:state-mismatch',
+            });
+          }
           return this.workflowBackground(request, toolCall, 'implementing', (taskId) => (
             this.workflow.reply(taskId, instructionReply('approve A', optionalString(toolCall, 'instruction')))
           ));
+        }
         case 'accept_task': {
           const taskId = this.resolveTaskId(request, toolCall);
+          const state = await this.store.loadState(taskId);
+          if (state.status === 'waiting_user_direction') {
+            return this.answerUserDirection(taskId, optionalString(toolCall, 'instruction') ?? request.text);
+          }
+          const allowed = this.assertToolAllowedForState(toolCall.name, state);
+          if (!allowed.ok) {
+            return this.replyNoOp({
+              state,
+              input,
+              intendedAction: describeIntendedToolAction(toolCall.name),
+              reason: allowed.reason,
+              auditAction: 'guard:state-mismatch',
+            });
+          }
           const result = await this.workflow.reply(taskId, instructionReply('accept', optionalString(toolCall, 'instruction')));
           return {
             kind: 'reply',
@@ -249,8 +324,47 @@ export class BridgeAgentService {
             messages: [this.workflowMessage(result)],
           };
         }
+        case 'answer_user_direction': {
+          const taskId = this.resolveTaskId(request, toolCall);
+          const state = await this.store.loadState(taskId);
+          const allowed = this.assertToolAllowedForState(toolCall.name, state);
+          if (!allowed.ok) {
+            return this.replyNoOp({
+              state,
+              input,
+              intendedAction: describeIntendedToolAction(toolCall.name),
+              reason: allowed.reason,
+              auditAction: 'guard:state-mismatch',
+            });
+          }
+          return this.answerUserDirection(taskId, requiredString(toolCall, 'answer'));
+        }
         case 'revise_plan': {
+          const taskId = this.resolveTaskId(request, toolCall);
+          const state = await this.store.loadState(taskId);
+          if (state.status === 'waiting_user_direction') {
+            return this.answerUserDirection(taskId, optionalString(toolCall, 'instruction') ?? request.text);
+          }
+          const allowed = this.assertToolAllowedForState(toolCall.name, state);
+          if (!allowed.ok) {
+            return this.replyNoOp({
+              state,
+              input,
+              intendedAction: describeIntendedToolAction(toolCall.name),
+              reason: allowed.reason,
+              auditAction: 'guard:state-mismatch',
+            });
+          }
           const instruction = requiredString(toolCall, 'instruction');
+          if (state.status === 'awaiting_user_acceptance') {
+            const result = await this.workflow.reply(taskId, `revise C: ${instruction}`);
+            return {
+              kind: 'reply',
+              ...(result.state.projectId ? { activeProjectId: result.state.projectId } : {}),
+              auditAction: 'tool:revise_plan',
+              messages: [this.workflowMessage(result)],
+            };
+          }
           return this.workflowBackground(request, toolCall, 'replanning', (taskId) => (
             this.workflow.reply(taskId, `revise C: ${instruction}`)
           ));
@@ -281,6 +395,86 @@ export class BridgeAgentService {
     } catch (error) {
       return this.reply(`这个动作没有执行：${errorMessage(error)}`);
     }
+  }
+
+  private async answerUserDirection(taskId: string, answer: string): Promise<BridgeAgentTurn> {
+    const result = await this.workflow.answerUserDirection(taskId, answer);
+    return {
+      kind: 'reply',
+      ...(result.state.projectId ? { activeProjectId: result.state.projectId } : {}),
+      auditAction: 'tool:answer_user_direction',
+      messages: [this.workflowMessage(result)],
+    };
+  }
+
+  private replyGuarded(input: BridgeAgentInput, text: string): BridgeAgentTurn {
+    if (!isFakeStateClaim(text)) return this.reply(text);
+    return this.replyNoOp({
+      state: input.task,
+      input,
+      intendedAction: inferFakeClaimIntent(text),
+      reason: '没有调用 workflow 工具',
+      auditAction: 'guard:fake-claim',
+    });
+  }
+
+  private replyNoOp(options: {
+    state?: NoOpState;
+    input?: BridgeAgentInput;
+    intendedAction: string;
+    reason: string;
+    auditAction: 'guard:state-mismatch' | 'guard:no-tool' | 'guard:fake-claim';
+  }): BridgeAgentTurn {
+    const toolNames = options.state
+      ? bridgeToolNamesForTaskStatus(options.state.status)
+      : bridgeToolNamesForInput(options.input);
+    const actionLines = [...toolNames].map((toolName) => `- ${BRIDGE_TOOL_USER_LABELS[toolName]}`);
+    const scopeLine = options.state
+      ? `当前阶段（${options.state.status}）下你可以：`
+      : '当前可用操作：';
+    // Guard-rejected model text is intentionally not echoed to the user; the raw assistant decision
+    // is still available through the normal decision logging path.
+    return {
+      kind: 'reply',
+      auditAction: options.auditAction,
+      messages: [{
+        text: [
+          '我没有调用任何 workflow 工具，所以 workflow 实际上没有变化（未推进 workflow）。',
+          `原本想做的：${options.intendedAction}`,
+          `不能执行的原因：${options.reason}`,
+          scopeLine,
+          ...actionLines,
+        ].join('\n'),
+      }],
+    };
+  }
+
+  private assertToolAllowedForState(toolName: BridgeToolName, state: NoOpState): ToolStateCheck {
+    let allowedStatuses: TaskState['status'][] | undefined;
+    switch (toolName) {
+      case 'choose_difficulty':
+        allowedStatuses = ['created', 'awaiting_difficulty_selection'];
+        break;
+      case 'approve_plan':
+        allowedStatuses = ['ready_for_decision'];
+        break;
+      case 'accept_task':
+        allowedStatuses = ['awaiting_user_acceptance'];
+        break;
+      case 'answer_user_direction':
+        allowedStatuses = ['waiting_user_direction'];
+        break;
+      case 'revise_plan':
+        allowedStatuses = ['ready_for_decision', 'waiting_user_direction', 'awaiting_user_acceptance'];
+        break;
+      default:
+        return { ok: true };
+    }
+    if (allowedStatuses.includes(state.status)) return { ok: true };
+    return {
+      ok: false,
+      reason: `当前 task 状态是 ${state.status}，这个 workflow 动作只能在 ${allowedStatuses.join(', ')} 阶段使用。`,
+    };
   }
 
   private async createTask(request: BridgeAgentRequest, toolCall: BridgeToolCall, fromTaskChat: boolean): Promise<BridgeAgentTurn> {
@@ -664,8 +858,9 @@ function bridgeNextStep(status: TaskState['status'], missingBackgroundWorker = f
     case 'created':
       return '下一步：选 low / medium / high。你也可以问我为什么要选难度。';
     case 'ready_for_decision':
-    case 'waiting_user_direction':
       return '下一步：如果计划没问题，可以说 approve；如果要改，直接说改哪里。';
+    case 'waiting_user_direction':
+      return '下一步：回答上面的待决定问题（answer_user_direction）。如果还需要时间或要补充信息，可以先继续提问。';
     case 'awaiting_user_acceptance':
       return '下一步：如果结果没问题，可以说 task recording / accept；如果还要改，直接说要改哪里。';
     case 'completed':
@@ -758,6 +953,33 @@ function isArtifactName(value: string): value is ArtifactName {
 
 function instructionReply(base: string, instruction?: string): string {
   return instruction ? `${base}: ${instruction}` : base;
+}
+
+function describeIntendedToolAction(toolName: BridgeToolName): string {
+  switch (toolName) {
+    case 'choose_difficulty':
+      return '选择工作难度并开始规划';
+    case 'approve_plan':
+      return '批准计划并启动实现';
+    case 'accept_task':
+      return '验收当前 task';
+    case 'answer_user_direction':
+      return '提交用户对 pending 问题的回答';
+    case 'revise_plan':
+      return '要求修改计划或返工';
+    default:
+      return BRIDGE_TOOL_USER_LABELS[toolName];
+  }
+}
+
+function inferFakeClaimIntent(text: string): string {
+  if (/已停止/.test(text)) return '停止当前 task';
+  if (/已进入验收|已验收|已接受/.test(text)) return '验收当前 task 或进入验收阶段';
+  if (/已批准|已通过/.test(text)) return '批准计划或验收结果';
+  if (/已启动/.test(text)) return '启动后台 workflow';
+  if (/已记录|已反馈给.*?(workflow|工作流)/.test(text)) return '记录用户选择并反馈给 workflow';
+  if (/我会推进|流程.*?已推进|已经推进|帮你推进|已推进/.test(text)) return '推进 workflow';
+  return '执行一个会改变 workflow 状态的动作';
 }
 
 function makeTitle(text: string): string {

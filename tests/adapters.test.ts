@@ -5,8 +5,10 @@ import {
   buildClaudeProfileArgs,
   buildCodexProfileArgs,
   buildInitialPlanPrompt,
+  codexSandboxForWorkflowRole,
   createAssistantAdapter,
   createHeavyAgentAdapter,
+  extractPlanPackDraft,
 } from '../src/adapters.js';
 import { normalizeConfig } from '../src/config.js';
 import type { AgentProfileConfig, BridgeAgentInput, AssistantConfig, OrchestratorDecisionInput } from '../src/types.js';
@@ -219,6 +221,54 @@ describe('OpenAICompatibleAssistantAdapter', () => {
     expect(prompt).toContain('User workflow directives and requested changes');
     expect(prompt).toContain('Use the original user prompt verbatim');
     expect(prompt).toContain('follow the user workflow directives');
+    expect(prompt).toContain('## Execution Unit 01: <name>');
+  });
+
+  it('extracts execution units from parseable headings and bold headings', () => {
+    expect(extractPlanPackDraft([
+      'Category: Assistant / Workflow',
+      '',
+      '## Execution Unit 01: Config cleanup',
+      'Update config files.',
+      '',
+      '**Execution Unit 02: Documentation links**',
+      'Update docs.',
+    ].join('\n'))).toMatchObject({
+      category: 'Assistant / Workflow',
+      executionUnits: [
+        { name: 'Config cleanup' },
+        { name: 'Documentation links' },
+      ],
+    });
+  });
+
+  it('extracts execution units from the numbered-list format older planner output used', () => {
+    expect(extractPlanPackDraft([
+      'Category: Docs / Task Record',
+      '',
+      'Parent Task: Add provider-agnostic beginner onboarding and AI agent setup documentation.',
+      '',
+      'Execution units:',
+      '',
+      '1. Create `START_HERE_FOR_BEGINNERS.md`',
+      '   - Explain prerequisites.',
+      '',
+      '2. Create `docs/agent-setup-guide.md`',
+      '   - State permission boundaries.',
+      '',
+      '3. Update cross-links only',
+      '   - Avoid duplicated sections.',
+      '',
+      'Acceptance criteria:',
+      '- Provider-agnostic wording throughout.',
+    ].join('\n'))).toMatchObject({
+      category: 'Docs / Task Record',
+      executionUnits: [
+        { name: 'Create `START_HERE_FOR_BEGINNERS.md`' },
+        { name: 'Create `docs/agent-setup-guide.md`' },
+        { name: 'Update cross-links only' },
+      ],
+    });
   });
 
   it('builds Codex CLI args from profile model and effort', () => {
@@ -235,6 +285,13 @@ describe('OpenAICompatibleAssistantAdapter', () => {
       model: 'claude-opus-4-7',
       effort: 'high',
     })).toEqual(['--model', 'claude-opus-4-7', '--effort', 'high']);
+  });
+
+  it('lets Codex-backed final reviewers rerun verification commands without giving write access to planners', () => {
+    expect(codexSandboxForWorkflowRole('developer')).toBe('danger-full-access');
+    expect(codexSandboxForWorkflowRole('finalReviewer')).toBe('workspace-write');
+    expect(codexSandboxForWorkflowRole('architect')).toBe('read-only');
+    expect(codexSandboxForWorkflowRole('planReviewer')).toBe('read-only');
   });
 
   it('parses orchestrator decisions from chat JSON mode', async () => {
@@ -334,6 +391,31 @@ describe('OpenAICompatibleAssistantAdapter', () => {
       ?.map((tool) => tool.function?.name);
     expect(toolNames).toEqual(expect.arrayContaining(['schedule_task_to_project_chat', 'create_project_chat', 'add_project', 'list_projects']));
     expect(toolNames).not.toContain('show_status');
+  });
+
+  it('only exposes user-direction tools while waiting for a pending user decision', async () => {
+    let requestBody: Record<string, unknown> | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      requestBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: 'ok' } }],
+      }), { status: 200 });
+    }));
+    const adapter = makeAssistantAdapter();
+    const input = makeBridgeInput();
+    input.latestUserMessage = '1';
+    if (!input.task) throw new Error('Expected task fixture.');
+    input.task.status = 'waiting_user_direction';
+    input.task.pendingUserPrompt = 'Options: 1) Accept current worktree. 2) Revert unrelated files.';
+
+    await adapter.decideBridgeAction(input);
+
+    const toolNames = (requestBody?.tools as Array<{ function?: { name?: string } }> | undefined)
+      ?.map((tool) => tool.function?.name);
+    expect(toolNames).toEqual(expect.arrayContaining(['answer_user_direction', 'stop_task', 'show_status']));
+    expect(toolNames).not.toContain('accept_task');
+    expect(toolNames).not.toContain('approve_plan');
+    expect(toolNames).not.toContain('revise_plan');
   });
 
   it('parses bridge assistant text when no tool is called', async () => {

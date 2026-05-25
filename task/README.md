@@ -12,6 +12,10 @@ New assistant task folders include a `token-usage.json` file for machine-readabl
 |---|---|---|---|---|---|
 | [Provider-agnostic 配置层整理](20260525-042725-provider-agnostic/README.md) | Other | created | Pending | Pending | 2026-05-25T04:27:25.193Z |
 | [Provider-agnostic 配置层整理 (low)](20260525-044247-provider-agnostic-low/README.md) | Assistant / Workflow | execution_unit_implementing | single | Category: Assistant / Workflow | 2026-05-25T05:12:41.232Z |
-| [Provider-agnostic 配置层整理 (low)](20260525-161044-provider-agnostic-low/README.md) | Other | implemented | single | **Parent Task**<br>Provider-agnostic 配置层整理 | 2026-05-25T16:21:03.330Z |
-| [为 Manager 项目新增 setup README](20260525-162237-manager-setup-readme/README.md) | Other | created | Pending | Pending | 2026-05-25T16:22:37.836Z |
+| [Provider-agnostic 配置层整理 (low)](20260525-161044-provider-agnostic-low/README.md) | Other | awaiting_user_acceptance | single | **Parent Task**<br>Provider-agnostic 配置层整理 | 2026-05-25T16:25:51.672Z |
+| [为 Manager 项目新增 setup README](20260525-162237-manager-setup-readme/README.md) | Other | completed | single | **Category:** Docs / Task Record | 2026-05-25T17:23:04.222Z |
+| [新增小白 onboarding 文档和 AI agent 配置指南](20260525-172317-onboarding-ai-agent/README.md) | Docs / Task Record | implemented | single | Category: Docs / Task Record | 2026-05-25T17:30:35.698Z |
+| [修复 Assistant Elon Ma / Lark bridge 动作执行契约](20260525-172200-assistant-elon-ma-lark-bridge/README.md) | Other | execution_unit_implementing | single | Assistant / Workflow | 2026-05-25T17:51:21.485Z |
+| [修复 Assistant Elon Ma / Lark bridge 动作执行契约](20260525-175810-assistant-elon-ma-lark-bridge/README.md) | Other | created | Pending | Pending | 2026-05-25T17:58:10.337Z |
+| [新增 extra high difficulty 档位及多轮 Plan 打磨机制](20260525-180600-extra-high-difficulty-plan/README.md) | Other | created | Pending | Pending | 2026-05-25T18:06:00.775Z |
 <!-- assistant-task-records:end -->

@@ -79,6 +79,7 @@ export type BridgeToolName =
   | 'choose_difficulty'
   | 'approve_plan'
   | 'accept_task'
+  | 'answer_user_direction'
   | 'revise_plan'
   | 'stop_task'
   | 'ask_task_question'

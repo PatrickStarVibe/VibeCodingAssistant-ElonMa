@@ -416,6 +416,57 @@ export class WorkflowService {
     return { state, message: 'No action taken.' };
   }
 
+  async answerUserDirection(taskIdOrLatest: string, answer: string): Promise<WorkflowResult> {
+    let state = await this.store.loadState(taskIdOrLatest);
+    const trimmed = answer.trim();
+    if (!trimmed) {
+      throw new Error('Cannot answer user direction with an empty reply.');
+    }
+    if (state.status !== 'waiting_user_direction') {
+      throw new Error(`Cannot answer user direction from state ${state.status}.`);
+    }
+
+    const decision = `user direction: ${trimmed}`;
+    if (isFinalReviewUserDirection(state)) {
+      if (isAcceptCurrentWorktreeDirection(trimmed)) {
+        state = {
+          ...withoutPendingPrompt(state),
+          status: 'awaiting_user_acceptance',
+          lastDecision: decision,
+          updatedAt: new Date().toISOString(),
+        };
+        state = await this.store.appendArtifact(state, 'decision-log', decision);
+        await this.store.saveState(state);
+        await this.refreshParentTaskReadme(state, 'User direction accepted final review scope; awaiting user acceptance.');
+        return { state, message: "已记录你的选择：接受当前工作区现状。现在进入验收阶段；直接说 '验收通过' / 'accept' 即可生成 task-record。" };
+      }
+
+      const continuePrompt = '已记录你的方向。如果要系统按这个方向继续处理，请回复 approve A、yes 或「继续修复」；也可以回复 stop 暂停。';
+      state = {
+        ...withoutPendingPrompt(state),
+        status: 'implementation_approved',
+        requestedChanges: [...state.requestedChanges, `User direction after final review:\n${trimmed}`],
+        lastDecision: decision,
+        pendingUserPrompt: continuePrompt,
+        updatedAt: new Date().toISOString(),
+      };
+      state = await this.store.appendArtifact(state, 'decision-log', decision);
+      await this.store.saveState(state);
+      return { state, message: continuePrompt };
+    }
+
+    state = {
+      ...withoutPendingPrompt(state),
+      status: 'planning_requested',
+      requestedChanges: [...state.requestedChanges, `User direction:\n${trimmed}`],
+      lastDecision: decision,
+      updatedAt: new Date().toISOString(),
+    };
+    state = await this.store.appendArtifact(state, 'decision-log', decision);
+    await this.store.saveState(state);
+    return this.planTask(state.taskId);
+  }
+
   async implementApproved(taskIdOrLatest: string): Promise<WorkflowResult> {
     let state = await this.store.loadState(taskIdOrLatest);
     if (state.status !== 'implementation_approved') {
@@ -1023,6 +1074,21 @@ function renderOriginalTask(title: string, task: string): string {
 function withoutPendingPrompt(state: TaskState): TaskState {
   const { pendingUserPrompt: _pendingUserPrompt, ...rest } = state;
   return rest;
+}
+
+function isFinalReviewUserDirection(state: TaskState): boolean {
+  return state.lastDecision === 'ask_user_direction' && Boolean(state.artifacts['final-review']);
+}
+
+function isAcceptCurrentWorktreeDirection(answer: string): boolean {
+  const normalized = answer.trim().toLocaleLowerCase();
+  return /^(?:1|option\s*1|选项\s*1|一)$/.test(normalized)
+    || normalized.includes('接受现状')
+    || normalized.includes('接受当前')
+    || normalized.includes('accept current')
+    || normalized.includes('as-is')
+    || normalized.includes('不用回退')
+    || normalized.includes('不需要回退');
 }
 
 function appendWorkflowInstruction(state: TaskState, instruction?: string): TaskState {

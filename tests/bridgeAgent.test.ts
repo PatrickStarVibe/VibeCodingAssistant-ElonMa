@@ -279,6 +279,69 @@ describe('BridgeAgentService', () => {
     }
   });
 
+  it('answers final-review user direction instead of treating option 1 as task acceptance', async () => {
+    const harness = await makeHarness();
+    try {
+      const created = await harness.workflow.createTask({ title: 'Direction task', task: 'Update docs.' });
+      let state = await harness.store.writeArtifact(created.state, 'final-review', 'Options: 1) Accept current worktree as-is. 2) Revert unrelated files.');
+      state = {
+        ...state,
+        status: 'waiting_user_direction',
+        difficulty: 'low',
+        lastDecision: 'ask_user_direction',
+        pendingUserPrompt: 'Options: 1) Accept current worktree as-is. 2) Revert unrelated files.',
+        updatedAt: new Date().toISOString(),
+      };
+      await harness.store.saveState(state);
+      harness.assistant.decisions.push({ kind: 'tool_call', toolCall: { name: 'answer_user_direction', arguments: { answer: '1' } } });
+
+      const turn = await harness.agent.handleMessage({
+        chatId: 'task-chat',
+        senderOpenId: 'user-open-id',
+        text: '1',
+        ...activeTaskChat(state.taskId),
+      });
+
+      expect(turn.kind).toBe('reply');
+      const next = await harness.store.loadState(state.taskId);
+      expect(next.status).toBe('awaiting_user_acceptance');
+      expect(next.pendingUserPrompt).toBeUndefined();
+      expect(next.lastDecision).toBe('user direction: 1');
+      expect(await harness.store.readArtifact(next, 'decision-log')).toContain('user direction: 1');
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('routes stale accept_task tool calls to user-direction handling while waiting for direction', async () => {
+    const harness = await makeHarness();
+    try {
+      const created = await harness.workflow.createTask({ title: 'Fallback direction task', task: 'Update docs.' });
+      let state = await harness.store.writeArtifact(created.state, 'final-review', 'Options: 1) Accept current worktree as-is. 2) Revert unrelated files.');
+      state = {
+        ...state,
+        status: 'waiting_user_direction',
+        difficulty: 'low',
+        lastDecision: 'ask_user_direction',
+        pendingUserPrompt: 'Options: 1) Accept current worktree as-is. 2) Revert unrelated files.',
+        updatedAt: new Date().toISOString(),
+      };
+      await harness.store.saveState(state);
+      harness.assistant.decisions.push({ kind: 'tool_call', toolCall: { name: 'accept_task', arguments: {} } });
+
+      await harness.agent.handleMessage({
+        chatId: 'task-chat',
+        senderOpenId: 'user-open-id',
+        text: '1',
+        ...activeTaskChat(state.taskId),
+      });
+
+      expect((await harness.store.loadState(state.taskId)).status).toBe('awaiting_user_acceptance');
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
   it('renders awaiting acceptance status without saying the plan still needs approval', async () => {
     const harness = await makeHarness();
     try {

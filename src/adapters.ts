@@ -243,6 +243,7 @@ const BRIDGE_TOOL_NAMES = new Set<BridgeToolName>([
   'choose_difficulty',
   'approve_plan',
   'accept_task',
+  'answer_user_direction',
   'revise_plan',
   'stop_task',
   'ask_task_question',
@@ -273,12 +274,72 @@ const IDLE_PROJECT_CHAT_TOOL_NAMES = new Set<BridgeToolName>([
   'list_projects',
 ]);
 
-const ACTIVE_PROJECT_CHAT_TOOL_NAMES = new Set<BridgeToolName>([
+const DIFFICULTY_GATE_TOOL_NAMES = new Set<BridgeToolName>([
   'reply_to_user',
   'choose_difficulty',
+  'stop_task',
+  'ask_task_question',
+  'show_status',
+  'show_artifact',
+  'list_projects',
+]);
+
+const READY_FOR_DECISION_TOOL_NAMES = new Set<BridgeToolName>([
+  'reply_to_user',
   'approve_plan',
+  'revise_plan',
+  'stop_task',
+  'ask_task_question',
+  'show_status',
+  'show_artifact',
+  'list_projects',
+]);
+
+const IMPLEMENTATION_APPROVED_TOOL_NAMES = new Set<BridgeToolName>([
+  'reply_to_user',
+  'stop_task',
+  'ask_task_question',
+  'show_status',
+  'show_artifact',
+  'list_projects',
+]);
+
+const AWAITING_USER_ACCEPTANCE_TOOL_NAMES = new Set<BridgeToolName>([
+  'reply_to_user',
   'accept_task',
   'revise_plan',
+  'stop_task',
+  'ask_task_question',
+  'show_status',
+  'show_artifact',
+  'list_projects',
+]);
+
+const WAITING_USER_DIRECTION_TOOL_NAMES = new Set<BridgeToolName>([
+  'reply_to_user',
+  'answer_user_direction',
+  'stop_task',
+  'ask_task_question',
+  'show_status',
+  'show_artifact',
+  'list_projects',
+]);
+
+const IN_FLIGHT_TASK_TOOL_NAMES = new Set<BridgeToolName>([
+  'reply_to_user',
+  'stop_task',
+  'ask_task_question',
+  'show_status',
+  'show_artifact',
+  'list_projects',
+]);
+
+const TERMINAL_TASK_TOOL_NAMES = new Set<BridgeToolName>(
+  [...IN_FLIGHT_TASK_TOOL_NAMES].filter((toolName) => toolName !== 'stop_task'),
+);
+
+const BOUND_TASK_FALLBACK_TOOL_NAMES = new Set<BridgeToolName>([
+  'reply_to_user',
   'stop_task',
   'ask_task_question',
   'show_status',
@@ -457,6 +518,17 @@ function bridgeTools(input?: BridgeAgentInput): ChatCompletionTool[] {
     {
       type: 'function',
       function: {
+        name: 'answer_user_direction',
+        description: '回答当前 task 正在等待的用户方向/选项确认。只用于 waiting_user_direction 阶段；不要用 accept_task 或 revise_plan 代替。',
+        parameters: object({
+          taskId: string('可选 task id；缺省时使用当前绑定 task。'),
+          answer: string('用户对 pendingUserPrompt 的回答，保留选项号和关键理由。'),
+        }, ['answer']),
+      },
+    },
+    {
+      type: 'function',
+      function: {
         name: 'revise_plan',
         description: '按用户意见修改计划并重新规划。',
         parameters: object({
@@ -575,13 +647,46 @@ function bridgeTools(input?: BridgeAgentInput): ChatCompletionTool[] {
   ] as ChatCompletionTool[]).filter((tool) => availableToolNames.has(tool.function.name as BridgeToolName));
 }
 
-function bridgeToolNamesForInput(input?: BridgeAgentInput): Set<BridgeToolName> {
-  if (!input) return BRIDGE_TOOL_NAMES;
-  if (input.chat.boundTaskId && input.chat.chatKind !== 'control') return ACTIVE_PROJECT_CHAT_TOOL_NAMES;
-  if (input.chat.chatKind === 'project') {
-    return input.chat.boundTaskId ? ACTIVE_PROJECT_CHAT_TOOL_NAMES : IDLE_PROJECT_CHAT_TOOL_NAMES;
+export function bridgeToolNamesForTaskStatus(status: TaskState['status']): Set<BridgeToolName> {
+  switch (status) {
+    case 'created':
+    case 'awaiting_difficulty_selection':
+      return DIFFICULTY_GATE_TOOL_NAMES;
+    case 'ready_for_decision':
+      return READY_FOR_DECISION_TOOL_NAMES;
+    case 'implementation_approved':
+      return IMPLEMENTATION_APPROVED_TOOL_NAMES;
+    case 'awaiting_user_acceptance':
+      return AWAITING_USER_ACCEPTANCE_TOOL_NAMES;
+    case 'waiting_user_direction':
+      return WAITING_USER_DIRECTION_TOOL_NAMES;
+    case 'completed':
+    case 'stopped':
+      return TERMINAL_TASK_TOOL_NAMES;
+    case 'planning_requested':
+    case 'planning':
+    case 'task_artifacts_persisting':
+    case 'execution_queue_ready':
+    case 'implementing':
+    case 'execution_unit_implementing':
+    case 'execution_unit_testing':
+    case 'execution_unit_result_recording':
+    case 'next_execution_unit_or_all_done':
+    case 'implemented':
+    case 'final_reviewing':
+    case 'final_review_routing':
+    case 'task_recording':
+      return IN_FLIGHT_TASK_TOOL_NAMES;
   }
-  return CONTROL_BRIDGE_TOOL_NAMES;
+}
+
+export function bridgeToolNamesForInput(input?: BridgeAgentInput): Set<BridgeToolName> {
+  if (!input) return BRIDGE_TOOL_NAMES;
+  if (input.chat.chatKind === 'control') return CONTROL_BRIDGE_TOOL_NAMES;
+  if (input.task?.status) return bridgeToolNamesForTaskStatus(input.task.status);
+  if (input.chat.boundTaskId) return BOUND_TASK_FALLBACK_TOOL_NAMES;
+  if (input.chat.chatKind === 'project') return IDLE_PROJECT_CHAT_TOOL_NAMES;
+  return BRIDGE_TOOL_NAMES;
 }
 
 function renderBridgeUserPrompt(input: BridgeAgentInput): string {
@@ -829,6 +934,9 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
           'There are two chat kinds. Control/Private Chat handles normal conversation, project management, and task scheduling. Project Chat is a long-lived group bound to one project; it may be idle or may have one active task.',
           'When a Project Chat is idle, normal conversation should use reply_to_user and a clear task prompt should use create_task in the same group.',
           'When a Project Chat has an active task, use only the active-task workflow tools that are available. Do not start a second task in that group.',
+          'If you do not call a tool, your text MUST NOT claim that anything was recorded, advanced, accepted, approved, stopped, started, routed, or fed back to the workflow. Plain replies are explanation, translation, Q&A, or clarification only.',
+          'If the user asks for an action that has no available tool in the current state, do not pretend to do it. Say plainly that you cannot execute it, name what you would have done, and list the available tools for the current state.',
+          'When task.status is waiting_user_direction, answer the pendingUserPrompt with answer_user_direction. Never use approve_plan, accept_task, or revise_plan to acknowledge a numbered choice; those tools are not even available in this state.',
           'When Control/Private Chat receives a task prompt, identify the project. If the project is unclear, ask a short clarification question. If the project is clear, use schedule_task_to_project_chat so Manager can place it into an idle Project Chat.',
           'If every Project Chat for a clear project is busy, explain that and ask whether to create a new Project Chat; do not auto-create one without user confirmation.',
           'Use create_project_chat only after the user asks for a new Project Chat or confirms that they want one.',
@@ -1211,6 +1319,8 @@ export function buildInitialPlanPrompt(input: {
   return [
     'Act as the Architect. Create an initial implementation plan. Do not edit files.',
     'Every approved plan is one parent task. If decomposition is useful, describe execution units; otherwise treat it as one execution unit.',
+    'When you decompose, format each execution unit as its own Markdown heading exactly like: "## Execution Unit 01: <name>".',
+    'Do not use only a numbered list under "Execution units" for decomposed plans; Manager can read the heading format reliably.',
     'Suggest exactly one lightweight Category if obvious. Supported categories are: Reader Core, Selection / Popup, Vocabulary Algorithm, Translation / LLM, Feedback / User Model, Storage / Persistence, Backend / API, Data / Dictionary Pipeline, Evaluation / Benchmark, Assistant / Workflow, Docs / Task Record, UI / Frontend, Other.',
     'Do not create category folders or tags.',
     `Workflow difficulty: ${input.difficulty}`,
@@ -1261,6 +1371,12 @@ function requireProfileCommand(
   throw new Error(`Workflow role ${role} uses profile "${profileName}", but profiles.${profileName}.command is missing.`);
 }
 
+export function codexSandboxForWorkflowRole(role: HeavyWorkflowRoleName): 'danger-full-access' | 'workspace-write' | 'read-only' {
+  if (role === 'developer') return 'danger-full-access';
+  if (role === 'finalReviewer') return 'workspace-write';
+  return 'read-only';
+}
+
 class CliHeavyAgentAdapter implements HeavyAgentAdapter {
   constructor(private readonly config: AssistantConfig) {}
 
@@ -1273,7 +1389,7 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
     config = this.config,
   ): Promise<string> {
     const command = requireProfileCommand(profileName, role, profile);
-    const sandbox = role === 'developer' ? 'danger-full-access' : 'read-only';
+    const sandbox = codexSandboxForWorkflowRole(role);
     const outputDir = await mkdtemp(join(tmpdir(), 'assistant-codex-'));
     const outputPath = join(outputDir, 'last-message.md');
     try {
@@ -1437,6 +1553,8 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
     const prompt = [
       'Act as the Architect. Create the revised plan. Do not edit files.',
       'Every approved plan is one parent task. If decomposition is useful, describe execution units; otherwise treat it as one execution unit.',
+      'When you decompose, format each execution unit as its own Markdown heading exactly like: "## Execution Unit 01: <name>".',
+      'Do not use only a numbered list under "Execution units" for decomposed plans; Manager can read the heading format reliably.',
       'Suggest exactly one lightweight Category if obvious. Use Other when unsure. Do not create category folders or tags.',
       `Workflow difficulty: ${input.difficulty}`,
       `Project context:\n${input.projectContext}`,
@@ -1495,6 +1613,7 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
     const difficulty = input.state.difficulty ?? 'medium';
     const prompt = [
       'Act as the Final Reviewer. Review the whole parent task after all execution units are implemented. Do not review every subtask separately by default. Report blocking issues first.',
+      'Do not edit files. Re-run the relevant verification commands yourself when practical, especially npm test and npm run build when they are part of the plan or verification log. If you cannot rerun a command, say so explicitly.',
       `Project context:\n${input.projectContext}`,
       `Task:\n${input.task}`,
       `Approved revised plan:\n${input.revisedPlan}`,
@@ -1522,17 +1641,49 @@ export function extractPlanPackDraft(markdown: string): PlanPackDraft {
   const category = markdown.match(/^\s*(?:Category|Task Category)\s*:\s*(.+?)\s*$/im)?.[1]
     ?? markdown.match(/^\|\s*Category\s*\|\s*(.+?)\s*\|/im)?.[1];
   const summary = sectionBody(markdown, 'Plan Summary') ?? firstNonHeadingParagraph(markdown);
-  const taskHeadings = [...markdown.matchAll(/^#{1,4}\s+Task\s+\d{1,2}\s*:\s*(.+?)\s*$/gim)];
-  const unitHeadings = taskHeadings.length > 0
-    ? taskHeadings
-    : [...markdown.matchAll(/^#{1,4}\s+Execution Unit\s+\d{1,2}\s*:\s*(.+?)\s*$/gim)];
+  const executionUnits = extractExecutionUnitDrafts(markdown);
   return {
     ...(category ? { category: category.trim() } : {}),
     ...(summary ? { summary: summary.trim() } : {}),
-    ...(unitHeadings.length > 0
-      ? { executionUnits: unitHeadings.map((match) => ({ name: match[1]?.trim() ?? 'Main' })) }
+    ...(executionUnits.length > 0
+      ? { executionUnits }
       : {}),
   };
+}
+
+function extractExecutionUnitDrafts(markdown: string): Array<{ name: string }> {
+  const headingUnits = [...markdown.matchAll(/^\s*(?:#{1,4}\s*)?(?:\*\*)?(?:Task|Execution Unit)\s+\d{1,2}\s*:\s*(.+?)(?:\*\*)?\s*$/gim)]
+    .map((match) => cleanExecutionUnitName(match[1]))
+    .filter((name) => name.length > 0);
+  if (headingUnits.length > 0) return headingUnits.map((name) => ({ name }));
+
+  const lines = markdown.split(/\r?\n/);
+  const unitsHeaderIndex = lines.findIndex((line) => /^\s*(?:#{1,6}\s*)?(?:\*\*)?Execution units?(?:\*\*)?\s*:?\s*$/i.test(line));
+  if (unitsHeaderIndex < 0) return [];
+
+  const names: string[] = [];
+  for (const line of lines.slice(unitsHeaderIndex + 1)) {
+    if (names.length > 0 && isPlanSectionBoundary(line)) break;
+
+    const listMatch = line.match(/^\s{0,3}\d{1,2}[.)]\s+(.+?)\s*$/);
+    if (listMatch) {
+      const name = cleanExecutionUnitName(listMatch[1]);
+      if (name) names.push(name);
+      continue;
+    }
+
+    if (names.length === 0 && line.trim().length > 0) break;
+  }
+  return names.map((name) => ({ name }));
+}
+
+function cleanExecutionUnitName(value: string | undefined): string {
+  return (value ?? '').replace(/\*\*$/u, '').trim();
+}
+
+function isPlanSectionBoundary(line: string): boolean {
+  return /^\s*#{1,6}\s+\S/u.test(line)
+    || /^\s*(?:\*\*)?(?:Acceptance Criteria|Verification Commands|Test Plan|Plan Summary|Category|Parent Task)\b/i.test(line);
 }
 
 function sectionBody(markdown: string, heading: string): string | undefined {
