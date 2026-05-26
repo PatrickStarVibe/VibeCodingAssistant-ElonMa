@@ -72,16 +72,56 @@ class FakeAssistant implements AssistantAdapter {
 }
 
 class FakeHeavyAgents implements HeavyAgentAdapter {
+  reviewerRuns = 0;
+
   async createInitialPlan(input: { difficulty: WorkflowDifficulty }): Promise<PlanResult> {
     return { markdown: `plan ${input.difficulty}`, verificationCommands: [] };
   }
 
-  async reviewPlan(): Promise<ReviewResult> {
-    return { markdown: 'review' };
+  async reviewPlan(input: { difficulty: WorkflowDifficulty }): Promise<ReviewResult> {
+    this.reviewerRuns += 1;
+    if (input.difficulty === 'extra-high') {
+      if (this.reviewerRuns > 1) {
+        return {
+          markdown: 'review still open',
+          reviewerBlockerOutput: {
+            blockers: [],
+            previousVerdicts: [{ id: 'B1', verdict: 'still_open', reason: 'Verification is still not strong enough.' }],
+          },
+        };
+      }
+      return {
+        markdown: 'review',
+        reviewerBlockerOutput: {
+          blockers: [{
+            id: 'B1',
+            severity: 'blocker',
+            category: 'test',
+            title: 'Verification missing',
+            detail: 'Plan does not define verification.',
+            verifyHint: 'Architect should add verification commands.',
+          }],
+          previousVerdicts: [],
+        },
+      };
+    }
+    return {
+      markdown: 'review',
+      ...(input.difficulty === 'high' ? { reviewerBlockerOutput: { blockers: [], previousVerdicts: [] } } : {}),
+    };
   }
 
   async revisePlan(): Promise<PlanResult> {
-    return { markdown: 'revised', verificationCommands: [] };
+    return {
+      markdown: 'revised',
+      verificationCommands: [],
+      architectBlockerResponses: [{
+        id: 'B1',
+        status: 'addressed',
+        summary: 'Added verification commands.',
+        planAnchor: '## Verification',
+      }],
+    };
   }
 
   async implement(): Promise<ImplementationResult> {
@@ -222,9 +262,10 @@ describe('orchestrator', () => {
       if (turn.kind !== 'background') return;
       const result = await turn.run();
 
-      expect(result.state.status).toBe('ready_for_decision');
+      expect(result.state.status).toBe('waiting_user_direction');
       expect(result.state.difficulty).toBe('extra-high');
       expect(result.state.reviewerRunCount).toBe(3);
+      expect(result.state.pendingUserDecision?.source).toBe('extra_high_planning');
     } finally {
       await cleanup([harness.root, harness.targetDir]);
     }

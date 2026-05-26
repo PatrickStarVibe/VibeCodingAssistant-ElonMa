@@ -116,8 +116,13 @@ class FakeHeavyAgents implements HeavyAgentAdapter {
     return { markdown: `plan ${input.difficulty}`, verificationCommands: [] };
   }
 
-  async reviewPlan(): Promise<ReviewResult> {
-    return { markdown: 'review' };
+  async reviewPlan(input: { difficulty: WorkflowDifficulty }): Promise<ReviewResult> {
+    return {
+      markdown: 'review',
+      ...(input.difficulty === 'high' || input.difficulty === 'extra-high'
+        ? { reviewerBlockerOutput: { blockers: [], previousVerdicts: [] } }
+        : {}),
+    };
   }
 
   async revisePlan(): Promise<PlanResult> {

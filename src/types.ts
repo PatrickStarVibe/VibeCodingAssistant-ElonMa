@@ -61,7 +61,7 @@ export interface OrchestratorDecision {
 }
 
 export interface OrchestratorDecisionInput {
-  state: Pick<TaskState, 'taskId' | 'title' | 'status' | 'difficulty' | 'pendingUserPrompt' | 'revisionRound' | 'reviewerRunCount'>;
+  state: Pick<TaskState, 'taskId' | 'title' | 'status' | 'difficulty' | 'pendingUserPrompt' | 'pendingUserDecision' | 'revisionRound' | 'reviewerRunCount'>;
   allowedActions: AllowedAction[];
   requestedChanges: string[];
   recentDecisionLog: string;
@@ -78,6 +78,7 @@ export type BridgeToolName =
   | 'create_task'
   | 'choose_difficulty'
   | 'approve_plan'
+  | 'run_followup'
   | 'accept_task'
   | 'answer_user_direction'
   | 'revise_plan'
@@ -166,7 +167,7 @@ export interface BridgeAgentInput {
     idle: boolean;
     name?: string;
   }>;
-  task?: Pick<TaskState, 'taskId' | 'title' | 'status' | 'difficulty' | 'pendingUserPrompt' | 'revisionRound' | 'reviewerRunCount' | 'requestedChanges'> & {
+  task?: Pick<TaskState, 'taskId' | 'title' | 'status' | 'difficulty' | 'pendingUserPrompt' | 'pendingUserDecision' | 'revisionRound' | 'reviewerRunCount' | 'requestedChanges' | 'implementationFollowup'> & {
     generatedArtifacts?: ArtifactName[];
   };
   runningJob?: {
@@ -287,6 +288,114 @@ export interface AssistantConfig {
   };
 }
 
+export type UserDecisionOptionId = 'A' | 'B' | 'C' | 'D';
+
+export type PendingUserDecisionSource =
+  | 'plan_revision'
+  | 'plan_explanation'
+  | 'final_review'
+  | 'extra_high_planning'
+  | 'plan_artifact_failure'
+  | 'architect_plan'
+  | 'plan_review';
+
+export interface PendingUserDecisionOption {
+  id: UserDecisionOptionId;
+  label: string;
+  impact: string;
+}
+
+export interface PendingUserDecision {
+  id: string;
+  source: PendingUserDecisionSource;
+  question: string;
+  rationale: string;
+  options: PendingUserDecisionOption[];
+  recommendedOptionId?: UserDecisionOptionId;
+  recommendationReason?: string;
+  allowFreeform: boolean;
+}
+
+export type BlockerSeverity = 'blocker' | 'high' | 'medium';
+export type BlockerCategory = 'design' | 'test' | 'scope' | 'risk' | 'ambiguity' | 'other';
+export type BlockerLifecycleStatus = 'open' | 'closed' | 'rejected_by_architect_pending_reviewer';
+export type ReviewerBlockerVerdict = 'closed' | 'still_open' | 'changed';
+export type ArchitectResponseStatus = 'addressed' | 'partially_addressed' | 'needs_user_decision' | 'rejected';
+
+export interface ReviewerBlockerDraft {
+  id: string;
+  severity: BlockerSeverity;
+  category: BlockerCategory;
+  title: string;
+  detail: string;
+  verifyHint: string;
+}
+
+export interface ReviewerPreviousBlockerVerdict {
+  id: string;
+  verdict: ReviewerBlockerVerdict;
+  reason: string;
+}
+
+export interface ReviewerBlockerOutput {
+  blockers: ReviewerBlockerDraft[];
+  previousVerdicts: ReviewerPreviousBlockerVerdict[];
+}
+
+export interface ArchitectBlockerResponse {
+  id: string;
+  status: ArchitectResponseStatus;
+  summary: string;
+  planAnchor?: string;
+  rejectionReason?: string;
+}
+
+export interface ReviewerBlocker {
+  id: string;
+  severity: BlockerSeverity;
+  category: BlockerCategory;
+  title: string;
+  detail: string;
+  verifyHint: string;
+  firstSeenRound: number;
+  lastUpdatedRound: number;
+  status: BlockerLifecycleStatus;
+  history: Array<{
+    round: number;
+    kind:
+      | 'introduced'
+      | 'changed'
+      | 'closed'
+      | 'still_open'
+      | 'architect_addressed'
+      | 'architect_partial'
+      | 'architect_rejected'
+      | 'architect_needs_user_decision';
+    note: string;
+    planAnchor?: string;
+  }>;
+}
+
+export interface BlockerLedger {
+  blockers: ReviewerBlocker[];
+  rounds: number;
+}
+
+export type ImplementationMode = 'full_plan' | 'final_review_followup';
+
+export interface ImplementationFollowupScope {
+  source: 'final_review';
+  round: number;
+  reason: string;
+  createdAt: string;
+}
+
+export interface ImplementationFollowupHistoryEntry {
+  round: number;
+  reason: string;
+  completedAt: string;
+}
+
 export type WorkflowStatus =
   | 'created'
   | 'awaiting_difficulty_selection'
@@ -316,6 +425,7 @@ export type ArtifactName =
   | 'review'
   | 'revision-instructions'
   | 'plan-rounds-log'
+  | 'blocker-ledger'
   | 'revised-plan'
   | 'assistant-explanation'
   | 'qa-log'
@@ -325,7 +435,12 @@ export type ArtifactName =
   | 'git-post-status'
   | 'git-pre-diff'
   | 'git-post-diff'
+  | 'followup-git-pre-status'
+  | 'followup-git-pre-diff'
+  | 'followup-git-post-status'
+  | 'followup-git-post-diff'
   | 'test-build-log'
+  | 'deferred-issues'
   | 'final-review'
   | 'agent-prompts'
   | 'agent-prompt-preview'
@@ -350,6 +465,12 @@ export interface TaskState {
   userAcceptanceNotes: string[];
   stoppedReason?: string;
   pendingUserPrompt?: string;
+  pendingUserDecision?: PendingUserDecision;
+  blockerLedger?: BlockerLedger;
+  implementationFollowup?: ImplementationFollowupScope;
+  implementationFollowupHistory?: ImplementationFollowupHistoryEntry[];
+  extraHighRoundLimit?: number;
+  extraHighContinuationFromReview?: boolean;
   lastDecision?: string;
   planSummary?: string;
   artifacts: Partial<Record<ArtifactName, string>>;
@@ -361,17 +482,31 @@ export interface PlanResult {
   verificationCommands: string[];
   planPackDraft?: PlanPackDraft;
   agentPrompt?: AgentPromptRecord;
+  sourcePath?: string;
+  stdoutSummary?: string;
+  userDecision?: PendingUserDecision;
+  decisionParseError?: string;
+  architectBlockerResponses?: ArchitectBlockerResponse[];
+  blockerResponseParseError?: string;
 }
 
 export interface ReviewResult {
   markdown: string;
   agentPrompt?: AgentPromptRecord;
+  sourcePath?: string;
+  stdoutSummary?: string;
+  userDecision?: PendingUserDecision;
+  decisionParseError?: string;
+  reviewerBlockerOutput?: ReviewerBlockerOutput;
+  blockerLedgerParseError?: string;
 }
 
 export interface ImplementationResult {
   markdown: string;
   changedFiles: string[];
   agentPrompt?: AgentPromptRecord;
+  sourcePath?: string;
+  stdoutSummary?: string;
 }
 
 export type FinalReviewRoute = 'complete' | 'route_to_implementer' | 'route_to_planner' | 'ask_user_direction';
@@ -386,6 +521,7 @@ export interface AssistantTextResult {
   markdown: string;
   needsUserDecision: boolean;
   userPrompt?: string;
+  userDecision?: PendingUserDecision;
 }
 
 export interface TaskProposal {
@@ -408,6 +544,7 @@ export interface AssistantRouteResult {
   route: FinalReviewRoute;
   reason: string;
   userPrompt?: string;
+  userDecision?: PendingUserDecision;
 }
 
 export interface VerificationCommandResult {

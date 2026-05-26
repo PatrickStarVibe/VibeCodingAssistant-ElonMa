@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { ArtifactStore } from './artifacts.js';
 import { BridgeAgentService, type BridgeAgentTurn, type BridgeOutboundMessage } from './bridgeAgent.js';
 import { isStopCommand } from './conversation.js';
-import type { AssistantConfig, TaskState } from './types.js';
+import type { ArtifactName, AssistantConfig, TaskState } from './types.js';
 import type { WorkflowResult } from './workflow.js';
 import {
   appendRecentMessage,
@@ -560,12 +560,15 @@ function workflowMessage(result: WorkflowResult): BridgeOutboundMessage {
 
 function filesForWorkflowResult(result: WorkflowResult): BridgeOutboundMessage['files'] {
   const state = result.state;
-  const artifactNames = [];
+  const artifactNames: ArtifactName[] = [];
   if (state.status === 'ready_for_decision') artifactNames.push('assistant-explanation', 'revised-plan');
-  if (state.status === 'awaiting_user_acceptance') artifactNames.push('final-review', 'test-build-log');
+  if (state.status === 'waiting_user_direction' && state.pendingUserDecision?.source === 'extra_high_planning') {
+    artifactNames.push('revised-plan', 'plan-rounds-log', 'blocker-ledger');
+  }
+  if (state.status === 'awaiting_user_acceptance') artifactNames.push('final-review', 'test-build-log', 'deferred-issues');
   if (state.status === 'completed') artifactNames.push('final-report');
   const files = artifactNames
-    .map((artifact) => state.artifacts[artifact as keyof typeof state.artifacts])
+    .map((artifact) => state.artifacts[artifact])
     .filter((path): path is string => Boolean(path))
     .map((path) => ({ path, name: path.split(/[\\/]/).pop() ?? 'artifact' }));
   return files.length > 0 ? files : undefined;

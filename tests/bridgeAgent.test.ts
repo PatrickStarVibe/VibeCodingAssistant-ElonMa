@@ -18,6 +18,7 @@ import type {
   AssistantRouteResult,
   AssistantTextResult,
   OrchestratorDecision,
+  PendingUserDecision,
   PlanResult,
   WorkflowDifficulty,
 } from '../src/types.js';
@@ -182,9 +183,59 @@ async function createTaskAwaitingAcceptance(harness: Awaited<ReturnType<typeof m
 
 const DEFAULT_DIRECTION_PROMPT = 'Options: 1) Accept current worktree as-is. 2) Revert unrelated files.';
 
+function makePendingDecision(): PendingUserDecision {
+  return {
+    id: 'decision:test',
+    source: 'plan_revision',
+    question: 'Choose the product direction.',
+    rationale: 'The planner needs a scope decision before continuing.',
+    options: [
+      { id: 'A', label: 'Keep the MVP narrow', impact: 'Planner continues with the smaller scoped implementation.' },
+      { id: 'B', label: 'Expand the scope', impact: 'Planner includes additional product behavior now.' },
+    ],
+    recommendedOptionId: 'A',
+    recommendationReason: 'The advisor recommends A because it fits the original request.',
+    allowFreeform: true,
+  };
+}
+
+function makeExtraHighPendingDecision(round = 3): PendingUserDecision {
+  return {
+    id: `extra-high-planning:round-${round}`,
+    source: 'extra_high_planning',
+    question: 'Reviewer still has blocking findings. What should happen next?',
+    rationale: 'Extra High planning hit the review round limit with unresolved blockers.',
+    options: [
+      { id: 'A', label: 'Continue one round', impact: 'Run one more planner/reviewer round, then ask again if blockers remain.' },
+      { id: 'B', label: 'Restart planning', impact: 'Return to planning from a clean direction and require approval again.' },
+      { id: 'C', label: 'Execute current plan', impact: 'Implement the blocked plan as an explicit user override.' },
+    ],
+    recommendedOptionId: 'A',
+    recommendationReason: 'One more round may resolve the current blockers without losing context.',
+    allowFreeform: true,
+  };
+}
+
+function makePlanArtifactFailureDecision(): PendingUserDecision {
+  return {
+    id: 'plan-artifact-failure:extra-high-initial-plan',
+    source: 'plan_artifact_failure',
+    question: 'The heavy agent did not provide a usable plan artifact. What should Manager do next?',
+    rationale: 'Manager paused before sending an empty plan onward.',
+    options: [
+      { id: 'A', label: 'Retry planning', impact: 'Reruns planning from the original task.' },
+      { id: 'B', label: 'Stop task', impact: 'Stops this task for manual inspection.' },
+    ],
+    recommendedOptionId: 'A',
+    recommendationReason: 'Retrying is the normal recovery after fixing the agent output contract.',
+    allowFreeform: true,
+  };
+}
+
 async function createTaskWaitingForUserDirection(
   harness: Awaited<ReturnType<typeof makeHarness>>,
   pendingUserPrompt = DEFAULT_DIRECTION_PROMPT,
+  pendingUserDecision?: PendingUserDecision,
 ): Promise<string> {
   const created = await harness.workflow.createTask({ title: 'Direction task', task: 'Update docs.' });
   let state = await harness.store.writeArtifact(created.state, 'final-review', pendingUserPrompt);
@@ -194,10 +245,36 @@ async function createTaskWaitingForUserDirection(
     difficulty: 'low',
     lastDecision: 'ask_user_direction',
     pendingUserPrompt,
+    ...(pendingUserDecision ? { pendingUserDecision } : {}),
     updatedAt: new Date().toISOString(),
   };
   await harness.store.saveState(state);
   return state.taskId;
+}
+
+async function createExtraHighPlanningPause(harness: Awaited<ReturnType<typeof makeHarness>>): Promise<string> {
+  const prompt = [
+    'Extra High reviewer concerns remain after round 3.',
+    'A. Continue one round',
+    'B. Restart planning',
+    'C. Execute current plan',
+  ].join('\n');
+  const taskId = await createTaskWaitingForUserDirection(harness, prompt, makeExtraHighPendingDecision());
+  let state = await harness.store.loadState(taskId);
+  state = await harness.store.writeArtifact(state, 'revised-plan', '# Current blocked plan\n\n- Keep this visible.');
+  state = await harness.store.writeArtifact(state, 'plan-rounds-log', '## Round 3\n\nverdict: issues_remain');
+  await harness.store.saveState({
+    ...state,
+    difficulty: 'extra-high',
+    reviewerRunCount: 3,
+    revisionRound: 2,
+    extraHighRoundLimit: 3,
+    extraHighContinuationFromReview: false,
+    pendingUserPrompt: prompt,
+    pendingUserDecision: makeExtraHighPendingDecision(),
+    updatedAt: new Date().toISOString(),
+  });
+  return taskId;
 }
 
 function activeTaskChat(taskId: string, chatId = 'task-chat') {
@@ -257,6 +334,75 @@ describe('BridgeAgentService', () => {
         const result = await turn.run();
         expect(result.state.difficulty).toBe('extra-high');
       }
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('runs final-review follow-up from implementation_approved confirmation', async () => {
+    const harness = await makeHarness();
+    try {
+      const taskId = await createTaskAtDifficultyGate(harness);
+      const state = await harness.store.loadState(taskId);
+      await harness.store.saveState({
+        ...state,
+        status: 'implementation_approved',
+        implementationFollowup: {
+          source: 'final_review',
+          round: 1,
+          reason: 'Contained defect remains.',
+          createdAt: new Date().toISOString(),
+        },
+        updatedAt: new Date().toISOString(),
+      });
+
+      const turn = await harness.agent.handleMessage({
+        chatId: 'task-chat',
+        senderOpenId: 'user-open-id',
+        text: 'approve A',
+        ...activeTaskChat(taskId),
+      });
+
+      expect(turn.kind).toBe('background');
+      if (turn.kind === 'background') {
+        expect(turn.label).toBe('final-review follow-up');
+      }
+      expect(harness.assistant.inputs).toHaveLength(0);
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('rejects run_followup without an active follow-up scope', async () => {
+    const harness = await makeHarness();
+    try {
+      const taskId = await createTaskAtDifficultyGate(harness);
+      const state = await harness.store.loadState(taskId);
+      await harness.store.saveState({
+        ...state,
+        status: 'implementation_approved',
+        updatedAt: new Date().toISOString(),
+      });
+      harness.assistant.decisions.push({
+        kind: 'tool_call',
+        toolCall: { name: 'run_followup', arguments: {} },
+      });
+
+      const turn = await harness.agent.handleMessage({
+        chatId: 'task-chat',
+        senderOpenId: 'user-open-id',
+        text: 'approve A',
+        ...activeTaskChat(taskId),
+      });
+
+      expect(turn.kind).toBe('reply');
+      if (turn.kind === 'reply') {
+        expect(turn.auditAction).toBe('guard:state-mismatch');
+        expect(turn.messages[0]?.text).toContain('no active final-review follow-up scope');
+      }
+      const next = await harness.store.loadState(taskId);
+      expect(next.status).toBe('implementation_approved');
+      expect(next.implementationFollowup).toBeUndefined();
     } finally {
       await cleanup([harness.root, harness.targetDir]);
     }
@@ -443,6 +589,129 @@ describe('BridgeAgentService', () => {
     }
   });
 
+  it('does not auto-submit clarifying questions as user direction answers', async () => {
+    const harness = await makeHarness();
+    try {
+      const decision = makePendingDecision();
+      const prompt = [
+        '需要你做一个产品/范围/方向决定。',
+        `问题：${decision.question}`,
+        'A. Keep the MVP narrow',
+        'B. Expand the scope',
+      ].join('\n');
+      const taskId = await createTaskWaitingForUserDirection(harness, prompt, decision);
+      harness.assistant.decisions.push({ kind: 'reply', text: '当前需要你决定 A/B 两个产品方向；我可以继续解释差异。' });
+
+      const turn = await harness.agent.handleMessage({
+        chatId: 'task-chat',
+        senderOpenId: 'user-open-id',
+        text: '什么 decision',
+        ...activeTaskChat(taskId),
+      });
+
+      expect(turn.kind).toBe('reply');
+      expect(turn.auditAction).toBe('guard:direction-text-blocked');
+      const next = await harness.store.loadState(taskId);
+      expect(next.status).toBe('waiting_user_direction');
+      expect(next.pendingUserDecision).toEqual(decision);
+      expect(await harness.store.readArtifact(next, 'decision-log').catch(() => '')).not.toContain('什么 decision');
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('continues Extra High planning as a background job and sends the current plan files immediately', async () => {
+    const harness = await makeHarness();
+    try {
+      const taskId = await createExtraHighPlanningPause(harness);
+      harness.assistant.decisions.push({
+        kind: 'tool_call',
+        toolCall: { name: 'answer_user_direction', arguments: { answer: 'A' } },
+      });
+
+      const turn = await harness.agent.handleMessage({
+        chatId: 'task-chat',
+        senderOpenId: 'user-open-id',
+        text: 'A',
+        ...activeTaskChat(taskId),
+      });
+
+      expect(turn.kind).toBe('background');
+      if (turn.kind === 'background') {
+        expect(turn.label).toBe('extra-high planning');
+        expect(turn.startedMessage.text).toContain('继续 Extra High planning 一轮');
+        expect(turn.startedMessage.text).toContain('revised-plan 和 plan-rounds-log');
+        expect(turn.startedMessage.files?.map((file) => file.name)).toEqual([
+          'revised-plan.md',
+          'plan-rounds-log.md',
+        ]);
+      }
+      expect((await harness.store.loadState(taskId)).status).toBe('waiting_user_direction');
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('starts Extra High option C as a background implementation override', async () => {
+    const harness = await makeHarness();
+    try {
+      const taskId = await createExtraHighPlanningPause(harness);
+      harness.assistant.decisions.push({
+        kind: 'tool_call',
+        toolCall: { name: 'answer_user_direction', arguments: { answer: 'C' } },
+      });
+
+      const turn = await harness.agent.handleMessage({
+        chatId: 'task-chat',
+        senderOpenId: 'user-open-id',
+        text: 'C',
+        ...activeTaskChat(taskId),
+      });
+
+      expect(turn.kind).toBe('background');
+      if (turn.kind === 'background') {
+        expect(turn.label).toBe('extra-high implementing');
+        expect(turn.startedMessage.text).toContain('直接执行当前 Extra High plan');
+        expect(turn.startedMessage.files?.map((file) => file.name)).toEqual([
+          'revised-plan.md',
+          'plan-rounds-log.md',
+        ]);
+      }
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('attaches the current Extra High plan files when a paused approve attempt is rejected', async () => {
+    const harness = await makeHarness();
+    try {
+      const taskId = await createExtraHighPlanningPause(harness);
+      harness.assistant.decisions.push({
+        kind: 'tool_call',
+        toolCall: { name: 'approve_plan', arguments: {} },
+      });
+
+      const turn = await harness.agent.handleMessage({
+        chatId: 'task-chat',
+        senderOpenId: 'user-open-id',
+        text: 'approve A',
+        ...activeTaskChat(taskId),
+      });
+
+      expect(turn.kind).toBe('reply');
+      if (turn.kind === 'reply') {
+        expect(turn.messages[0]?.text).toContain('Continue one round');
+        expect(turn.messages[0]?.files?.map((file) => file.name)).toEqual([
+          'revised-plan.md',
+          'plan-rounds-log.md',
+        ]);
+      }
+      expect((await harness.store.loadState(taskId)).status).toBe('waiting_user_direction');
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
   it('auto-routes neutral acknowledgements to answer_user_direction for numeric answers', async () => {
     const harness = await makeHarness();
     try {
@@ -463,6 +732,35 @@ describe('BridgeAgentService', () => {
       expect(next.pendingUserPrompt).toBeUndefined();
       expect(next.lastDecision).toBe('user direction: 1');
       expect(await harness.store.readArtifact(next, 'decision-log')).toContain('user direction: 1');
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
+  it('auto-routes short continuation replies to answer_user_direction for artifact failures', async () => {
+    const harness = await makeHarness();
+    try {
+      const taskId = await createTaskWaitingForUserDirection(
+        harness,
+        'Heavy agent did not provide a usable plan artifact. Reply A to retry planning or B to stop.',
+        makePlanArtifactFailureDecision(),
+      );
+      harness.assistant.decisions.push({ kind: 'reply', text: '收到，我继续。' });
+
+      const turn = await harness.agent.handleMessage({
+        chatId: 'task-chat',
+        senderOpenId: 'user-open-id',
+        text: '继续',
+        ...activeTaskChat(taskId),
+      });
+
+      expect(turn.kind).toBe('reply');
+      expect(turn.auditAction).toBe('guard:direction-autoanswer');
+      const next = await harness.store.loadState(taskId);
+      expect(next.status).toBe('ready_for_decision');
+      expect(next.pendingUserDecision).toBeUndefined();
+      expect(next.lastDecision).toBe('user direction: 继续');
+      expect(next.requestedChanges.join('\n')).toContain('Retry planning after plan artifact failure');
     } finally {
       await cleanup([harness.root, harness.targetDir]);
     }

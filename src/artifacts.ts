@@ -10,6 +10,7 @@ const ARTIFACT_FILES: Record<ArtifactName, string> = {
   review: 'review.md',
   'revision-instructions': 'revision-instructions.md',
   'plan-rounds-log': 'plan-rounds-log.md',
+  'blocker-ledger': 'blocker-ledger.md',
   'revised-plan': 'revised-plan.md',
   'assistant-explanation': 'assistant-explanation.md',
   'qa-log': 'qa-log.md',
@@ -19,7 +20,12 @@ const ARTIFACT_FILES: Record<ArtifactName, string> = {
   'git-post-status': 'git-post-status.txt',
   'git-pre-diff': 'git-pre-diff.patch',
   'git-post-diff': 'git-post-diff.patch',
+  'followup-git-pre-status': 'followup-git-pre-status.txt',
+  'followup-git-pre-diff': 'followup-git-pre-diff.patch',
+  'followup-git-post-status': 'followup-git-post-status.txt',
+  'followup-git-post-diff': 'followup-git-post-diff.patch',
   'test-build-log': 'test-build-log.md',
+  'deferred-issues': 'deferred-issues.md',
   'final-review': 'final-review.md',
   'agent-prompts': 'agent-prompts.md',
   'agent-prompt-preview': 'agent-prompt-preview.md',
@@ -119,8 +125,8 @@ const INTERNAL_TRANSITION_STATUSES = new Set<WorkflowStatus>([
 ]);
 
 function stripInternalPendingPrompt(state: TaskState): TaskState {
-  if (!state.pendingUserPrompt || !INTERNAL_TRANSITION_STATUSES.has(state.status)) return state;
-  console.warn(`Clearing stale pendingUserPrompt from internal workflow state ${state.status} for task ${state.taskId}.`);
-  const { pendingUserPrompt: _pendingUserPrompt, ...rest } = state;
+  if ((!state.pendingUserPrompt && !state.pendingUserDecision) || !INTERNAL_TRANSITION_STATUSES.has(state.status)) return state;
+  console.warn(`Clearing stale pending user direction from internal workflow state ${state.status} for task ${state.taskId}.`);
+  const { pendingUserPrompt: _pendingUserPrompt, pendingUserDecision: _pendingUserDecision, ...rest } = state;
   return rest;
 }

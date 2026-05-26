@@ -4,6 +4,49 @@
 
 如果你不熟悉命令行，先看更慢、更细的 [START_HERE_FOR_BEGINNERS.md](START_HERE_FOR_BEGINNERS.md)。如果你准备把配置工作交给 AI coding agent，请把 [docs/agent-setup-guide.md](docs/agent-setup-guide.md) 一起交给它。项目概览见 [README.md](README.md)。
 
+## Quick start with setup wizard / 快速启动
+
+新 clone 或第一次配置时，优先运行交互式向导：
+
+```powershell
+npm run assistant:setup
+```
+
+向导会创建缺失的 `.env.local` 和 `assistant.config.local.json`，引导填写项目路径、profile、Lark allowlist 和配置里声明的 env var name。它不会把 secret value 打印到输出里。
+
+配置后用 preflight 检查 launch readiness，再启动：
+
+```powershell
+npm run assistant:preflight
+npm run assistant:start
+```
+
+默认 preflight 要求存在可启动的 `assistant.config.local.json`。如果目录里只有 `assistant.config.example.json`，preflight 会失败并提示先运行 setup；显式传入 `--config assistant.config.example.json` 只适合检查 example，不代表它可以直接启动。
+
+如果要验证非默认 env 文件，可以运行：
+
+```powershell
+npm run assistant:preflight -- --env-file <PATH_TO_ENV_FILE>
+```
+
+`--env-file` 会检查你指定的文件，但实际 runtime 启动时仍加载 `.env.local`。
+
+Windows 用户也可以双击根目录的 `start-assistant.bat`，或运行：
+
+```powershell
+.\start-assistant.ps1
+```
+
+两个 Windows launcher 都会先检查 Node.js/npm，然后调用 `npm run assistant:start`；`assistant:start` 的第一步就是 preflight。
+
+维护者在发 GitHub / npm 分发前可以运行：
+
+```powershell
+npm run assistant:hygiene
+```
+
+它会检查 git 状态、`.gitignore` 保护项、`package-lock.json` 和 package version 提示。
+
 ## 1. 准备信息
 
 开始前先收集这些信息：
@@ -201,7 +244,7 @@ npm run assistant -- reply --config assistant.config.local.json --task <TASK_ID>
 
 - API key missing：检查 `.env.local` 是否存在；变量名是否和 `profiles.<profile>.apiKeyEnv` 完全一致；如果系统环境变量已有同名空值，先修正系统环境变量。
 - provider command not found：检查命令型 profile 的 `command`；确认 `<YOUR_PROVIDER_COMMAND>` 在当前 shell 的 `PATH` 中，或改成绝对路径。
-- project path invalid：检查 `workspace.targetDir` 和 `projects[].targetDir` 是否是本机真实目录；Windows 路径可以使用 `/` 或转义后的 `\\`。
+- project path invalid：检查 `workspace.targetDir` 和 `projects[].targetDir` 是否缺失、仍是 placeholder，或不是本机真实目录；Windows 路径可以使用 `/` 或转义后的 `\\`。
 - Lark 权限不对：检查 app credentials、bot 是否启用、事件订阅是否打开、收发消息和建群/上传文件权限是否已授权；确认发消息用户的 open ID 在 `allowedOpenIds` 中，目标 chat 在 `controlChatIds` 中或未启用该限制。
 
 ## 9. Prompt for your coding agent

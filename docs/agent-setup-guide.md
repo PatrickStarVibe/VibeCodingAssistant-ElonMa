@@ -19,7 +19,9 @@ Also inspect existing local config files if they exist, but do not print real se
 
 - `assistant.config.local.json`
 - `assistant.projects.local.json`
-- `.env.local`
+- `.env.local` existence only, plus required env var names only.
+
+For `.env.local`, the agent may check whether the file exists and whether required env var names are present. The agent must not read env var values unless the user gives explicit in-conversation permission, and values must never be written to logs, task records, docs, examples, screenshots, commits, or final messages.
 
 ## Information To Ask The User For
 
@@ -76,7 +78,11 @@ Do not:
 - Hard-code one LLM provider into all docs or profiles unless the user asks for that exact local setup.
 - Revert unrelated user changes while editing local config.
 
-When you need to confirm `.env.local`, report only non-secret facts, such as "the expected env var name exists and has a non-empty value."
+When you need to confirm `.env.local`, report only non-secret facts:
+
+- Whether `.env.local` exists.
+- Whether each required env var name exists, without reading or reporting its value.
+- Reading any env value requires the user's explicit in-conversation permission.
 
 ## Setup Workflow
 
@@ -88,11 +94,20 @@ When you need to confirm `.env.local`, report only non-secret facts, such as "th
 6. Ensure every `apiKeyEnv`, `appIdEnv`, and `appSecretEnv` name has a corresponding variable in `.env.local` or the system environment.
 7. Validate without printing secrets.
 
+The supported first-run path is the setup wizard:
+
+```powershell
+npm run assistant:setup
+```
+
+For CI or scripted smoke checks, `npm run assistant:setup -- --non-interactive` copies missing example files and runs preflight without prompts. It is expected to fail until placeholders and local-only values are replaced.
+
 ## Validation Commands
 
 Run these from the Manager repo root:
 
 ```powershell
+npm run assistant:preflight
 npm run assistant -- projects --config assistant.config.local.json
 npm run build
 npm test
@@ -100,10 +115,41 @@ npm test
 
 Expected non-secret checks:
 
+- `npm run assistant:preflight` checks Node.js, config source, config-derived env var names, workspace/project paths, Lark allowlists, command-backed profiles, and `npmScript` references.
 - The `projects` command lists the expected project id and target path.
 - `npm run build` exits successfully.
 - `npm test` exits successfully.
 - No command output contains real API keys, app secrets, or tokens.
+
+Useful validation variants:
+
+```powershell
+npm run assistant:doctor
+npm run assistant:hygiene
+npm run assistant:preflight -- --json
+npm run assistant:preflight -- --env-file <PATH_TO_ENV_FILE>
+```
+
+Preflight config source rules:
+
+- Default preflight requires `assistant.config.local.json`.
+- If only `assistant.config.example.json` exists, default preflight fails and tells the user to run `npm run assistant:setup`.
+- `--config <path>` explicitly validates that file; a missing explicit path is a failure.
+- If neither local nor example config exists, preflight fails with a config-source error.
+
+Preflight derives required env var names from config. It checks `profiles.<name>.apiKeyEnv` for API-backed profiles used by workflow roles and `lark.appIdEnv` / `lark.appSecretEnv` when Lark is configured. It does not hard-require old names such as `MANAGER_API_KEY` or `MANAGER_AGENT_ID` unless the user's config explicitly names them.
+
+For `.env.local`, follow the three-bullet rule above: check only whether the file exists, whether each required env var name exists, and do not read values without explicit in-conversation permission. Preflight may report missing or placeholder values by env var name, but it must never echo the values.
+
+`--env-file <path>` validates the named file for preflight, but the runtime still loads `.env.local` when the assistant starts. If a non-default env file passes preflight, copy the same non-secret env var names into `.env.local` or confirm with the user before launch.
+
+Preflight is intentionally stricter than the runtime for workspace paths. It does not silently substitute any machine-local runtime default for `workspace.targetDir`. A missing, blank, or placeholder `workspace.targetDir`, a missing/placeholder `projects[].targetDir`, or a `defaultProjectId` that does not match a project blocks launch. This is the supported way to avoid accidentally using a developer machine path after cloning the repo.
+
+Windows launchers:
+
+- `start-assistant.bat` is the double-click batch entry point.
+- `start-assistant.ps1` is the PowerShell entry point.
+- Both check Node.js/npm and then call `npm run assistant:start`; `assistant:start` runs preflight before the Lark bridge starts.
 
 Optional smoke task:
 
@@ -132,7 +178,7 @@ The env var named by `profiles.<profile>.apiKeyEnv` is missing or empty. Add the
 The local config file was not created or the command points at the wrong path. Create `assistant.config.local.json` from the example or pass `--config assistant.config.local.json`.
 
 `project path invalid`:
-The path in `workspace.targetDir` or `projects[].targetDir` does not exist on this machine. Ask the user for the correct local folder.
+The path in `workspace.targetDir` or `projects[].targetDir` is missing, still a placeholder, or does not exist on this machine. Ask the user for the correct local folder; do not rely on runtime defaults.
 
 `provider command not found`:
 The command-backed profile's `command` is not available in the current shell. Ask for the installed command, full executable path, or setup instructions for that provider.

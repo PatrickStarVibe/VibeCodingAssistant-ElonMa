@@ -24,6 +24,7 @@ const ARTIFACT_NAMES: ArtifactName[] = [
   'review',
   'revision-instructions',
   'plan-rounds-log',
+  'blocker-ledger',
   'revised-plan',
   'assistant-explanation',
   'qa-log',
@@ -33,7 +34,12 @@ const ARTIFACT_NAMES: ArtifactName[] = [
   'git-post-status',
   'git-pre-diff',
   'git-post-diff',
+  'followup-git-pre-status',
+  'followup-git-pre-diff',
+  'followup-git-post-status',
+  'followup-git-post-diff',
   'test-build-log',
+  'deferred-issues',
   'final-review',
   'agent-prompts',
   'agent-prompt-preview',
@@ -518,7 +524,7 @@ export function parseTaskRequest(text: string): TaskRequest | undefined {
 }
 
 export function filesForState(state: TaskState): OutboundFile[] | undefined {
-  const names = artifactsForStatus(state.status);
+  const names = artifactsForState(state);
   const files = names
     .map((name) => state.artifacts[name])
     .filter((path): path is string => typeof path === 'string' && path.length > 0)
@@ -526,10 +532,13 @@ export function filesForState(state: TaskState): OutboundFile[] | undefined {
   return files.length > 0 ? files : undefined;
 }
 
-function artifactsForStatus(status: TaskState['status']): ArtifactName[] {
-    if (status === 'ready_for_decision') return ['assistant-explanation', 'revised-plan'];
-  if (status === 'awaiting_user_acceptance') return ['final-review', 'test-build-log'];
-  if (status === 'completed') return ['final-report'];
+function artifactsForState(state: TaskState): ArtifactName[] {
+  if (state.status === 'ready_for_decision') return ['assistant-explanation', 'revised-plan'];
+  if (state.status === 'waiting_user_direction' && state.pendingUserDecision?.source === 'extra_high_planning') {
+    return ['revised-plan', 'plan-rounds-log'];
+  }
+  if (state.status === 'awaiting_user_acceptance') return ['final-review', 'test-build-log'];
+  if (state.status === 'completed') return ['final-report'];
   return [];
 }
 
@@ -867,6 +876,7 @@ function fallbackComposeReply(
 function stateWithoutPendingPrompt(state: TaskState): TaskState {
   const copy = { ...state };
   delete copy.pendingUserPrompt;
+  delete copy.pendingUserDecision;
   return copy;
 }
 

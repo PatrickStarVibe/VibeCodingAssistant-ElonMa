@@ -7,12 +7,18 @@
     "assistant": "./dist/cli.js"
   },
   "scripts": {
+    "assistant:preflight": "node -- scripts/preflight.mjs",
+    "assistant:start": "node -- scripts/preflight.mjs && npm run assistant:lark",
+    "assistant:setup": "node scripts/setup.mjs",
+    "assistant:doctor": "node -- scripts/preflight.mjs --doctor",
+    "assistant:hygiene": "node scripts/repo-hygiene.mjs",
     "assistant": "tsx src/cli.ts",
     "assistant:lark": "tsx src/larkCli.ts",
     "build": "tsc -p tsconfig.json",
     "task-usage:summarize": "tsx scripts/task-usage/summarizeTaskUsage.ts",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run assistant:preflight"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.65.0"

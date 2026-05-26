@@ -21,9 +21,11 @@ import type {
   BridgeToolName,
   BridgeLiveProcessSnapshot,
   AssistantConfig,
+  PendingUserDecision,
   TaskState,
   WorkflowDifficulty,
 } from './types.js';
+import { isExactDecisionSelection, renderPendingUserDecision, selectedDecisionOption } from './userDecision.js';
 import { getActiveProcessSnapshots } from './processRunner.js';
 import type { WorkflowResult, WorkflowService } from './workflow.js';
 import type { ActiveTaskBinding, LarkRunningJob, ProjectChatRegistration } from './larkBridgeState.js';
@@ -59,7 +61,7 @@ export interface BridgeAgentRequest {
 
 type LiveProcessProvider = (taskId: string) => BridgeLiveProcessSnapshot[];
 type ToolStateCheck = { ok: true } | { ok: false; reason: string };
-type NoOpState = Pick<TaskState, 'status' | 'pendingUserPrompt'>;
+type NoOpState = Pick<TaskState, 'status' | 'pendingUserPrompt' | 'pendingUserDecision' | 'implementationFollowup'>;
 
 const FAKE_STATE_CLAIM_PATTERN = /已记录|已推进|已启动|已停止|已进入验收|已验收|已批准|已通过|已接受|已反馈给.*?(workflow|工作流)|我会(记录|反馈|提交|推进|转交)|我来(记录|反馈|提交|推进)|帮你(记录|反馈|提交|推进|转交)|(反馈|提交|转交)给.*?(workflow|工作流)|(马上|现在|立刻|稍后).*(推进|反馈|记录|提交).*(workflow|工作流|流程)|工作流.*?已|流程.*?已推进|已经推进/;
 
@@ -68,8 +70,9 @@ const BRIDGE_TOOL_USER_LABELS: Record<BridgeToolName, string> = {
   create_task: '创建新 task（create_task）',
   choose_difficulty: '选择工作难度（choose_difficulty）',
   approve_plan: '批准计划并启动实现（approve_plan）',
+  run_followup: '运行 Final Review follow-up（run_followup）',
   accept_task: '验收当前 task（accept_task）',
-  answer_user_direction: '回答 pending 问题（answer_user_direction）',
+  answer_user_direction: '回答 Architect/Reviewer/Assistant Elon Ma 的 pending 问题（answer_user_direction，可回 A/B/C/D 或自由文本）',
   revise_plan: '要求修改计划或返工（revise_plan）',
   stop_task: '停止当前 task（stop_task）',
   ask_task_question: '围绕当前 task 提问（ask_task_question）',
@@ -87,11 +90,19 @@ export function isFakeStateClaim(text: string): boolean {
   return FAKE_STATE_CLAIM_PATTERN.test(text);
 }
 
-function looksLikeUserDirectionAnswer(text: string, pendingPrompt?: string): boolean {
-  const trimmed = text.trim();
-  if (/^[1-9][0-9]?\s*[。.!\s]?$/.test(trimmed)) return true;
-  if (/^[A-Da-d]\s*[。.!\s]?$/.test(trimmed)) return true;
-  return Boolean(pendingPrompt?.trim()) && trimmed.length > 0 && trimmed.length <= 30;
+function looksLikeUserDirectionAnswer(input: BridgeAgentInput): boolean {
+  if (input.task?.status !== 'waiting_user_direction') return false;
+  return isExactDecisionSelection(input.latestUserMessage, input.task.pendingUserDecision, input.task.pendingUserPrompt)
+    || looksLikeShortDirectionAnswer(input.latestUserMessage, input.task.pendingUserDecision, input.task.pendingUserPrompt);
+}
+
+function looksLikeShortDirectionAnswer(answer: string, decision: PendingUserDecision | undefined, pendingPrompt?: string): boolean {
+  if (!decision && !isLegacyPlanArtifactFailurePrompt(pendingPrompt)) return false;
+  return /^(?:continue|retry|rerun|restart|go ahead|继续|重试|重新跑|重新规划|再跑一轮|停|停止|stop)$/i.test(answer.trim());
+}
+
+function isLegacyPlanArtifactFailurePrompt(prompt: string | undefined): boolean {
+  return Boolean(prompt?.includes('Heavy agent did not provide a usable plan artifact'));
 }
 
 function looksLikeClarifyingQuestion(text: string): boolean {
@@ -160,6 +171,9 @@ export class BridgeAgentService {
     }
 
     const input = await this.buildInput(request);
+    const deterministicTurn = await this.tryHandleDeterministicWorkflowCommand(request, input);
+    if (deterministicTurn) return deterministicTurn;
+
     const decision = await this.assistant.decideBridgeAction(input).catch((error: unknown): BridgeAgentDecision => ({
       kind: 'reply',
       text: `Elon Ma could not make a bridge decision: ${errorMessage(error)}`,
@@ -212,6 +226,8 @@ export class BridgeAgentService {
           generatedArtifacts: Object.keys(task.artifacts) as ArtifactName[],
           ...(task.difficulty ? { difficulty: task.difficulty } : {}),
           ...(task.pendingUserPrompt ? { pendingUserPrompt: task.pendingUserPrompt } : {}),
+          ...(task.pendingUserDecision ? { pendingUserDecision: task.pendingUserDecision } : {}),
+          ...(task.implementationFollowup ? { implementationFollowup: task.implementationFollowup } : {}),
         },
       } : {}),
       ...(request.runningJob ? {
@@ -228,6 +244,24 @@ export class BridgeAgentService {
       projects: (this.config.projects ?? []).map((project) => ({ id: project.id, name: project.name })),
       config: this.config,
     };
+  }
+
+  private async tryHandleDeterministicWorkflowCommand(
+    request: BridgeAgentRequest,
+    input: BridgeAgentInput,
+  ): Promise<BridgeAgentTurn | undefined> {
+    if (
+      input.task?.status === 'implementation_approved'
+      && input.task.implementationFollowup
+      && isApproveConfirmation(input.latestUserMessage)
+    ) {
+      return this.executeTool(request, input, {
+        name: 'run_followup',
+        arguments: {},
+        reasoning: 'deterministic final-review follow-up confirmation',
+      });
+    }
+    return undefined;
   }
 
   private async retrieveMemory(
@@ -307,6 +341,23 @@ export class BridgeAgentService {
             });
           }
           return this.workflowBackground(request, toolCall, 'implementing', (taskId) => (
+            this.workflow.reply(taskId, instructionReply('approve A', optionalString(toolCall, 'instruction')))
+          ));
+        }
+        case 'run_followup': {
+          const taskId = this.resolveTaskId(request, toolCall);
+          const state = await this.store.loadState(taskId);
+          const allowed = this.assertToolAllowedForState(toolCall.name, state);
+          if (!allowed.ok) {
+            return this.replyNoOp({
+              state,
+              input,
+              intendedAction: describeIntendedToolAction(toolCall.name),
+              reason: allowed.reason,
+              auditAction: 'guard:state-mismatch',
+            });
+          }
+          return this.workflowBackground(request, toolCall, 'final-review follow-up', (taskId) => (
             this.workflow.reply(taskId, instructionReply('approve A', optionalString(toolCall, 'instruction')))
           ));
         }
@@ -413,6 +464,22 @@ export class BridgeAgentService {
     answer: string,
     auditAction = 'tool:answer_user_direction',
   ): Promise<BridgeAgentTurn> {
+    const state = await this.store.loadState(taskId);
+    if (shouldRunExtraHighDirectionInBackground(state, answer)) {
+      const files = filesForState(state);
+      return {
+        kind: 'background',
+        taskId,
+        label: extraHighDirectionBackgroundLabel(state, answer),
+        auditAction,
+        startedMessage: {
+          text: renderExtraHighDirectionStartedMessage(state, answer, Boolean(files?.length)),
+          ...(files ? { files } : {}),
+        },
+        run: () => this.workflow.answerUserDirection(taskId, answer),
+      };
+    }
+
     const result = await this.workflow.answerUserDirection(taskId, answer);
     return {
       kind: 'reply',
@@ -424,7 +491,7 @@ export class BridgeAgentService {
 
   private async replyGuarded(input: BridgeAgentInput, text: string): Promise<BridgeAgentTurn> {
     if (!isFakeStateClaim(text) && input.task?.status === 'waiting_user_direction') {
-      if (looksLikeUserDirectionAnswer(input.latestUserMessage, input.task.pendingUserPrompt)) {
+      if (looksLikeUserDirectionAnswer(input)) {
         return this.answerUserDirection(input.task.taskId, input.latestUserMessage, 'guard:direction-autoanswer');
       }
       if (looksLikeClarifyingQuestion(text)) return this.reply(text);
@@ -453,15 +520,17 @@ export class BridgeAgentService {
     reason: string;
     auditAction: 'guard:state-mismatch' | 'guard:no-tool' | 'guard:fake-claim' | 'guard:direction-text-blocked';
   }): BridgeAgentTurn {
-    const toolNames = options.state
-      ? bridgeToolNamesForTaskStatus(options.state.status)
-      : bridgeToolNamesForInput(options.input);
+    const toolNames = options.input
+      ? bridgeToolNamesForInput(options.input)
+      : options.state
+        ? this.bridgeToolNamesForNoOpState(options.state)
+        : bridgeToolNamesForInput();
     const actionLines = [...toolNames].map((toolName) => `- ${BRIDGE_TOOL_USER_LABELS[toolName]}`);
     const scopeLine = options.state
       ? `当前阶段（${options.state.status}）下你可以：`
       : '当前可用操作：';
     const pendingPrompt = options.state?.status === 'waiting_user_direction'
-      ? options.state.pendingUserPrompt?.trim()
+      ? (options.state.pendingUserDecision ? renderPendingUserDecision(options.state.pendingUserDecision) : options.state.pendingUserPrompt?.trim())
       : undefined;
     const directionPromptLine = pendingPrompt
       ? `当前 task 正在等你回答下面这个问题，必须用 \`answer_user_direction\` 提交答案，不能用普通文字回复推进 workflow：${
@@ -495,6 +564,20 @@ export class BridgeAgentService {
       case 'approve_plan':
         allowedStatuses = ['ready_for_decision'];
         break;
+      case 'run_followup':
+        if (state.status !== 'implementation_approved') {
+          return {
+            ok: false,
+            reason: 'run_followup can only be used from implementation_approved.',
+          };
+        }
+        if (!state.implementationFollowup) {
+          return {
+            ok: false,
+            reason: 'Current task has no active final-review follow-up scope.',
+          };
+        }
+        return { ok: true };
       case 'accept_task':
         allowedStatuses = ['awaiting_user_acceptance'];
         break;
@@ -512,6 +595,14 @@ export class BridgeAgentService {
       ok: false,
       reason: `当前 task 状态是 ${state.status}，这个 workflow 动作只能在 ${allowedStatuses.join(', ')} 阶段使用。`,
     };
+  }
+
+  private bridgeToolNamesForNoOpState(state: NoOpState): Set<BridgeToolName> {
+    const toolNames = new Set(bridgeToolNamesForTaskStatus(state.status));
+    if (state.status === 'implementation_approved' && state.implementationFollowup) {
+      toolNames.add('run_followup');
+    }
+    return toolNames;
   }
 
   private async createTask(request: BridgeAgentRequest, toolCall: BridgeToolCall, fromTaskChat: boolean): Promise<BridgeAgentTurn> {
@@ -721,8 +812,12 @@ export class BridgeAgentService {
 
   private workflowMessage(result: WorkflowResult): BridgeOutboundMessage {
     const files = filesForState(result.state);
+    const waitingPrompt = result.state.status === 'waiting_user_direction' ? result.state.pendingUserPrompt?.trim() : undefined;
+    const text = waitingPrompt && !result.message.includes(waitingPrompt)
+      ? `${result.message}\n\n${waitingPrompt}`
+      : result.message;
     return {
-      text: result.message,
+      text,
       ...(files ? { files } : {}),
     };
   }
@@ -744,13 +839,68 @@ export function summarizeProjectChats(chats: ProjectChatRegistration[], activeBy
 function filesForState(state: TaskState): BridgeOutboundFile[] | undefined {
   const artifactNames: ArtifactName[] = [];
   if (state.status === 'ready_for_decision') artifactNames.push('assistant-explanation', 'revised-plan');
-  if (state.status === 'awaiting_user_acceptance') artifactNames.push('final-review', 'test-build-log');
+  if (isExtraHighPlanningPause(state)) artifactNames.push('revised-plan', 'plan-rounds-log', 'blocker-ledger');
+  if (state.status === 'awaiting_user_acceptance') artifactNames.push('final-review', 'test-build-log', 'deferred-issues');
   if (state.status === 'completed') artifactNames.push('final-report');
   const files = artifactNames
     .map((artifact) => state.artifacts[artifact])
     .filter((path): path is string => Boolean(path))
     .map((path) => ({ path, name: basename(path) }));
   return files.length > 0 ? files : undefined;
+}
+
+function isExtraHighPlanningPause(state: TaskState): boolean {
+  return state.status === 'waiting_user_direction'
+    && state.pendingUserDecision?.source === 'extra_high_planning';
+}
+
+function shouldRunExtraHighDirectionInBackground(state: TaskState, answer: string): boolean {
+  if (!isExtraHighPlanningPause(state)) return false;
+  const trimmed = answer.trim();
+  if (!trimmed) return false;
+  const selected = selectedDecisionOption(state.pendingUserDecision, trimmed);
+  if (/^stop$/i.test(trimmed)) return false;
+  if (!selected && /^(?:approve|approved|approve\s+a|yes|y|同意|批准)$/i.test(trimmed)) return false;
+  return true;
+}
+
+function extraHighDirectionBackgroundLabel(state: TaskState, answer: string): string {
+  const selected = selectedDecisionOption(state.pendingUserDecision, answer);
+  if (isExtraHighExecuteCurrentPlanDirection(answer, selected?.id)) return 'extra-high implementing';
+  return selected?.id === 'B' ? 'extra-high replanning' : 'extra-high planning';
+}
+
+function renderExtraHighDirectionStartedMessage(state: TaskState, answer: string, hasFiles: boolean): string {
+  const selected = selectedDecisionOption(state.pendingUserDecision, answer);
+  const executeCurrentPlan = isExtraHighExecuteCurrentPlanDirection(answer, selected?.id);
+  const firstLine = selected?.id === 'B'
+    ? '收到，我重新开始 Extra High planning。'
+    : executeCurrentPlan
+      ? '收到，我会直接执行当前 Extra High plan。'
+    : selected?.id === 'A'
+      ? '收到，我继续 Extra High planning 一轮。'
+      : '收到，我按你的方向继续 Extra High planning 一轮。';
+  const round = state.reviewerRunCount || state.revisionRound;
+  return [
+    firstLine,
+    round ? `当前停在第 ${round} 轮 reviewer 仍有 blocking findings。` : undefined,
+    hasFiles
+      ? '我先把当前 revised-plan 和 plan-rounds-log 附上，方便你看到现在的 plan 不是黑盒。'
+      : '当前状态里还没有可发送的 revised-plan 或 plan-rounds-log；这一轮完成后会随结果发送。',
+    executeCurrentPlan
+      ? '执行完成后我会把实现、测试和最终 review 结果发到这里。'
+      : '这一轮完成后我会把新的结果发到这里；如果仍有 blocking findings，会再次先问你要不要继续。',
+  ].filter((line): line is string => Boolean(line)).join('\n');
+}
+
+function isExtraHighExecuteCurrentPlanDirection(answer: string, selectedOptionId?: string): boolean {
+  if (selectedOptionId === 'C') return true;
+  const normalized = answer.trim().replace(/\s+/g, ' ').toLocaleLowerCase();
+  const compact = normalized.replace(/\s+/g, '');
+  return /(?:execute|implement|run|use|approve).*(?:current|this|latest).*(?:plan|方案)/i.test(normalized)
+    || /(?:current|this|latest).*(?:plan|方案).*(?:execute|implement|run|use|approve)/i.test(normalized)
+    || /(?:直接|现在|马上)?(?:执行|实施|实现|批准|照做|按).*(?:当前|这个|這個|这版|最新版|latest)?(?:plan|方案|计划|計劃)/.test(compact)
+    || /(?:按|照)(?:当前|这个|這個|这版|最新版)?(?:plan|方案|计划|計劃)(?:执行|做|实施|实现)/.test(compact);
 }
 
 function trimLiveProcessSnapshot(snapshot: BridgeLiveProcessSnapshot): BridgeLiveProcessSnapshot {
@@ -772,12 +922,16 @@ function renderBridgeStatus(state: TaskState, runningLabel?: string, liveProcess
   const liveLines = renderLiveProcessSummary(liveProcesses);
   const executionLines = renderExecutionProgress(state);
   const missingBackgroundWorker = isBackgroundWorkflowState(state.status) && !runningLabel && liveProcesses.length === 0;
+  const pendingPrompt = state.status === 'waiting_user_direction' ? state.pendingUserPrompt?.trim() : undefined;
   const lines = [
     `当前任务：${state.title}`,
     `阶段：${bridgeStageName(state.status)}`,
     `状态码：${state.status}`,
     state.difficulty ? `难度：${state.difficulty}` : undefined,
     runningLabel ? `后台任务：${runningLabel}` : undefined,
+    pendingPrompt ? '' : undefined,
+    pendingPrompt ? '待你决定：' : undefined,
+    pendingPrompt,
     missingBackgroundWorker
       ? '后台任务未运行：可能是上次 Manager 重启或进程中断后的残留状态；当前没有可恢复的 worker。'
       : undefined,
@@ -982,7 +1136,12 @@ function isArtifactName(value: string): value is ArtifactName {
     'git-post-status',
     'git-pre-diff',
     'git-post-diff',
+    'followup-git-pre-status',
+    'followup-git-pre-diff',
+    'followup-git-post-status',
+    'followup-git-post-diff',
     'test-build-log',
+    'deferred-issues',
     'final-review',
     'agent-prompts',
     'agent-prompt-preview',
@@ -994,12 +1153,18 @@ function instructionReply(base: string, instruction?: string): string {
   return instruction ? `${base}: ${instruction}` : base;
 }
 
+function isApproveConfirmation(input: string): boolean {
+  return /^(?:approve A|approve|approved|A|yes|y)$/i.test(input.trim().replace(/\s+/g, ' '));
+}
+
 function describeIntendedToolAction(toolName: BridgeToolName): string {
   switch (toolName) {
     case 'choose_difficulty':
       return '选择工作难度并开始规划';
     case 'approve_plan':
       return '批准计划并启动实现';
+    case 'run_followup':
+      return '运行 Final Review follow-up';
     case 'accept_task':
       return '验收当前 task';
     case 'answer_user_direction':

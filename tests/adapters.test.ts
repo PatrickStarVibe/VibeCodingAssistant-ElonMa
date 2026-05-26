@@ -1,14 +1,28 @@
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  HeavyAgentArtifactError,
   OpenAICompatibleAssistantAdapter,
   buildClaudeProfileArgs,
   buildCodexProfileArgs,
   buildInitialPlanPrompt,
+  buildReviewPlanPrompt,
+  buildRevisedPlanPrompt,
+  claudeAllowedToolsForWorkflowRole,
+  claudePermissionModeForWorkflowRole,
   codexSandboxForWorkflowRole,
   createAssistantAdapter,
   createHeavyAgentAdapter,
   extractPlanPackDraft,
+  parseAgentDecisionMarkdown,
+  parseAgentArchitectBlockerResponseMarkdown,
+  parseAgentReviewerBlockerMarkdown,
+  resolveHeavyAgentMarkdownFromOutput,
+  usesBlockerLedger,
 } from '../src/adapters.js';
 import { normalizeConfig } from '../src/config.js';
 import type { AgentProfileConfig, BridgeAgentInput, AssistantConfig, OrchestratorDecisionInput } from '../src/types.js';
@@ -300,6 +314,205 @@ describe('OpenAICompatibleAssistantAdapter', () => {
     expect(codexSandboxForWorkflowRole('planReviewer')).toBe('read-only');
   });
 
+  it('keeps Claude planners and reviewers read-only while leaving execution reviewers permissive', () => {
+    expect(claudePermissionModeForWorkflowRole('architect')).toBe('default');
+    expect(claudePermissionModeForWorkflowRole('planReviewer')).toBe('default');
+    expect(claudePermissionModeForWorkflowRole('developer')).toBe('bypassPermissions');
+    expect(claudePermissionModeForWorkflowRole('finalReviewer')).toBe('bypassPermissions');
+    expect(claudeAllowedToolsForWorkflowRole('architect')).toEqual(['Read', 'Grep', 'Glob', 'LS']);
+    expect(claudeAllowedToolsForWorkflowRole('planReviewer')).toEqual(['Read', 'Grep', 'Glob', 'LS']);
+    expect(claudeAllowedToolsForWorkflowRole('developer')).toEqual([]);
+  });
+
+  it('reads Claude plan-mode artifacts as the heavy-agent markdown body', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'assistant-claude-plan-'));
+    try {
+      const sourcePath = join(dir, 'plan.md');
+      await writeFile(sourcePath, '# Full Plan\n\n## Execution Unit 01: Build it\n', 'utf8');
+
+      const result = await resolveHeavyAgentMarkdownFromOutput({
+        code: 0,
+        stdout: `Planner summary\nPlan written to ${sourcePath}\n`,
+        stderr: '',
+      }, { kind: 'claude' });
+
+      expect(result.markdown).toContain('# Full Plan');
+      expect(result.sourcePath).toBe(sourcePath);
+      expect(result.stdoutSummary).toBe('Planner summary');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('throws a heavy-agent artifact error when Claude reports an unreadable plan file', async () => {
+    const sourcePath = join(tmpdir(), 'missing-claude-plan.md');
+
+    await expect(resolveHeavyAgentMarkdownFromOutput({
+      code: 0,
+      stdout: `Plan written to ${sourcePath}\n`,
+      stderr: '',
+    }, { kind: 'claude' })).rejects.toBeInstanceOf(HeavyAgentArtifactError);
+  });
+
+  it('keeps Claude stdout fallback when no plan artifact marker is present', async () => {
+    const result = await resolveHeavyAgentMarkdownFromOutput({
+      code: 0,
+      stdout: '# Direct Plan\n',
+      stderr: 'warning text',
+    }, { kind: 'claude' });
+
+    expect(result).toEqual({ markdown: '# Direct Plan\nwarning text' });
+  });
+
+  it('records the Codex last-message file as the heavy-agent source path', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'assistant-codex-plan-'));
+    try {
+      const outputPath = join(dir, 'last-message.md');
+      await writeFile(outputPath, '# Codex Plan\n\n## Execution Unit 01: Build it\n', 'utf8');
+
+      const result = await resolveHeavyAgentMarkdownFromOutput({
+        code: 0,
+        stdout: 'codex status line',
+        stderr: '',
+      }, { kind: 'codex', outputPath });
+
+      expect(result.markdown).toContain('# Codex Plan');
+      expect(result.sourcePath).toBe(outputPath);
+      expect(result.stdoutSummary).toBe('codex status line');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('parses Architect and Reviewer decision blocks from heavy-agent markdown', () => {
+    const decisionMarkdown = [
+      '# Needs Direction',
+      '',
+      '```assistant-user-decision',
+      '{',
+      '  "question": "Which scope should ship first?",',
+      '  "rationale": "The choice changes implementation scope.",',
+      '  "options": [',
+      '    { "label": "Ship MVP", "impact": "Keeps the work focused." },',
+      '    { "label": "Ship full scope", "impact": "Takes longer but covers everything." }',
+      '  ]',
+      '}',
+      '```',
+      '',
+      '## Context',
+      'Waiting for user direction.',
+    ].join('\n');
+    const plan = parseAgentDecisionMarkdown(decisionMarkdown, 'architect_plan');
+    const review = parseAgentDecisionMarkdown(decisionMarkdown, 'plan_review');
+
+    expect(plan.userDecision?.source).toBe('architect_plan');
+    expect(review.userDecision?.source).toBe('plan_review');
+    expect(plan.markdown).not.toContain('assistant-user-decision');
+    expect(review.markdown).not.toContain('assistant-user-decision');
+  });
+
+  it('sends authoritative Reviewer feedback and requested changes to Architect revise', () => {
+    const prompt = buildRevisedPlanPrompt({
+      task: 'Plan this.',
+      projectContext: 'Context packet',
+      initialPlan: '# Initial Plan',
+      review: 'Reviewer says preserve the rollback path.',
+      requestedChanges: ['User direction:\nShip MVP only.'],
+      difficulty: 'high',
+    });
+
+    expect(prompt).toContain('Reviewer feedback (authoritative; source of truth for what to change):');
+    expect(prompt).toContain('Reviewer says preserve the rollback path.');
+    expect(prompt).toContain('User workflow directives and requested changes (authoritative):');
+    expect(prompt).toContain('Ship MVP only.');
+    expect(prompt).not.toContain('Assistant revision instructions:');
+  });
+
+  it('injects blocker ledger protocol for high and extra-high but not medium', () => {
+    const highReview = buildReviewPlanPrompt({
+      task: 'Plan this.',
+      projectContext: 'Context packet',
+      initialPlan: '# Initial Plan',
+      difficulty: 'high',
+    });
+    const mediumReview = buildReviewPlanPrompt({
+      task: 'Plan this.',
+      projectContext: 'Context packet',
+      initialPlan: '# Initial Plan',
+      difficulty: 'medium',
+    });
+    const extraHighRevise = buildRevisedPlanPrompt({
+      task: 'Plan this.',
+      projectContext: 'Context packet',
+      initialPlan: '# Initial Plan',
+      review: 'Reviewer found blockers.',
+      requestedChanges: [],
+      difficulty: 'extra-high',
+      blockerLedgerText: '- B1 [blocker/test/open] Verification missing',
+    });
+
+    expect(usesBlockerLedger('high')).toBe(true);
+    expect(usesBlockerLedger('extra-high')).toBe(true);
+    expect(usesBlockerLedger('medium')).toBe(false);
+    expect(highReview).toContain('reviewer-blockers');
+    expect(highReview).toContain('previousBlockerVerdicts');
+    expect(mediumReview).not.toContain('reviewer-blockers');
+    expect(extraHighRevise).toContain('architect-blocker-responses');
+    expect(extraHighRevise).toContain('B1 [blocker/test/open] Verification missing');
+  });
+
+  it('parses and strips reviewer and architect blocker blocks from heavy-agent markdown', () => {
+    const review = parseAgentReviewerBlockerMarkdown([
+      '# Review',
+      '',
+      '```reviewer-blockers',
+      '{',
+      '  "blockers": [{',
+      '    "id": "B1",',
+      '    "severity": "blocker",',
+      '    "category": "test",',
+      '    "title": "Verification missing",',
+      '    "detail": "The plan lacks verification.",',
+      '    "verifyHint": "Add concrete commands."',
+      '  }],',
+      '  "previousBlockerVerdicts": []',
+      '}',
+      '```',
+    ].join('\n'));
+    const plan = parseAgentArchitectBlockerResponseMarkdown([
+      '# Revised Plan',
+      '',
+      '```architect-blocker-responses',
+      '{',
+      '  "responses": [{',
+      '    "id": "B1",',
+      '    "status": "addressed",',
+      '    "summary": "Added test commands.",',
+      '    "planAnchor": "## Verification Commands"',
+      '  }]',
+      '}',
+      '```',
+    ].join('\n'));
+
+    expect(review.reviewerBlockerOutput?.blockers[0]?.id).toBe('B1');
+    expect(review.markdown).not.toContain('reviewer-blockers');
+    expect(plan.architectBlockerResponses?.[0]?.planAnchor).toBe('## Verification Commands');
+    expect(plan.markdown).not.toContain('architect-blocker-responses');
+  });
+
+  it('reports blocker parse errors while stripping invalid fenced blocks', () => {
+    const review = parseAgentReviewerBlockerMarkdown([
+      '# Review',
+      '',
+      '```reviewer-blockers',
+      '{ nope',
+      '```',
+    ].join('\n'));
+
+    expect(review.blockerLedgerParseError).toContain('valid JSON');
+    expect(review.markdown).toBe('# Review');
+  });
+
   it('parses orchestrator decisions from chat JSON mode', async () => {
     let requestBody: Record<string, unknown> | undefined;
     vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
@@ -452,6 +665,57 @@ describe('OpenAICompatibleAssistantAdapter', () => {
     expect(toolNames).not.toContain('revise_plan');
   });
 
+  it('does not expose implementation approval tools without an active follow-up scope', async () => {
+    let requestBody: Record<string, unknown> | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      requestBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: 'ok' } }],
+      }), { status: 200 });
+    }));
+    const adapter = makeAssistantAdapter();
+    const input = makeBridgeInput();
+    input.latestUserMessage = 'approve A';
+    if (!input.task) throw new Error('Expected task fixture.');
+    input.task.status = 'implementation_approved';
+
+    await adapter.decideBridgeAction(input);
+
+    const toolNames = (requestBody?.tools as Array<{ function?: { name?: string } }> | undefined)
+      ?.map((tool) => tool.function?.name);
+    expect(toolNames).toEqual(expect.arrayContaining(['show_status']));
+    expect(toolNames).not.toContain('run_followup');
+    expect(toolNames).not.toContain('approve_plan');
+  });
+
+  it('exposes run_followup while a final-review follow-up is approved', async () => {
+    let requestBody: Record<string, unknown> | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      requestBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: 'ok' } }],
+      }), { status: 200 });
+    }));
+    const adapter = makeAssistantAdapter();
+    const input = makeBridgeInput();
+    input.latestUserMessage = 'approve A';
+    if (!input.task) throw new Error('Expected task fixture.');
+    input.task.status = 'implementation_approved';
+    input.task.implementationFollowup = {
+      source: 'final_review',
+      round: 1,
+      reason: 'Contained defect remains.',
+      createdAt: new Date().toISOString(),
+    };
+
+    await adapter.decideBridgeAction(input);
+
+    const toolNames = (requestBody?.tools as Array<{ function?: { name?: string } }> | undefined)
+      ?.map((tool) => tool.function?.name);
+    expect(toolNames).toEqual(expect.arrayContaining(['run_followup', 'show_status']));
+    expect(toolNames).not.toContain('approve_plan');
+  });
+
   it('instructs bridge decisions to submit pending user answers via answer_user_direction', async () => {
     let requestBody: Record<string, unknown> | undefined;
     vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
@@ -472,6 +736,43 @@ describe('OpenAICompatibleAssistantAdapter', () => {
     const messages = requestBody?.messages as Array<{ role: string; content: string }> | undefined;
     const system = messages?.filter((message) => message.role === 'system').map((message) => message.content).join('\n\n') ?? '';
     expect(system).toContain('MUST be sent via `answer_user_direction`');
+  });
+
+  it('parses structured user decisions from planning advisor text', async () => {
+    stubChatContent(JSON.stringify({
+      markdown: 'Need a scope decision.',
+      needsUserDecision: true,
+      userDecision: {
+        question: 'Should analytics be included now?',
+        rationale: 'Analytics changes the first implementation scope.',
+        options: [
+          { id: 'A', label: 'Skip analytics', impact: 'Keeps this task focused.' },
+          { id: 'B', label: 'Include analytics', impact: 'Adds scope and verification.' },
+        ],
+        recommendedOptionId: 'A',
+        recommendationReason: 'Planner recommends A because analytics was not requested.',
+      },
+    }));
+    const adapter = makeAssistantAdapter();
+
+    const result = await adapter.createRevisionInstructions({
+      task: 'Build it.',
+      projectContext: '',
+      initialPlan: 'Plan.',
+      review: 'Review.',
+      requestedChanges: [],
+      state: { taskId: 'TASK-1', requestedChanges: [] } as never,
+      config: makeConfig(),
+    });
+
+    expect(result.needsUserDecision).toBe(true);
+    expect(result.userDecision).toMatchObject({
+      source: 'plan_revision',
+      question: 'Should analytics be included now?',
+      recommendedOptionId: 'A',
+      recommendationReason: 'Planner recommends A because analytics was not requested.',
+    });
+    expect(result.userDecision?.options).toHaveLength(2);
   });
 
   it('parses bridge assistant text when no tool is called', async () => {

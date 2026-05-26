@@ -4,8 +4,12 @@ import { join, resolve } from 'node:path';
 
 import { getDefaultAssistantRoot } from './config.js';
 import { normalizeWorkflowDifficulty, WORKFLOW_DIFFICULTIES } from './difficulty.js';
+import {
+  parseArchitectResponsesBlock,
+  parseReviewerBlockerBlock,
+} from './blockerLedger.js';
 import { sanitizeTextForArtifact } from './textSanitizer.js';
-import { runFile } from './processRunner.js';
+import { runFile, type RunResult } from './processRunner.js';
 import type {
   AgentPromptRecord,
   AgentProfileConfig,
@@ -19,6 +23,7 @@ import type {
   FinalReviewResult,
   ExecutionUnitState,
   HeavyWorkflowRoleName,
+  ImplementationMode,
   ImplementationResult,
   IntentName,
   IntentResult,
@@ -32,8 +37,10 @@ import type {
   ReviewResult,
   TaskProposal,
   TaskState,
+  PendingUserDecisionSource,
   WorkflowDifficulty,
 } from './types.js';
+import { normalizePendingUserDecision, parseUserDecisionBlock } from './userDecision.js';
 
 export interface AssistantAdapter {
   decideBridgeAction?(input: BridgeAgentInput): Promise<BridgeAgentDecision>;
@@ -66,7 +73,6 @@ export interface AssistantAdapter {
     projectContext: string;
     revisedPlan: string;
     review: string;
-    revisionInstructions: string;
     state: TaskState;
     config: AssistantConfig;
   }): Promise<AssistantTextResult>;
@@ -89,16 +95,17 @@ export interface AssistantAdapter {
 
 export interface HeavyAgentAdapter {
   createInitialPlan(input: { task: string; projectContext: string; difficulty: WorkflowDifficulty; state: TaskState; config: AssistantConfig }): Promise<PlanResult>;
-  reviewPlan(input: { task: string; projectContext: string; initialPlan: string; difficulty: WorkflowDifficulty; state: TaskState; config: AssistantConfig }): Promise<ReviewResult>;
+  reviewPlan(input: { task: string; projectContext: string; initialPlan: string; difficulty: WorkflowDifficulty; state: TaskState; config: AssistantConfig; blockerLedgerText?: string }): Promise<ReviewResult>;
   revisePlan(input: {
     task: string;
     projectContext: string;
     initialPlan: string;
     review: string;
-    revisionInstructions: string;
+    requestedChanges: string[];
     difficulty: WorkflowDifficulty;
     state: TaskState;
     config: AssistantConfig;
+    blockerLedgerText?: string;
   }): Promise<PlanResult>;
   implement(input: {
     task: string;
@@ -107,6 +114,10 @@ export interface HeavyAgentAdapter {
     executionUnit: ExecutionUnitState;
     state: TaskState;
     config: AssistantConfig;
+    mode: ImplementationMode;
+    finalReviewReason?: string;
+    priorImplementationLog?: string;
+    priorVerificationLog?: string;
   }): Promise<ImplementationResult>;
   finalReview(input: {
     task: string;
@@ -157,7 +168,7 @@ function numberValue(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
-function assistantTextFromContent(content: string): AssistantTextResult {
+function assistantTextFromContent(content: string, decisionSource: PendingUserDecisionSource): AssistantTextResult {
   const payload = record(parseMaybeJson(content));
   const result: AssistantTextResult = {
     markdown: stringValue(payload.markdown) ?? stringValue(payload.content) ?? content,
@@ -165,6 +176,8 @@ function assistantTextFromContent(content: string): AssistantTextResult {
   };
   const userPrompt = stringValue(payload.userPrompt);
   if (userPrompt) result.userPrompt = userPrompt;
+  const decision = normalizePendingUserDecision(payload.userDecision, decisionSource);
+  if (decision.ok) result.userDecision = decision.decision;
   return result;
 }
 
@@ -183,6 +196,8 @@ function routeFromContent(content: string): AssistantRouteResult {
     };
     const userPrompt = stringValue(payload.userPrompt);
     if (userPrompt) result.userPrompt = userPrompt;
+    const decision = normalizePendingUserDecision(payload.userDecision, 'final_review');
+    if (decision.ok) result.userDecision = decision.decision;
     return result;
   }
 
@@ -223,7 +238,12 @@ const ARTIFACT_NAMES = new Set<ArtifactName>([
   'git-post-status',
   'git-pre-diff',
   'git-post-diff',
+  'followup-git-pre-status',
+  'followup-git-pre-diff',
+  'followup-git-post-status',
+  'followup-git-post-diff',
   'test-build-log',
+  'deferred-issues',
   'final-review',
   'agent-prompts',
   'agent-prompt-preview',
@@ -244,6 +264,7 @@ const BRIDGE_TOOL_NAMES = new Set<BridgeToolName>([
   'create_task',
   'choose_difficulty',
   'approve_plan',
+  'run_followup',
   'accept_task',
   'answer_user_direction',
   'revise_plan',
@@ -522,6 +543,17 @@ function bridgeTools(input?: BridgeAgentInput): ChatCompletionTool[] {
     {
       type: 'function',
       function: {
+        name: 'run_followup',
+        description: 'Run the scoped Final Review follow-up unit. Use only when task.status is implementation_approved and the task has implementationFollowup.',
+        parameters: object({
+          taskId: string('Optional task id; defaults to the currently bound task.'),
+          instruction: string('Optional follow-up constraint from the user.'),
+        }),
+      },
+    },
+    {
+      type: 'function',
+      function: {
         name: 'answer_user_direction',
         description: '回答当前 task 正在等待的用户方向/选项确认。只用于 waiting_user_direction 阶段；不要用 accept_task 或 revise_plan 代替。',
         parameters: object({
@@ -687,7 +719,13 @@ export function bridgeToolNamesForTaskStatus(status: TaskState['status']): Set<B
 export function bridgeToolNamesForInput(input?: BridgeAgentInput): Set<BridgeToolName> {
   if (!input) return BRIDGE_TOOL_NAMES;
   if (input.chat.chatKind === 'control') return CONTROL_BRIDGE_TOOL_NAMES;
-  if (input.task?.status) return bridgeToolNamesForTaskStatus(input.task.status);
+  if (input.task?.status) {
+    const toolNames = new Set(bridgeToolNamesForTaskStatus(input.task.status));
+    if (input.task.status === 'implementation_approved' && input.task.implementationFollowup) {
+      toolNames.add('run_followup');
+    }
+    return toolNames;
+  }
   if (input.chat.boundTaskId) return BOUND_TASK_FALLBACK_TOOL_NAMES;
   if (input.chat.chatKind === 'project') return IDLE_PROJECT_CHAT_TOOL_NAMES;
   return BRIDGE_TOOL_NAMES;
@@ -909,7 +947,7 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
     return content ? bridgeDecisionFromContent(content, availableToolNames) : { kind: 'reply', text: responseText };
   }
 
-  private async structuredText(user: string): Promise<AssistantTextResult> {
+  private async structuredText(user: string, decisionSource: PendingUserDecisionSource): Promise<AssistantTextResult> {
     const content = await this.chat([
       { role: 'system', content: await this.elonMaSystem() },
       {
@@ -917,14 +955,18 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
         content: [
           'You are Elon Ma, the agent for a local AI coding workflow.',
           'Your display name is Assistant Elon Ma. If asked your name, answer that you are Assistant Elon Ma; do not use provider names or generic assistant names.',
-          'Return JSON only with keys markdown, needsUserDecision, and optional userPrompt.',
+          'Return JSON only with keys markdown, needsUserDecision, optional userPrompt, and optional userDecision.',
           'Ask the user only for product, logic, cost, UX, scope, or direction decisions.',
           'Never ask for low-level file/helper/test implementation permission.',
+          'When needsUserDecision=true, userDecision is REQUIRED and must contain question, rationale, options, and allowFreeform=true.',
+          'userDecision.options must contain 1 to 4 choices with ids A, B, C, D in order; each option needs label and impact.',
+          'If Architect, Reviewer, or Assistant Elon Ma recommends an option, include recommendedOptionId and recommendationReason. Do not invent a Manager-side recommendation.',
+          'The user may answer with A/B/C/D or free-form instructions.',
         ].join(' '),
       },
       { role: 'user', content: user },
     ], true);
-    return assistantTextFromContent(content);
+    return assistantTextFromContent(content, decisionSource);
   }
 
   async decideBridgeAction(input: BridgeAgentInput): Promise<BridgeAgentDecision> {
@@ -940,7 +982,7 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
           'When a Project Chat has an active task, use only the active-task workflow tools that are available. Do not start a second task in that group.',
           'If you do not call a tool, your text MUST NOT claim that anything was recorded, advanced, accepted, approved, stopped, started, routed, or fed back to the workflow. Plain replies are explanation, translation, Q&A, or clarification only.',
           'If the user asks for an action that has no available tool in the current state, do not pretend to do it. Say plainly that you cannot execute it, name what you would have done, and list the available tools for the current state.',
-          'If task.status is `waiting_user_direction`, any reply that addresses the pending question — including a bare number, an option letter, or a sentence explaining the choice — **MUST be sent via `answer_user_direction`**. Plain text is allowed only when you are genuinely asking the user a clarifying question back; in that case do not claim you will record, forward, or feed anything to the workflow.',
+          'If task.status is `waiting_user_direction`, any reply that addresses the pending question, including an A/B/C/D option letter or a sentence explaining the choice, **MUST be sent via `answer_user_direction`**. Plain text is allowed only when you are genuinely asking the user a clarifying question back; in that case do not claim you will record, forward, or feed anything to the workflow.',
           'When Control/Private Chat receives a task prompt, identify the project. If the project is unclear, ask a short clarification question. If the project is clear, use schedule_task_to_project_chat so Manager can place it into an idle Project Chat.',
           'If every Project Chat for a clear project is busy, explain that and ask whether to create a new Project Chat; do not auto-create one without user confirmation.',
           'Use create_project_chat only after the user asks for a new Project Chat or confirms that they want one.',
@@ -972,7 +1014,7 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
         content: [
           '你是 Assistant Elon Ma 的 workflow advisor/orchestrator.',
           '只能选择 allowedActions 内允许的 intent；action 只能是 respond, approve_implementation, forward_to_workflow, show_artifact, ask_clarification, wait_for_user.',
-          'awaiting_difficulty_selection 阶段，如果用户明确选择 low/medium/high/extra-high，返回 action=forward_to_workflow, intent=difficulty, difficulty=<level>. extra-high 表示 high 流程加 Planner/Reviewer 最多 3 轮 plan 打磨。',
+          'awaiting_difficulty_selection 阶段，如果用户明确选择 low/medium/high/extra-high，返回 action=forward_to_workflow, intent=difficulty, difficulty=<level>. extra-high 表示 high 流程加 Planner/Reviewer 初始最多 3 轮；若仍有 blocking concerns，系统会询问用户是否再跑一轮。',
           'awaiting_difficulty_selection 阶段不是表单监狱；如果用户在提问、吐槽、补充上下文、要求解释或表达想暂停/取消，就像助理一样理解并选择 respond、wait_for_user、ask_clarification 或合法的 stop，不要机械复读 low/medium/high/extra-high.',
           'ready_for_decision 阶段，如果用户明确批准计划，返回 action=approve_implementation.',
           '高风险动作 approve_implementation 以及 accept/reject/stop 要求 confidence >= 0.8.',
@@ -1015,7 +1057,7 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
           'JSON keys: intent, difficulty, instruction, note, artifact, confidence, requiresClarification, userFacingInterpretation.',
           'intent 必须是 allowedActions 里的 id；如果无法判断，用 unknown。',
           '如果 allowedActions 里有 ask，而用户是在提问、聊天、吐槽、补充上下文或要求解释，不要用 unknown；用 ask。等待难度选择时也一样，不能把这个阶段当成只接受 low/medium/high/extra-high 的表单。',
-          'difficulty 只在 intent=difficulty 时填写 low、medium、high 或 extra-high。extra-high 表示 high 流程加 Planner/Reviewer 最多 3 轮 plan 打磨。',
+          'difficulty 只在 intent=difficulty 时填写 low、medium、high 或 extra-high。extra-high 表示 high 流程加 Planner/Reviewer 初始最多 3 轮；之后每一轮都需要用户确认。',
           'instruction 可以跟随任何会推动 workflow 的 intent，用来保留用户给后续 agent 的约束、原文使用要求、范围边界或修改要求；不要丢掉这些信息。',
           'note 只在 intent=note 时填写备注。',
           'artifact 可在用户要求查看、发送、解释或使用某个产物时填写；可选值包括 original-task、revised-plan、agent-prompts、agent-prompt-preview、final-report 等。',
@@ -1103,12 +1145,13 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
     return this.structuredText([
       priorityNote,
       'Do not ask the user unless there is a product/direction-level decision that the user has not already answered.',
+      'If you need a user decision, provide userDecision with A/B/C/D structured options and include any Assistant Elon Ma recommendation with its explanation.',
       `Project context:\n${input.projectContext}`,
       `Task:\n${input.task}`,
       `Initial plan:\n${input.initialPlan}`,
       `Reviewer feedback:\n${input.review}`,
       `User requested changes (PRIORITY when present):\n${input.requestedChanges.join('\n\n') || 'none'}`,
-    ].join('\n\n'));
+    ].join('\n\n'), 'plan_revision');
   }
 
   async explainRevisedPlan(input: {
@@ -1116,7 +1159,6 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
     projectContext: string;
     revisedPlan: string;
     review: string;
-    revisionInstructions: string;
     state: TaskState;
     config: AssistantConfig;
   }): Promise<AssistantTextResult> {
@@ -1125,13 +1167,12 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
       plainLanguageSkill,
       'Explain the revised plan to the user in plain language.',
       'Explain what the plan tries to do, why it flows logically, practical meaning of important technical choices, what the reviewer objected to, and how the revision addressed it.',
-      'Identify whether remaining decisions are technical-only or product/direction-level.',
+      'This explanation is informational only. Do not set needsUserDecision or ask the user for a planning decision here.',
       `Project context:\n${input.projectContext}`,
       `Task:\n${input.task}`,
       `Reviewer feedback:\n${input.review}`,
-      `Revision instructions:\n${input.revisionInstructions}`,
       `Revised plan:\n${input.revisedPlan}`,
-    ].filter(Boolean).join('\n\n'));
+    ].filter(Boolean).join('\n\n'), 'plan_explanation');
   }
 
   async answerQuestion(input: { question: string; context: string; projectContext: string; state: TaskState; config: AssistantConfig }): Promise<string> {
@@ -1225,8 +1266,9 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
         role: 'system',
         content: [
           'You route after final review.',
-          'Return JSON only: {"route":"complete|route_to_implementer|route_to_planner|ask_user_direction","reason":"...","userPrompt":"optional"}',
+          'Return JSON only: {"route":"complete|route_to_implementer|route_to_planner|ask_user_direction","reason":"...","userPrompt":"optional","userDecision":"optional"}',
           'Route to implementer for contained implementation defects, planner for plan/design mismatch, ask user for product/scope/direction decisions.',
+          'If route=ask_user_direction, userDecision is REQUIRED with question, rationale, 1 to 4 A/B/C/D options, allowFreeform=true, and any recommendation explanation from the advisor.',
         ].join(' '),
       },
       {
@@ -1256,13 +1298,20 @@ export class StubHeavyAgentAdapter implements HeavyAgentAdapter {
     };
   }
 
-  async reviewPlan(): Promise<ReviewResult> {
+  async reviewPlan(input: { difficulty: WorkflowDifficulty }): Promise<ReviewResult> {
+    const usesLedger = usesBlockerLedger(input.difficulty);
     return {
       markdown: [
         '# Reviewer Feedback',
         '',
         'Stub reviewer: no blocking issues found. Enable `--allow-agent-calls` for the configured Reviewer Agent.',
       ].join('\n'),
+      ...(usesLedger ? {
+        reviewerBlockerOutput: {
+          blockers: [],
+          previousVerdicts: [],
+        },
+      } : {}),
     };
   }
 
@@ -1270,19 +1319,23 @@ export class StubHeavyAgentAdapter implements HeavyAgentAdapter {
     task: string;
     initialPlan: string;
     review: string;
-    revisionInstructions: string;
+    requestedChanges: string[];
     difficulty: WorkflowDifficulty;
     state: TaskState;
     config: AssistantConfig;
+    blockerLedgerText?: string;
   }): Promise<PlanResult> {
     return {
       markdown: [
         '# Revised Plan',
         '',
-        'This is a stub revised plan created from the Assistant revision instructions.',
+        'This is a stub revised plan created from the authoritative Reviewer feedback and user-requested changes.',
         '',
-        '## Revision Instructions',
-        input.revisionInstructions,
+        '## Reviewer Feedback',
+        input.review,
+        '',
+        '## User Requested Changes',
+        input.requestedChanges.join('\n\n') || 'none',
         '',
         '## Verification Commands',
         '- npm test',
@@ -1291,10 +1344,14 @@ export class StubHeavyAgentAdapter implements HeavyAgentAdapter {
     };
   }
 
-  async implement(): Promise<ImplementationResult> {
+  async implement(input?: { mode?: ImplementationMode }): Promise<ImplementationResult> {
     return {
       markdown: [
         '# Implementation Log',
+        '',
+        input?.mode === 'final_review_followup'
+          ? 'Stub implementer ran a Final Review Follow-up scoped implementation.'
+          : 'Stub implementer ran the approved execution unit.',
         '',
         'Stub implementer did not modify the target workspace. Enable `--allow-agent-calls` to call the configured Implementer Agent.',
       ].join('\n'),
@@ -1335,8 +1392,109 @@ export function buildInitialPlanPrompt(input: {
     `User workflow directives and requested changes:\n${input.state.requestedChanges.join('\n\n') || 'none'}`,
     'When user workflow directives conflict with anything else, follow the user workflow directives.',
     'Priority order: explicit user workflow directives > authoritative user prompt > current code/project context.',
+    architectDecisionProtocolPrompt(),
     'End with a "Verification Commands" section listing only commands to run.',
   ].join('\n\n');
+}
+
+function architectDecisionProtocolPrompt(): string {
+  return [
+    'User decision protocol:',
+    'If a product, scope, UX, cost, or direction decision is required before writing a usable plan, do not guess and do not pick for the user.',
+    'Instead, include exactly one fenced JSON block with language `assistant-user-decision` containing question, rationale, 1 to 4 options with label and impact, and optional recommendedOptionId plus recommendationReason.',
+    'If no user decision is required, do not include an assistant-user-decision block.',
+    'Output contract: return the full plan markdown directly in your final stdout response. Do not only say "Plan written to <path>". Do not rely on provider-specific plan files.',
+  ].join('\n');
+}
+
+function reviewerDecisionProtocolPrompt(): string {
+  return [
+    'Reviewer decision protocol:',
+    'Your review markdown is authoritative feedback for the Architect.',
+    'Only if a product, scope, UX, cost, or direction decision must be made by the user, include exactly one fenced JSON block with language `assistant-user-decision` containing question, rationale, 1 to 4 options with label and impact, and optional recommendedOptionId plus recommendationReason.',
+    'Do not ask the user for purely technical fixes, missing tests, implementation risks, or plan quality issues; write those directly in the review.',
+    'Output contract: return the full review markdown directly in your final stdout response. Do not only say "Plan written to <path>". Do not rely on provider-specific plan files.',
+  ].join('\n');
+}
+
+function reviewerBlockerProtocolPrompt(difficulty: WorkflowDifficulty, ledgerText: string): string {
+  const isExtraHigh = difficulty === 'extra-high';
+  return [
+    'Blocker ledger protocol:',
+    'Because this is high or extra-high planning, you MUST include exactly one fenced JSON block with language `reviewer-blockers`.',
+    'Use this schema: {"blockers":[{"id":"B1","severity":"blocker|high|medium","category":"design|test|scope|risk|ambiguity|other","title":"short title","detail":"why this blocks or risks the plan and what must change","verifyHint":"how the Architect can prove it was fixed"}],"previousBlockerVerdicts":[{"id":"B1","verdict":"closed|still_open|changed","reason":"why"}]}.',
+    'If there are no blockers, output `"blockers": []`.',
+    isExtraHigh
+      ? 'For the first ledger review, previousBlockerVerdicts MUST be []. For later reviews, previousBlockerVerdicts MUST cover every active prior blocker from the ledger context. Use closed only when the latest plan truly resolves it; use still_open if it remains; use changed only when you update the same blocker id and include that id in blockers with updated fields.'
+      : 'For high planning, this is a single-pass ledger. previousBlockerVerdicts should be [] unless Manager provides an active prior ledger.',
+    'New blocker ids must look like B1, B2, B3 and must be greater than any existing blocker id. Do not renumber existing blockers.',
+    'Do not repeat still_open blockers in blockers; Manager carries them forward automatically. If changed, repeat the same id in blockers with updated detail.',
+    'Ledger context for this review:',
+    ledgerText,
+  ].join('\n');
+}
+
+function architectBlockerResponseProtocolPrompt(ledgerText: string): string {
+  return [
+    'Architect blocker response protocol:',
+    'If the ledger context below contains active blockers, you MUST include exactly one fenced JSON block with language `architect-blocker-responses`.',
+    'Use this schema: {"responses":[{"id":"B1","status":"addressed|partially_addressed|needs_user_decision|rejected","summary":"how the revised plan handles this blocker","planAnchor":"heading, Execution Unit, or section where the plan reflects this","rejectionReason":"only when status is rejected"}]}.',
+    'Responses must cover every active blocker id in the ledger context. Do not invent new blocker ids; only Reviewer creates blockers.',
+    'planAnchor is required for addressed and partially_addressed. rejectionReason is required for rejected.',
+    'If status is needs_user_decision, also include the existing assistant-user-decision fenced JSON block in the same output.',
+    'If the ledger context says there are no active blockers, do not include architect-blocker-responses.',
+    'Active blocker ledger context:',
+    ledgerText,
+  ].join('\n');
+}
+
+export function buildRevisedPlanPrompt(input: {
+  task: string;
+  projectContext: string;
+  initialPlan: string;
+  review: string;
+  requestedChanges: string[];
+  difficulty: WorkflowDifficulty;
+  blockerLedgerText?: string;
+}): string {
+  return [
+    'Act as the Architect. Create the revised plan. Do not edit files.',
+    'Every approved plan is one parent task. If decomposition is useful, describe execution units; otherwise treat it as one execution unit.',
+    'When you decompose, format each execution unit as its own Markdown heading exactly like: "## Execution Unit 01: <name>".',
+    'Do not use only a numbered list under "Execution units" for decomposed plans; Manager can read the heading format reliably.',
+    'Suggest exactly one lightweight Category if obvious. Use Other when unsure. Do not create category folders or tags.',
+    `Workflow difficulty: ${input.difficulty}`,
+    `Project context:\n${input.projectContext}`,
+    `Task:\n${input.task}`,
+    `Initial plan:\n${input.initialPlan}`,
+    `Reviewer feedback (authoritative; source of truth for what to change):\n${input.review}`,
+    usesBlockerLedger(input.difficulty) ? architectBlockerResponseProtocolPrompt(input.blockerLedgerText ?? '(no active blockers)') : undefined,
+    `User workflow directives and requested changes (authoritative):\n${input.requestedChanges.join('\n\n') || 'none'}`,
+    architectDecisionProtocolPrompt(),
+    'End with a "Verification Commands" section listing only commands to run.',
+  ].filter((part): part is string => part !== undefined).join('\n\n');
+}
+
+export function buildReviewPlanPrompt(input: {
+  task: string;
+  projectContext: string;
+  initialPlan: string;
+  difficulty: WorkflowDifficulty;
+  blockerLedgerText?: string;
+}): string {
+  return [
+    'Act as the Plan Reviewer. Review this initial plan once. Focus on blocking bugs, risks, missing tests, product-impacting ambiguity, and whether any proposed execution-unit breakdown is coherent.',
+    `Workflow difficulty: ${input.difficulty}`,
+    `Project context:\n${input.projectContext}`,
+    `Task:\n${input.task}`,
+    `Initial plan:\n${input.initialPlan}`,
+    usesBlockerLedger(input.difficulty) ? reviewerBlockerProtocolPrompt(input.difficulty, input.blockerLedgerText ?? '(no prior blockers; this is the first ledger review)') : undefined,
+    reviewerDecisionProtocolPrompt(),
+  ].filter((part): part is string => part !== undefined).join('\n\n');
+}
+
+export function usesBlockerLedger(difficulty: WorkflowDifficulty): boolean {
+  return difficulty === 'high' || difficulty === 'extra-high';
 }
 
 export function buildCodexProfileArgs(profile: AgentProfileConfig | undefined): string[] {
@@ -1381,6 +1539,141 @@ export function codexSandboxForWorkflowRole(role: HeavyWorkflowRoleName): 'dange
   return 'read-only';
 }
 
+export function claudePermissionModeForWorkflowRole(role: HeavyWorkflowRoleName): 'bypassPermissions' | 'default' {
+  return role === 'architect' || role === 'planReviewer' ? 'default' : 'bypassPermissions';
+}
+
+export function claudeAllowedToolsForWorkflowRole(role: HeavyWorkflowRoleName): string[] {
+  return role === 'architect' || role === 'planReviewer'
+    ? ['Read', 'Grep', 'Glob', 'LS']
+    : [];
+}
+
+export class HeavyAgentArtifactError extends Error {
+  readonly sourcePath?: string;
+
+  constructor(message: string, options: { sourcePath?: string } = {}) {
+    super(message);
+    this.name = 'HeavyAgentArtifactError';
+    if (options.sourcePath) this.sourcePath = options.sourcePath;
+  }
+}
+
+interface HeavyAgentMarkdownResult {
+  markdown: string;
+  sourcePath?: string;
+  stdoutSummary?: string;
+}
+
+export function parseAgentDecisionMarkdown(
+  markdown: string,
+  source: PendingUserDecisionSource,
+): Pick<PlanResult, 'markdown' | 'userDecision' | 'decisionParseError'> {
+  const parsed = parseUserDecisionBlock(markdown, source);
+  if (!parsed) return { markdown };
+  if (!parsed.ok) {
+    return {
+      markdown,
+      decisionParseError: parsed.error,
+    };
+  }
+  return {
+    markdown: parsed.result.strippedMarkdown,
+    userDecision: parsed.result.decision,
+  };
+}
+
+export function parseAgentReviewerBlockerMarkdown(
+  markdown: string,
+): Pick<ReviewResult, 'markdown' | 'reviewerBlockerOutput' | 'blockerLedgerParseError'> {
+  const parsed = parseReviewerBlockerBlock(markdown);
+  if (!parsed) return { markdown };
+  if (!parsed.ok) {
+    return {
+      markdown: parsed.strippedMarkdown,
+      blockerLedgerParseError: parsed.error,
+    };
+  }
+  return {
+    markdown: parsed.strippedMarkdown,
+    reviewerBlockerOutput: parsed.output,
+  };
+}
+
+export function parseAgentArchitectBlockerResponseMarkdown(
+  markdown: string,
+): Pick<PlanResult, 'markdown' | 'architectBlockerResponses' | 'blockerResponseParseError'> {
+  const parsed = parseArchitectResponsesBlock(markdown);
+  if (!parsed) return { markdown };
+  if (!parsed.ok) {
+    return {
+      markdown: parsed.strippedMarkdown,
+      blockerResponseParseError: parsed.error,
+    };
+  }
+  return {
+    markdown: parsed.strippedMarkdown,
+    architectBlockerResponses: parsed.responses,
+  };
+}
+
+const CLAUDE_PLAN_PATH_REGEX = /Plan written to\s+`?([^\r\n`]+?\.md)`?\.?/i;
+
+function commandOutputErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function combineCommandOutput(result: RunResult): string {
+  return [result.stdout, result.stderr]
+    .map((part) => sanitizeTextForArtifact(part).trim())
+    .filter(Boolean)
+    .join('\n');
+}
+
+export async function resolveHeavyAgentMarkdownFromOutput(
+  result: RunResult,
+  options: {
+    kind: 'claude' | 'codex' | 'generic';
+    outputPath?: string;
+  },
+): Promise<HeavyAgentMarkdownResult> {
+  const combined = combineCommandOutput(result);
+
+  if (options.kind === 'codex' && options.outputPath) {
+    const body = sanitizeTextForArtifact(await readFile(options.outputPath, 'utf8').catch(() => '')).trim();
+    if (body) {
+      return {
+        markdown: body,
+        sourcePath: options.outputPath,
+        ...(combined ? { stdoutSummary: combined } : {}),
+      };
+    }
+  }
+
+  if (options.kind === 'claude') {
+    const match = combined.match(CLAUDE_PLAN_PATH_REGEX);
+    const sourcePath = match?.[1]?.trim();
+    if (sourcePath) {
+      const matchedText = match?.[0] ?? '';
+      const fileBody = await readFile(sourcePath, 'utf8').catch((error: unknown) => {
+        throw new HeavyAgentArtifactError(
+          `Claude reported plan at ${sourcePath} but the file is not readable: ${commandOutputErrorMessage(error)}`,
+          { sourcePath },
+        );
+      });
+      const stdoutSummary = combined.replace(matchedText, '').trim();
+      return {
+        markdown: sanitizeTextForArtifact(fileBody).trim(),
+        sourcePath,
+        ...(stdoutSummary ? { stdoutSummary } : {}),
+      };
+    }
+
+  }
+
+  return { markdown: combined };
+}
+
 class CliHeavyAgentAdapter implements HeavyAgentAdapter {
   constructor(private readonly config: AssistantConfig) {}
 
@@ -1391,7 +1684,7 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
     profile: AgentProfileConfig,
     taskId: string,
     config = this.config,
-  ): Promise<string> {
+  ): Promise<HeavyAgentMarkdownResult> {
     const command = requireProfileCommand(profileName, role, profile);
     const sandbox = codexSandboxForWorkflowRole(role);
     const outputDir = await mkdtemp(join(tmpdir(), 'assistant-codex-'));
@@ -1419,8 +1712,7 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
         label: `${role}:${profileName}`,
         outputPath,
       });
-      const lastMessage = await readFile(outputPath, 'utf8').catch(() => '');
-      return sanitizeTextForArtifact(lastMessage.trim() || [result.stdout, result.stderr].filter(Boolean).join('\n'));
+      return resolveHeavyAgentMarkdownFromOutput(result, { kind: 'codex', outputPath });
     } finally {
       await rm(outputDir, { recursive: true, force: true }).catch(() => undefined);
     }
@@ -1433,13 +1725,16 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
     profile: AgentProfileConfig,
     taskId: string,
     config = this.config,
-  ): Promise<string> {
+  ): Promise<HeavyAgentMarkdownResult> {
     const command = requireProfileCommand(profileName, role, profile);
+    const permissionMode = claudePermissionModeForWorkflowRole(role);
+    const allowedTools = claudeAllowedToolsForWorkflowRole(role);
     const result = await runFile(command, [
       '-p',
       ...buildClaudeProfileArgs(profile),
       '--permission-mode',
-      'bypassPermissions',
+      permissionMode,
+      ...(allowedTools.length > 0 ? ['--allowedTools', allowedTools.join(',')] : []),
       '--add-dir',
       config.workspace.targetDir,
     ], config.workspace.targetDir, prompt, {
@@ -1448,7 +1743,7 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
       profileName,
       label: `${role}:${profileName}`,
     });
-    return sanitizeTextForArtifact([result.stdout, result.stderr].filter(Boolean).join('\n'));
+    return resolveHeavyAgentMarkdownFromOutput(result, { kind: 'claude' });
   }
 
   private async genericCommand(
@@ -1458,7 +1753,7 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
     profile: AgentProfileConfig,
     taskId: string,
     config = this.config,
-  ): Promise<string> {
+  ): Promise<HeavyAgentMarkdownResult> {
     const command = requireProfileCommand(profileName, role, profile);
     const result = await runFile(command, [], config.workspace.targetDir, prompt, {
       taskId,
@@ -1466,7 +1761,7 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
       profileName,
       label: `${role}:${profileName}`,
     });
-    return sanitizeTextForArtifact([result.stdout, result.stderr].filter(Boolean).join('\n'));
+    return resolveHeavyAgentMarkdownFromOutput(result, { kind: 'generic' });
   }
 
   private runWorkflowRole(
@@ -1475,7 +1770,7 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
     role: HeavyWorkflowRoleName,
     config: AssistantConfig,
     state: Pick<TaskState, 'taskId'>,
-  ): Promise<string> {
+  ): Promise<HeavyAgentMarkdownResult> {
     const profileName = config.workflowRoles[difficulty][role];
     const profile = config.profiles[profileName];
     if (!profile) {
@@ -1521,26 +1816,34 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
 
   async createInitialPlan(input: { task: string; projectContext: string; difficulty: WorkflowDifficulty; state: TaskState; config: AssistantConfig }): Promise<PlanResult> {
     const prompt = buildInitialPlanPrompt(input);
-    const markdown = await this.runWorkflowRole(prompt, input.difficulty, 'architect', input.config, input.state);
+    const output = await this.runWorkflowRole(prompt, input.difficulty, 'architect', input.config, input.state);
+    const parsed = parseAgentDecisionMarkdown(output.markdown, 'architect_plan');
     return {
-      markdown,
-      verificationCommands: extractVerificationCommands(markdown),
-      planPackDraft: extractPlanPackDraft(markdown),
+      markdown: parsed.markdown,
+      verificationCommands: extractVerificationCommands(parsed.markdown),
+      planPackDraft: extractPlanPackDraft(parsed.markdown),
       agentPrompt: this.agentPromptRecord(prompt, input.difficulty, 'architect', input.state, input.config),
+      ...(output.sourcePath ? { sourcePath: output.sourcePath } : {}),
+      ...(output.stdoutSummary ? { stdoutSummary: output.stdoutSummary } : {}),
+      ...(parsed.userDecision ? { userDecision: parsed.userDecision } : {}),
+      ...(parsed.decisionParseError ? { decisionParseError: parsed.decisionParseError } : {}),
     };
   }
 
-  async reviewPlan(input: { task: string; projectContext: string; initialPlan: string; difficulty: WorkflowDifficulty; state: TaskState; config: AssistantConfig }): Promise<ReviewResult> {
-    const prompt = [
-      'Act as the Plan Reviewer. Review this initial plan once. Focus on blocking bugs, risks, missing tests, product-impacting ambiguity, and whether any proposed execution-unit breakdown is coherent.',
-      `Workflow difficulty: ${input.difficulty}`,
-      `Project context:\n${input.projectContext}`,
-      `Task:\n${input.task}`,
-      `Initial plan:\n${input.initialPlan}`,
-    ].join('\n\n');
+  async reviewPlan(input: { task: string; projectContext: string; initialPlan: string; difficulty: WorkflowDifficulty; state: TaskState; config: AssistantConfig; blockerLedgerText?: string }): Promise<ReviewResult> {
+    const prompt = buildReviewPlanPrompt(input);
+    const output = await this.runWorkflowRole(prompt, input.difficulty, 'planReviewer', input.config, input.state);
+    const decisionParsed = parseAgentDecisionMarkdown(output.markdown, 'plan_review');
+    const ledgerParsed = parseAgentReviewerBlockerMarkdown(decisionParsed.markdown);
     return {
-      markdown: await this.runWorkflowRole(prompt, input.difficulty, 'planReviewer', input.config, input.state),
+      markdown: ledgerParsed.markdown,
       agentPrompt: this.agentPromptRecord(prompt, input.difficulty, 'planReviewer', input.state, input.config),
+      ...(output.sourcePath ? { sourcePath: output.sourcePath } : {}),
+      ...(output.stdoutSummary ? { stdoutSummary: output.stdoutSummary } : {}),
+      ...(decisionParsed.userDecision ? { userDecision: decisionParsed.userDecision } : {}),
+      ...(decisionParsed.decisionParseError ? { decisionParseError: decisionParsed.decisionParseError } : {}),
+      ...(ledgerParsed.reviewerBlockerOutput ? { reviewerBlockerOutput: ledgerParsed.reviewerBlockerOutput } : {}),
+      ...(ledgerParsed.blockerLedgerParseError ? { blockerLedgerParseError: ledgerParsed.blockerLedgerParseError } : {}),
     };
   }
 
@@ -1549,31 +1852,27 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
     projectContext: string;
     initialPlan: string;
     review: string;
-    revisionInstructions: string;
+    requestedChanges: string[];
     difficulty: WorkflowDifficulty;
     state: TaskState;
     config: AssistantConfig;
+    blockerLedgerText?: string;
   }): Promise<PlanResult> {
-    const prompt = [
-      'Act as the Architect. Create the revised plan. Do not edit files.',
-      'Every approved plan is one parent task. If decomposition is useful, describe execution units; otherwise treat it as one execution unit.',
-      'When you decompose, format each execution unit as its own Markdown heading exactly like: "## Execution Unit 01: <name>".',
-      'Do not use only a numbered list under "Execution units" for decomposed plans; Manager can read the heading format reliably.',
-      'Suggest exactly one lightweight Category if obvious. Use Other when unsure. Do not create category folders or tags.',
-      `Workflow difficulty: ${input.difficulty}`,
-      `Project context:\n${input.projectContext}`,
-      `Task:\n${input.task}`,
-      `Initial plan:\n${input.initialPlan}`,
-      `Reviewer feedback:\n${input.review}`,
-      `Assistant revision instructions:\n${input.revisionInstructions}`,
-      'End with a "Verification Commands" section listing only commands to run.',
-    ].join('\n\n');
-    const markdown = await this.runWorkflowRole(prompt, input.difficulty, 'architect', input.config, input.state);
+    const prompt = buildRevisedPlanPrompt(input);
+    const output = await this.runWorkflowRole(prompt, input.difficulty, 'architect', input.config, input.state);
+    const decisionParsed = parseAgentDecisionMarkdown(output.markdown, 'architect_plan');
+    const blockerParsed = parseAgentArchitectBlockerResponseMarkdown(decisionParsed.markdown);
     return {
-      markdown,
-      verificationCommands: extractVerificationCommands(markdown),
-      planPackDraft: extractPlanPackDraft(markdown),
+      markdown: blockerParsed.markdown,
+      verificationCommands: extractVerificationCommands(blockerParsed.markdown),
+      planPackDraft: extractPlanPackDraft(blockerParsed.markdown),
       agentPrompt: this.agentPromptRecord(prompt, input.difficulty, 'architect', input.state, input.config),
+      ...(output.sourcePath ? { sourcePath: output.sourcePath } : {}),
+      ...(output.stdoutSummary ? { stdoutSummary: output.stdoutSummary } : {}),
+      ...(decisionParsed.userDecision ? { userDecision: decisionParsed.userDecision } : {}),
+      ...(decisionParsed.decisionParseError ? { decisionParseError: decisionParsed.decisionParseError } : {}),
+      ...(blockerParsed.architectBlockerResponses ? { architectBlockerResponses: blockerParsed.architectBlockerResponses } : {}),
+      ...(blockerParsed.blockerResponseParseError ? { blockerResponseParseError: blockerParsed.blockerResponseParseError } : {}),
     };
   }
 
@@ -1584,24 +1883,32 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
     executionUnit: ExecutionUnitState;
     state: TaskState;
     config: AssistantConfig;
+    mode: ImplementationMode;
+    finalReviewReason?: string;
+    priorImplementationLog?: string;
+    priorVerificationLog?: string;
   }): Promise<ImplementationResult> {
     const difficulty = input.state.difficulty ?? 'medium';
-    const prompt = [
-      'Act as the Developer. Implement only the current execution unit from the approved parent-task plan.',
-      `Project context:\n${input.projectContext}`,
-      `Task:\n${input.task}`,
-      `Approved revised plan:\n${input.revisedPlan}`,
-      `User workflow directives and requested changes:\n${input.state.requestedChanges.join('\n\n') || 'none'}`,
-      `Current execution unit:\nTask ${String(input.executionUnit.index).padStart(2, '0')}: ${input.executionUnit.name}`,
-      'Do not revert unrelated user changes. Report changed files at the end.',
-      'Run focused tests when practical and include the Test Result details for this execution unit.',
-      'When reading Markdown or other text files, preserve UTF-8 text. On Windows PowerShell, use Get-Content -Raw -Encoding utf8 for file content, and keep command output free of ANSI color codes.',
-    ].join('\n\n');
-    const markdown = await this.runWorkflowRole(prompt, difficulty, 'developer', input.config, input.state);
+    const prompt = input.mode === 'final_review_followup'
+      ? buildFinalReviewFollowupImplementationPrompt(input)
+      : [
+          'Act as the Developer. Implement only the current execution unit from the approved parent-task plan.',
+          `Project context:\n${input.projectContext}`,
+          `Task:\n${input.task}`,
+          `Approved revised plan:\n${input.revisedPlan}`,
+          `User workflow directives and requested changes:\n${input.state.requestedChanges.join('\n\n') || 'none'}`,
+          `Current execution unit:\nTask ${String(input.executionUnit.index).padStart(2, '0')}: ${input.executionUnit.name}`,
+          'Do not revert unrelated user changes. Report changed files at the end.',
+          'Run focused tests when practical and include the Test Result details for this execution unit.',
+          'When reading Markdown or other text files, preserve UTF-8 text. On Windows PowerShell, use Get-Content -Raw -Encoding utf8 for file content, and keep command output free of ANSI color codes.',
+        ].join('\n\n');
+    const output = await this.runWorkflowRole(prompt, difficulty, 'developer', input.config, input.state);
     return {
-      markdown,
+      markdown: output.markdown,
       changedFiles: [],
       agentPrompt: this.agentPromptRecord(prompt, difficulty, 'developer', input.state, input.config),
+      ...(output.sourcePath ? { sourcePath: output.sourcePath } : {}),
+      ...(output.stdoutSummary ? { stdoutSummary: output.stdoutSummary } : {}),
     };
   }
 
@@ -1624,13 +1931,45 @@ class CliHeavyAgentAdapter implements HeavyAgentAdapter {
       `Implementation log:\n${input.implementationLog}`,
       `Verification:\n${input.verificationLog}`,
     ].join('\n\n');
-    const markdown = await this.runWorkflowRole(prompt, difficulty, 'finalReviewer', input.config, input.state);
+    const output = await this.runWorkflowRole(prompt, difficulty, 'finalReviewer', input.config, input.state);
     return {
-      markdown,
-      passed: !/\b(blocking|must fix|failed|regression)\b/i.test(markdown),
+      markdown: output.markdown,
+      passed: !/\b(blocking|must fix|failed|regression)\b/i.test(output.markdown),
       agentPrompt: this.agentPromptRecord(prompt, difficulty, 'finalReviewer', input.state, input.config),
     };
   }
+}
+
+function buildFinalReviewFollowupImplementationPrompt(input: {
+  task: string;
+  projectContext: string;
+  revisedPlan: string;
+  state: TaskState;
+  finalReviewReason?: string;
+  priorImplementationLog?: string;
+  priorVerificationLog?: string;
+}): string {
+  return [
+    'Act as the Developer. You are running a Final Review Follow-up, not the full approved plan.',
+    '',
+    'Hard constraints:',
+    '- Do NOT modify the approved plan.',
+    '- Do NOT add or remove execution units.',
+    '- Do NOT re-implement units that are already Done.',
+    '- Do NOT revert existing implementation unless the final reviewer called it defective.',
+    '- ONLY make the minimal changes required to address the final-review reason below.',
+    '- Manager will run verification commands automatically; do not run them yourself unless needed for local diagnosis.',
+    '',
+    `Project context:\n${input.projectContext}`,
+    `Task:\n${input.task}`,
+    `Final review reason:\n${input.finalReviewReason?.trim() || 'Final review requested a contained implementation follow-up.'}`,
+    `Prior implementation log:\n${input.priorImplementationLog?.trim() || 'none'}`,
+    `Prior verification log:\n${input.priorVerificationLog?.trim() || 'none'}`,
+    `Approved revised plan:\n${input.revisedPlan}`,
+    `User workflow directives and requested changes:\n${input.state.requestedChanges.join('\n\n') || 'none'}`,
+    'Report only what you changed for this follow-up and any focused diagnostic command you ran manually.',
+    'When reading Markdown or other text files, preserve UTF-8 text. On Windows PowerShell, use Get-Content -Raw -Encoding utf8 for file content, and keep command output free of ANSI color codes.',
+  ].join('\n\n');
 }
 
 export function extractVerificationCommands(markdown: string): string[] {

@@ -118,6 +118,7 @@ async function decideNextAction(
         reviewerRunCount: state.reviewerRunCount,
         ...(state.difficulty ? { difficulty: state.difficulty } : {}),
         ...(state.pendingUserPrompt ? { pendingUserPrompt: state.pendingUserPrompt } : {}),
+        ...(state.pendingUserDecision ? { pendingUserDecision: state.pendingUserDecision } : {}),
       },
       allowedActions: getAllowedActions(state),
       requestedChanges: state.requestedChanges,

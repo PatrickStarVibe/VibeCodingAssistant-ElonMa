@@ -2,7 +2,19 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { ArtifactStore } from './artifacts.js';
-import { buildInitialPlanPrompt, type HeavyAgentAdapter, type AssistantAdapter } from './adapters.js';
+import { buildInitialPlanPrompt, HeavyAgentArtifactError, usesBlockerLedger, type HeavyAgentAdapter, type AssistantAdapter } from './adapters.js';
+import {
+  activeBlockers,
+  applyArchitectResponses,
+  applyReviewerOutput,
+  renderBlockerLedgerArtifact,
+  renderLedgerForArchitectPrompt,
+  renderLedgerForReviewerPrompt,
+  renderRoundLedgerSnapshot,
+  renderUnclosedBlockerSummary,
+  validateArchitectResponsesAgainstLedger,
+  validateReviewerOutputAgainstLedger,
+} from './blockerLedger.js';
 import { normalizeWorkflowDifficulty, WORKFLOW_DIFFICULTIES } from './difficulty.js';
 import { diffStatusLines, readGitSnapshot } from './git.js';
 import { ProjectKnowledgeService } from './projectKnowledge.js';
@@ -22,7 +34,30 @@ import {
   summarizeTaskUsageLedger,
   type TaskUsageBreakdownKey,
 } from './taskUsage.js';
-import type { AgentPromptRecord, ArtifactName, ExecutionUnitState, GitSnapshot, AssistantConfig, PlanResult, TaskState, VerificationCommandResult, WorkflowDifficulty } from './types.js';
+import type {
+  AgentPromptRecord,
+  ArtifactName,
+  ExecutionUnitState,
+  GitSnapshot,
+  AssistantConfig,
+  BlockerLedger,
+  PlanResult,
+  ReviewResult,
+  TaskState,
+  VerificationCommandResult,
+  WorkflowDifficulty,
+  PendingUserDecision,
+  PendingUserDecisionOption,
+  PendingUserDecisionSource,
+} from './types.js';
+import {
+  normalizePendingUserDecision,
+  renderInvalidUserDecisionPause,
+  renderPendingUserDecision,
+  renderUserDirectionForPlanner,
+  renderUserDirectionLog,
+  selectedDecisionOption,
+} from './userDecision.js';
 import { renderVerificationLog, runVerificationCommands } from './verification.js';
 
 export interface WorkflowOptions {
@@ -36,15 +71,16 @@ export interface WorkflowResult {
 }
 
 const MAX_EXTRA_HIGH_PLANNING_ROUNDS = 3;
-const EXTRA_HIGH_APPROVED_REVISION_INSTRUCTIONS = 'n/a — approved';
-const EXTRA_HIGH_CAP_REVISION_INSTRUCTIONS = 'n/a — round 3 cap with issues remaining';
-const EXTRA_HIGH_CAP_NOTE = '> Note: Reviewer still flagged issues at round 3 — see plan-rounds-log.md.';
+const MAX_AUTOMATIC_FINAL_REVIEW_FOLLOWUP_ROUNDS = 1;
+const EXTRA_HIGH_APPROVED_NEXT_ROUND_DIRECTIVE = 'n/a - approved';
+const EXTRA_HIGH_CAP_NEXT_ROUND_DIRECTIVE = 'n/a - active blocker ledger recorded; user direction required';
+const REVIEWER_AUTHORITATIVE_NEXT_ROUND_DIRECTIVE = 'Close every active Reviewer blocker ID in the next revised plan.';
 
 type ExtraHighCompletedLoopResult = {
   state: TaskState;
   finalPlan: PlanResult;
   finalReview: string;
-  finalRevisionInstructions: string;
+  finalNextRoundDirective: string;
   rounds: number;
   capHitWithIssues: boolean;
 };
@@ -124,7 +160,7 @@ export class WorkflowService {
     const difficulty = state.difficulty;
 
     // Phase 2: Plan, review, revise.
-    if (state.revisionRound >= this.config.maxRevisionRounds) {
+    if (difficulty !== 'extra-high' && state.revisionRound >= this.config.maxRevisionRounds) {
       throw new Error(`Maximum revision rounds reached (${this.config.maxRevisionRounds}).`);
     }
 
@@ -145,30 +181,35 @@ export class WorkflowService {
         projectContext,
         revisedPlan: loop.finalPlan.markdown,
         review: loop.finalReview,
-        revisionInstructions: loop.finalRevisionInstructions,
         state,
         config: scopedConfig,
       });
       state = await this.store.writeArtifact(state, 'assistant-explanation', explanation.markdown);
-      if (explanation.needsUserDecision) {
-        state = await this.pauseForUserDirection(state, explanation.userPrompt ?? explanation.markdown);
-        return { state, message: 'Assistant Elon Ma explanation needs a product-level decision.' };
-      }
 
       state = { ...withoutPendingPrompt(state), status: 'ready_for_decision', updatedAt: new Date().toISOString() };
       await this.store.saveState(state);
       return { state, message: 'Revised plan is ready for your decision.' };
     }
 
-    const initialPlan = await this.heavyAgents.createInitialPlan({
+    const initialPlanResult = await this.runPlanAgent(state, 'initial plan', () => this.heavyAgents.createInitialPlan({
       task,
       projectContext,
       difficulty,
       state,
       config: scopedConfig,
-    });
+    }));
+    if (!initialPlanResult.ok) return { state: initialPlanResult.state, message: initialPlanResult.message };
+    const initialPlan = initialPlanResult.plan;
     state = await this.appendAgentPrompt(state, initialPlan.agentPrompt);
+    if (initialPlan.decisionParseError) {
+      state = await this.pauseForInvalidAgentDecision(state, 'architect_plan', initialPlan.decisionParseError, initialPlan.markdown);
+      return { state, message: state.pendingUserPrompt ?? 'Architect output needs a valid structured user decision block.' };
+    }
     state = await this.store.writeArtifact(state, 'initial-plan', initialPlan.markdown);
+    if (initialPlan.userDecision) {
+      state = await this.pauseForAgentDecision(state, 'architect_plan', initialPlan.userDecision);
+      return { state, message: state.pendingUserPrompt ?? 'Architect needs a user decision before planning can continue.' };
+    }
 
     if (difficulty === 'low') {
       state = await this.store.writeArtifact(state, 'revised-plan', initialPlan.markdown);
@@ -179,15 +220,10 @@ export class WorkflowService {
         projectContext,
         revisedPlan: initialPlan.markdown,
         review: '',
-        revisionInstructions: '',
         state,
         config: scopedConfig,
       });
       state = await this.store.writeArtifact(state, 'assistant-explanation', explanation.markdown);
-      if (explanation.needsUserDecision) {
-        state = await this.pauseForUserDirection(state, explanation.userPrompt ?? explanation.markdown);
-        return { state, message: 'Assistant Elon Ma explanation needs a product-level decision.' };
-      }
 
       state = { ...withoutPendingPrompt(state), status: 'ready_for_decision', updatedAt: new Date().toISOString() };
       await this.store.saveState(state);
@@ -203,43 +239,59 @@ export class WorkflowService {
         difficulty,
         state,
         config: scopedConfig,
+        ...(usesBlockerLedger(difficulty) && state.blockerLedger ? { blockerLedgerText: renderLedgerForReviewerPrompt(state.blockerLedger) } : {}),
       });
       reviewMarkdown = review.markdown;
       state = await this.appendAgentPrompt(state, review.agentPrompt);
+      const reviewRound = state.reviewerRunCount + 1;
       state = {
         ...await this.store.writeArtifact(state, 'review', reviewMarkdown),
-        reviewerRunCount: state.reviewerRunCount + 1,
+        reviewerRunCount: reviewRound,
       };
+      if (review.decisionParseError) {
+        state = await this.pauseForInvalidAgentDecision(state, 'plan_review', review.decisionParseError, review.markdown);
+        return { state, message: state.pendingUserPrompt ?? 'Plan Reviewer output needs a valid structured user decision block.' };
+      }
+      const reviewerLedger = await this.applyReviewerLedgerOrPause(state, review, difficulty, reviewRound);
+      if (reviewerLedger.paused) return { state: reviewerLedger.state, message: reviewerLedger.message };
+      state = reviewerLedger.state;
+      if (review.userDecision) {
+        state = await this.pauseForAgentDecision(state, 'plan_review', review.userDecision);
+        return { state, message: state.pendingUserPrompt ?? 'Plan Reviewer needs a user decision before revise can continue.' };
+      }
     } else {
       reviewMarkdown = await this.store.readArtifact(state, 'review');
     }
 
-    const revisionInstructions = await this.assistant.createRevisionInstructions({
+    const revisedPlanResult = await this.runPlanAgent(state, 'revised plan', () => this.heavyAgents.revisePlan({
       task,
       projectContext,
       initialPlan: initialPlan.markdown,
       review: reviewMarkdown,
       requestedChanges: state.requestedChanges,
-      state,
-      config: scopedConfig,
-    });
-    state = await this.store.writeArtifact(state, 'revision-instructions', revisionInstructions.markdown);
-    if (revisionInstructions.needsUserDecision) {
-      state = await this.pauseForUserDirection(state, revisionInstructions.userPrompt ?? revisionInstructions.markdown);
-      return { state, message: 'Assistant Elon Ma needs a product-level decision before the plan can be revised.' };
-    }
-
-    const revisedPlan = await this.heavyAgents.revisePlan({
-      task,
-      projectContext,
-      initialPlan: initialPlan.markdown,
-      review: reviewMarkdown,
-      revisionInstructions: revisionInstructions.markdown,
       difficulty,
       state,
       config: scopedConfig,
-    });
+      ...(usesBlockerLedger(difficulty) && state.blockerLedger ? { blockerLedgerText: renderLedgerForArchitectPrompt(state.blockerLedger) } : {}),
+    }));
+    if (!revisedPlanResult.ok) return { state: revisedPlanResult.state, message: revisedPlanResult.message };
+    const revisedPlan = revisedPlanResult.plan;
     state = await this.appendAgentPrompt(state, revisedPlan.agentPrompt);
+    if (revisedPlan.decisionParseError) {
+      state = await this.pauseForInvalidAgentDecision(state, 'architect_plan', revisedPlan.decisionParseError, revisedPlan.markdown);
+      return { state, message: state.pendingUserPrompt ?? 'Architect output needs a valid structured user decision block.' };
+    }
+    const architectLedger = await this.applyArchitectLedgerOrPause(state, revisedPlan, difficulty, state.revisionRound);
+    if (architectLedger.paused) return { state: architectLedger.state, message: architectLedger.message };
+    state = architectLedger.state;
+    if (hasArchitectNeedsUserDecision(revisedPlan) && !revisedPlan.userDecision) {
+      state = await this.pauseForInvalidBlockerOutput(state, 'Architect', 'architect response status needs_user_decision requires an assistant-user-decision block');
+      return { state, message: state.pendingUserPrompt ?? 'Architect blocker response needs a structured user decision block.' };
+    }
+    if (revisedPlan.userDecision) {
+      state = await this.pauseForAgentDecision(state, 'architect_plan', revisedPlan.userDecision);
+      return { state, message: state.pendingUserPrompt ?? 'Architect needs a user decision before planning can continue.' };
+    }
     state = await this.store.writeArtifact(state, 'revised-plan', revisedPlan.markdown);
     state = await this.writePlanMetadata(state, revisedPlan);
 
@@ -248,15 +300,10 @@ export class WorkflowService {
       projectContext,
       revisedPlan: revisedPlan.markdown,
       review: reviewMarkdown,
-      revisionInstructions: revisionInstructions.markdown,
       state,
       config: scopedConfig,
     });
     state = await this.store.writeArtifact(state, 'assistant-explanation', explanation.markdown);
-    if (explanation.needsUserDecision) {
-      state = await this.pauseForUserDirection(state, explanation.userPrompt ?? explanation.markdown);
-      return { state, message: 'Assistant Elon Ma explanation needs a product-level decision.' };
-    }
 
     state = { ...withoutPendingPrompt(state), status: 'ready_for_decision', updatedAt: new Date().toISOString() };
     await this.store.saveState(state);
@@ -268,28 +315,22 @@ export class WorkflowService {
     const task = await this.store.readArtifact(state, 'original-task');
     const revisedPlan = await this.requireArtifact(state, 'revised-plan', 'Cannot explain before a revised plan exists.');
     const review = await this.store.readArtifact(state, 'review').catch(() => '');
-    const revisionInstructions = await this.store.readArtifact(state, 'revision-instructions').catch(() => '');
-    const projectContext = await this.buildProjectContext(state, [task, revisedPlan, review, revisionInstructions].join('\n\n'));
+    const projectContext = await this.buildProjectContext(state, [task, revisedPlan, review].join('\n\n'));
     const explanation = await this.assistant.explainRevisedPlan({
       task,
       projectContext,
       revisedPlan,
       review,
-      revisionInstructions,
       state,
       config: this.configForState(state),
     });
     state = await this.store.writeArtifact(state, 'assistant-explanation', explanation.markdown);
-    state = explanation.needsUserDecision
-      ? {
-        ...state,
-        status: 'waiting_user_direction',
-        pendingUserPrompt: explanation.userPrompt ?? explanation.markdown,
-        updatedAt: new Date().toISOString(),
-      }
-      : { ...withoutPendingPrompt(state), status: 'ready_for_decision', updatedAt: new Date().toISOString() };
+    state = { ...withoutPendingPrompt(state), status: 'ready_for_decision', updatedAt: new Date().toISOString() };
     await this.store.saveState(state);
-    return { state, message: explanation.needsUserDecision ? 'Assistant Elon Ma needs a product-level decision.' : 'Explanation updated.' };
+    return {
+      state,
+      message: 'Explanation updated.',
+    };
   }
 
   async askQuestion(taskIdOrLatest: string, question: string): Promise<WorkflowResult> {
@@ -352,26 +393,26 @@ export class WorkflowService {
     }
 
     if (parsed.kind === 'stop') {
-      state = {
+      state = clearFollowupScope({
         ...state,
         status: 'stopped',
         stoppedReason: 'User sent stop.',
         lastDecision: reply,
         updatedAt: new Date().toISOString(),
-      };
+      });
       state = await this.store.appendArtifact(state, 'decision-log', `stop: ${reply}`);
       await this.store.saveState(state);
       return { state, message: 'Task stopped.' };
     }
 
     if (parsed.kind === 'reject') {
-      state = {
+      state = clearFollowupScope({
         ...state,
         status: 'stopped',
         stoppedReason: 'User rejected the revised plan.',
         lastDecision: reply,
         updatedAt: new Date().toISOString(),
-      };
+      });
       state = await this.store.appendArtifact(state, 'decision-log', `reject B: ${reply}`);
       await this.store.saveState(state);
       return { state, message: 'Revised plan rejected; task stopped.' };
@@ -429,8 +470,9 @@ export class WorkflowService {
       if (!['ready_for_decision', 'waiting_user_direction'].includes(state.status)) {
         throw new Error(`Cannot request revision from state ${state.status}.`);
       }
+      const { blockerLedger: _blockerLedger, ...stateWithoutBlockerLedger } = state;
       state = {
-        ...state,
+        ...stateWithoutBlockerLedger,
         status: 'planning_requested',
         requestedChanges: [...state.requestedChanges, parsed.instruction],
         lastDecision: reply,
@@ -447,6 +489,12 @@ export class WorkflowService {
       }
       if (state.status === 'implementation_approved') {
         return this.implementApproved(state.taskId);
+      }
+      if (state.status === 'waiting_user_direction' && state.pendingUserDecision?.source === 'extra_high_planning') {
+        return {
+          state,
+          message: state.pendingUserPrompt ?? 'Extra High reviewer concerns remain. Reply A to continue one round, B to restart planning, C to execute the current plan anyway, or say stop.',
+        };
       }
       if (state.status !== 'ready_for_decision' && state.status !== 'waiting_user_direction') {
         throw new Error(`Cannot approve implementation from state ${state.status}.`);
@@ -478,16 +526,164 @@ export class WorkflowService {
       throw new Error(`Cannot answer user direction from state ${state.status}.`);
     }
 
+    const pendingDecision = state.pendingUserDecision;
+    const selectedOption = selectedDecisionOption(pendingDecision, trimmed);
     const decision = `user direction: ${trimmed}`;
+    const directionLog = renderUserDirectionLog(trimmed, pendingDecision);
+    const plannerDirection = renderUserDirectionForPlanner(trimmed, pendingDecision);
+    if (pendingDecision?.source === 'plan_artifact_failure' || (!pendingDecision && isPlanArtifactFailurePrompt(state.pendingUserPrompt))) {
+      if (/^(?:stop|b|停止)$/i.test(trimmed) || selectedOption?.id === 'B') {
+        state = {
+          ...withoutPendingPrompt(state),
+          status: 'stopped',
+          stoppedReason: 'User stopped planning after a heavy-agent plan artifact failure.',
+          lastDecision: decision,
+          updatedAt: new Date().toISOString(),
+        };
+        state = await this.store.appendArtifact(state, 'decision-log', directionLog);
+        await this.store.saveState(state);
+        return { state, message: 'Planning stopped after the plan artifact failure.' };
+      }
+
+      state = resetPlanningAfterUserDecision(state, `Retry planning after plan artifact failure:\n${plannerDirection}`, decision);
+      state = await this.store.appendArtifact(state, 'decision-log', directionLog);
+      await this.store.saveState(state);
+      return this.planTask(state.taskId);
+    }
+
+    if (pendingDecision?.source === 'extra_high_planning') {
+      if (/^stop$/i.test(trimmed)) {
+        state = {
+          ...withoutPendingPrompt(state),
+          status: 'stopped',
+          stoppedReason: 'User stopped Extra High planning while reviewer concerns remained.',
+          lastDecision: decision,
+          updatedAt: new Date().toISOString(),
+        };
+        state = await this.store.appendArtifact(state, 'decision-log', directionLog);
+        await this.store.saveState(state);
+        return { state, message: 'Extra High planning stopped.' };
+      }
+
+      if (isExtraHighExecuteCurrentPlanDirection(trimmed, selectedOption)) {
+        state = {
+          ...state,
+          requestedChanges: [
+            ...state.requestedChanges,
+            'User explicitly chose to execute the current Extra High plan despite outstanding reviewer blockers.',
+          ],
+        };
+        state = await this.persistApprovedTaskArtifacts(state);
+        state = {
+          ...withoutPendingPrompt(state),
+          status: 'implementation_approved',
+          approvedAt: new Date().toISOString(),
+          lastDecision: decision,
+          updatedAt: new Date().toISOString(),
+        };
+        state = await this.store.appendArtifact(
+          state,
+          'decision-log',
+          `${directionLog}\nextra-high override: execute current plan despite outstanding reviewer blockers`,
+        );
+        await this.store.saveState(state);
+        return this.implementApproved(state.taskId);
+      }
+
+      if (selectedOption?.id === 'B') {
+        state = restartFromPlanningState(state, plannerDirection, decision);
+        state = {
+          ...state,
+          difficulty: 'extra-high',
+          extraHighRoundLimit: MAX_EXTRA_HIGH_PLANNING_ROUNDS,
+          extraHighContinuationFromReview: false,
+        };
+        state = await this.store.appendArtifact(state, 'decision-log', directionLog);
+        await this.store.saveState(state);
+        return this.planTask(state.taskId);
+      }
+
+      if (!selectedOption && /^(?:approve|approved|approve\s+a|yes|y|同意|批准)$/i.test(trimmed)) {
+        return {
+          state,
+          message: state.pendingUserPrompt ?? 'Extra High reviewer concerns remain. Reply A to continue one round, B to restart planning, C to execute the current plan anyway, or say stop.',
+        };
+      }
+
+      const nextRoundLimit = Math.max(state.extraHighRoundLimit ?? MAX_EXTRA_HIGH_PLANNING_ROUNDS, state.reviewerRunCount) + 1;
+      state = {
+        ...withoutPendingPrompt(state),
+        status: 'planning_requested',
+        extraHighRoundLimit: nextRoundLimit,
+        extraHighContinuationFromReview: true,
+        requestedChanges: selectedOption?.id === 'A'
+          ? state.requestedChanges
+          : [...state.requestedChanges, `Extra High continuation direction:\n${plannerDirection}`],
+        lastDecision: decision,
+        updatedAt: new Date().toISOString(),
+      };
+      state = await this.store.appendArtifact(state, 'decision-log', directionLog);
+      await this.store.saveState(state);
+      return this.planTask(state.taskId);
+    }
+
+    if (isFinalReviewFollowupCapDirection(state)) {
+      if (isFinalReviewFollowupStopDirection(trimmed, selectedOption)) {
+        state = clearFollowupScope({
+          ...withoutPendingPrompt(state),
+          status: 'stopped',
+          stoppedReason: 'Repeated final-review failures; user chose to stop.',
+          lastDecision: decision,
+          updatedAt: new Date().toISOString(),
+        });
+        state = await this.store.appendArtifact(state, 'decision-log', directionLog);
+        await this.store.saveState(state);
+        return { state, message: 'Task stopped after repeated final-review follow-up failures.' };
+      }
+
+      if (selectedOption?.id === 'B') {
+        const deferredIssues = renderDeferredFinalReviewIssues(state, plannerDirection);
+        state = clearFollowupScope({
+          ...withoutPendingPrompt(state),
+          status: 'awaiting_user_acceptance',
+          lastDecision: decision,
+          pendingUserPrompt: "Deferred issues recorded. Reply 'accept' to finalize the task record, or stop to pause.",
+          updatedAt: new Date().toISOString(),
+        });
+        state = await this.store.writeArtifact(state, 'deferred-issues', deferredIssues);
+        state = await this.store.appendArtifact(state, 'decision-log', `${directionLog}\nfinal-review follow-up deferred issues recorded`);
+        await this.store.saveState(state);
+        await this.refreshParentTaskReadme(state, 'Deferred final-review issues recorded; awaiting user acceptance.');
+        return { state, message: state.pendingUserPrompt ?? 'Deferred issues recorded; awaiting user acceptance.' };
+      }
+
+      const reason = finalReviewFollowupReasonFromDecision(pendingDecision) ?? plannerDirection;
+      const followup = makeFinalReviewFollowupScope(state, reason);
+      state = {
+        ...withoutPendingPrompt(state),
+        status: 'implementation_approved',
+        implementationFollowup: followup,
+        requestedChanges: selectedOption?.id === 'A'
+          ? state.requestedChanges
+          : [...state.requestedChanges, `Final review follow-up continuation direction:\n${plannerDirection}`],
+        lastDecision: decision,
+        pendingUserPrompt: renderFinalReviewImplementationReroutePrompt(reason),
+        updatedAt: new Date().toISOString(),
+      };
+      state = await this.store.appendArtifact(state, 'decision-log', `${directionLog}\nfinal-review follow-up round ${followup.round} approved for retry`);
+      await this.store.saveState(state);
+      return { state, message: state.pendingUserPrompt ?? 'Final review follow-up is ready. Reply approve A to run it.' };
+    }
+
     if (isFinalReviewUserDirection(state)) {
-      if (isAcceptCurrentWorktreeDirection(trimmed)) {
+      if (isAcceptCurrentWorktreeDirection(trimmed, selectedOption)) {
         state = {
           ...withoutPendingPrompt(state),
           status: 'awaiting_user_acceptance',
           lastDecision: decision,
           updatedAt: new Date().toISOString(),
         };
-        state = await this.store.appendArtifact(state, 'decision-log', decision);
+        state = await this.store.appendArtifact(state, 'decision-log', directionLog);
         await this.store.saveState(state);
         await this.refreshParentTaskReadme(state, 'User direction accepted final review scope; awaiting user acceptance.');
         return { state, message: "已记录你的选择：接受当前工作区现状。现在进入验收阶段；直接说 '验收通过' / 'accept' 即可生成 task-record。" };
@@ -497,24 +693,18 @@ export class WorkflowService {
       state = {
         ...withoutPendingPrompt(state),
         status: 'implementation_approved',
-        requestedChanges: [...state.requestedChanges, `User direction after final review:\n${trimmed}`],
+        requestedChanges: [...state.requestedChanges, `User direction after final review:\n${plannerDirection}`],
         lastDecision: decision,
         pendingUserPrompt: continuePrompt,
         updatedAt: new Date().toISOString(),
       };
-      state = await this.store.appendArtifact(state, 'decision-log', decision);
+      state = await this.store.appendArtifact(state, 'decision-log', directionLog);
       await this.store.saveState(state);
       return { state, message: continuePrompt };
     }
 
-    state = {
-      ...withoutPendingPrompt(state),
-      status: 'planning_requested',
-      requestedChanges: [...state.requestedChanges, `User direction:\n${trimmed}`],
-      lastDecision: decision,
-      updatedAt: new Date().toISOString(),
-    };
-    state = await this.store.appendArtifact(state, 'decision-log', decision);
+    state = resetPlanningAfterUserDecision(state, `User direction:\n${plannerDirection}`, decision);
+    state = await this.store.appendArtifact(state, 'decision-log', directionLog);
     await this.store.saveState(state);
     return this.planTask(state.taskId);
   }
@@ -528,26 +718,37 @@ export class WorkflowService {
     const revisedPlan = await this.requireArtifact(state, 'revised-plan', 'Cannot implement before a revised plan exists.');
     const planMetadata = readPlanMetadata(revisedPlan);
     const scopedConfig = this.configForState(state);
-    const projectContext = await this.buildProjectContext(state, [task, revisedPlan].join('\n\n'));
+    const followup = state.implementationFollowup;
+    const priorImplementationLog = followup ? await this.store.readArtifact(state, 'implementation-log').catch(() => '') : undefined;
+    const priorVerificationLog = followup ? await this.store.readArtifact(state, 'test-build-log').catch(() => '') : undefined;
+    const projectContext = await this.buildProjectContext(state, [
+      task,
+      revisedPlan,
+      followup ? `Final review follow-up reason:\n${followup.reason}` : undefined,
+      priorImplementationLog ? `Prior implementation log:\n${priorImplementationLog}` : undefined,
+      priorVerificationLog ? `Prior verification log:\n${priorVerificationLog}` : undefined,
+    ].filter(Boolean).join('\n\n'));
     const preGit = await readGitSnapshot(scopedConfig.workspace.targetDir);
 
-    state = await this.store.writeArtifact(state, 'git-pre-status', preGit.statusShort ? `${preGit.statusShort}\n` : '');
-    state = await this.store.writeArtifact(state, 'git-pre-diff', preGit.diff);
+    if (followup) {
+      state = await this.store.writeArtifact(state, 'followup-git-pre-status', preGit.statusShort ? `${preGit.statusShort}\n` : '');
+      state = await this.store.writeArtifact(state, 'followup-git-pre-diff', preGit.diff);
+    } else {
+      state = await this.store.writeArtifact(state, 'git-pre-status', preGit.statusShort ? `${preGit.statusShort}\n` : '');
+      state = await this.store.writeArtifact(state, 'git-pre-diff', preGit.diff);
+    }
     state = { ...state, status: 'implementing', currentExecutionIndex: 0, updatedAt: new Date().toISOString() };
     await this.store.saveState(state);
 
-    const executionQueue = state.executionQueue.length > 0 ? state.executionQueue : makeExecutionUnits(undefined);
-    state = { ...state, executionQueue, executionMode: executionModeFor(executionQueue), updatedAt: new Date().toISOString() };
-    await this.store.saveState(state);
-
     const verificationRuns: Array<{ unit: ExecutionUnitState; results: VerificationCommandResult[] }> = [];
-    for (const unit of executionQueue) {
-      state = await this.updateExecutionUnit(state, unit.index, 'In Progress');
-      state = { ...state, status: 'execution_unit_implementing', currentExecutionIndex: unit.index - 1, updatedAt: new Date().toISOString() };
+    if (followup) {
+      const activeUnit = makeFinalReviewFollowupExecutionUnit(followup.round);
+      const stateWithoutCurrentExecution = { ...state };
+      delete stateWithoutCurrentExecution.currentExecutionIndex;
+      state = { ...stateWithoutCurrentExecution, status: 'execution_unit_implementing', updatedAt: new Date().toISOString() };
       await this.store.saveState(state);
-      await this.refreshParentTaskReadme(state, `Implementing execution unit ${unit.index}/${executionQueue.length}.`);
+      await this.refreshParentTaskReadme(state, activeUnit.name);
 
-      const activeUnit = state.executionQueue[unit.index - 1] ?? unit;
       const implementation = await this.heavyAgents.implement({
         task,
         projectContext,
@@ -555,10 +756,14 @@ export class WorkflowService {
         executionUnit: activeUnit,
         state,
         config: scopedConfig,
+        mode: 'final_review_followup',
+        finalReviewReason: followup.reason,
+        ...(priorImplementationLog !== undefined ? { priorImplementationLog } : {}),
+        ...(priorVerificationLog !== undefined ? { priorVerificationLog } : {}),
       });
       state = await this.appendAgentPrompt(state, implementation.agentPrompt);
       const implementationSection = [
-        `## Execution Unit ${String(activeUnit.index).padStart(2, '0')}: ${activeUnit.name}`,
+        `## Final Review Follow-up (round ${followup.round})`,
         '',
         implementation.markdown,
       ].join('\n');
@@ -575,27 +780,96 @@ export class WorkflowService {
       );
       verificationRuns.push({ unit: activeUnit, results: verification });
       state = await this.store.appendArtifact(state, 'test-build-log', [
-        `# Execution Unit ${String(activeUnit.index).padStart(2, '0')}: ${activeUnit.name}`,
+        `# Final Review Follow-up (round ${followup.round})`,
         '',
         renderVerificationLog(verification),
       ].join('\n'));
 
       state = { ...state, status: 'execution_unit_result_recording', updatedAt: new Date().toISOString() };
       await this.store.saveState(state);
-      const testResult = renderTestResult(verification);
-      state = await this.updateExecutionUnit(state, activeUnit.index, 'Done', testResult);
-      await this.taskRecords.markExecutionUnit(this.projectForState(state), state, state.executionQueue[activeUnit.index - 1] ?? activeUnit, 'Done', testResult);
       state = { ...state, status: 'next_execution_unit_or_all_done', updatedAt: new Date().toISOString() };
       await this.store.saveState(state);
       await this.refreshParentTaskReadme(state, `${activeUnit.name} completed.`);
+    } else {
+      const executionQueue = state.executionQueue.length > 0 ? state.executionQueue : makeExecutionUnits(undefined);
+      state = { ...state, executionQueue, executionMode: executionModeFor(executionQueue), updatedAt: new Date().toISOString() };
+      await this.store.saveState(state);
+
+      for (const unit of executionQueue) {
+        state = await this.updateExecutionUnit(state, unit.index, 'In Progress');
+        state = { ...state, status: 'execution_unit_implementing', currentExecutionIndex: unit.index - 1, updatedAt: new Date().toISOString() };
+        await this.store.saveState(state);
+        await this.refreshParentTaskReadme(state, `Implementing execution unit ${unit.index}/${executionQueue.length}.`);
+
+        const activeUnit = state.executionQueue[unit.index - 1] ?? unit;
+        const implementation = await this.heavyAgents.implement({
+          task,
+          projectContext,
+          revisedPlan,
+          executionUnit: activeUnit,
+          state,
+          config: scopedConfig,
+          mode: 'full_plan',
+        });
+        state = await this.appendAgentPrompt(state, implementation.agentPrompt);
+        const implementationSection = [
+          `## Execution Unit ${String(activeUnit.index).padStart(2, '0')}: ${activeUnit.name}`,
+          '',
+          implementation.markdown,
+        ].join('\n');
+        state = await this.store.appendArtifact(state, 'implementation-log', implementationSection);
+        await this.taskRecords.appendImplementationLog(this.projectForState(state), state, implementationSection);
+
+        state = { ...state, status: 'execution_unit_testing', updatedAt: new Date().toISOString() };
+        await this.store.saveState(state);
+        const verification = await runVerificationCommands(
+          planMetadata.verificationCommands,
+          this.config.verification.allowlist,
+          scopedConfig.workspace.targetDir,
+          this.options.executeVerification ?? true,
+        );
+        verificationRuns.push({ unit: activeUnit, results: verification });
+        state = await this.store.appendArtifact(state, 'test-build-log', [
+          `# Execution Unit ${String(activeUnit.index).padStart(2, '0')}: ${activeUnit.name}`,
+          '',
+          renderVerificationLog(verification),
+        ].join('\n'));
+
+        state = { ...state, status: 'execution_unit_result_recording', updatedAt: new Date().toISOString() };
+        await this.store.saveState(state);
+        const testResult = renderTestResult(verification);
+        state = await this.updateExecutionUnit(state, activeUnit.index, 'Done', testResult);
+        await this.taskRecords.markExecutionUnit(this.projectForState(state), state, state.executionQueue[activeUnit.index - 1] ?? activeUnit, 'Done', testResult);
+        state = { ...state, status: 'next_execution_unit_or_all_done', updatedAt: new Date().toISOString() };
+        await this.store.saveState(state);
+        await this.refreshParentTaskReadme(state, `${activeUnit.name} completed.`);
+      }
     }
 
     const postGit = await readGitSnapshot(scopedConfig.workspace.targetDir);
+    if (followup) {
+      state = await this.store.writeArtifact(state, 'followup-git-post-status', postGit.statusShort ? `${postGit.statusShort}\n` : '');
+      state = await this.store.writeArtifact(state, 'followup-git-post-diff', postGit.diff);
+    }
     state = await this.store.writeArtifact(state, 'git-post-status', postGit.statusShort ? `${postGit.statusShort}\n` : '');
     state = await this.store.writeArtifact(state, 'git-post-diff', postGit.diff);
     const stateWithoutCurrentExecution = { ...state };
     delete stateWithoutCurrentExecution.currentExecutionIndex;
-    state = { ...stateWithoutCurrentExecution, status: 'implemented', updatedAt: new Date().toISOString() };
+    state = clearFollowupScope({
+      ...stateWithoutCurrentExecution,
+      ...(followup ? {
+        implementationFollowupHistory: [
+          ...(state.implementationFollowupHistory ?? []),
+          {
+            round: followup.round,
+            reason: followup.reason,
+            completedAt: new Date().toISOString(),
+          },
+        ],
+      } : {}),
+      status: 'implemented',
+      updatedAt: new Date().toISOString(),
+    });
     await this.store.saveState(state);
     await this.refreshParentTaskReadme(state, renderExecutionTestSummary(verificationRuns));
 
@@ -644,17 +918,23 @@ export class WorkflowService {
         pendingUserPrompt: "等你验收：直接说 '验收通过' / 'accept' 即可生成 task-record。",
         updatedAt: new Date().toISOString(),
       };
+      state = clearFollowupScope(state);
       await this.store.saveState(state);
       await this.refreshParentTaskReadme(state, `Final review route: complete. ${route.reason}`);
       return { state, message: 'Final review passed. Awaiting user acceptance before task recording and completion.' };
     }
 
     if (route.route === 'route_to_implementer') {
+      if ((state.implementationFollowupHistory?.length ?? 0) >= MAX_AUTOMATIC_FINAL_REVIEW_FOLLOWUP_ROUNDS) {
+        state = await this.pauseForAgentDecision(state, 'final_review', makeFinalReviewFollowupCapDecision(state, route.reason));
+        return { state, message: state.pendingUserPrompt ?? 'Final review still has implementation blockers after follow-up.' };
+      }
       const reroutePrompt = renderFinalReviewImplementationReroutePrompt(route.reason);
       state = {
         ...state,
         status: 'implementation_approved',
         requestedChanges: [...state.requestedChanges, renderFinalReviewImplementationChange(route.reason)],
+        implementationFollowup: makeFinalReviewFollowupScope(state, route.reason),
         pendingUserPrompt: reroutePrompt,
         updatedAt: new Date().toISOString(),
       };
@@ -671,14 +951,22 @@ export class WorkflowService {
         requestedChanges: [...state.requestedChanges, planningChange],
         updatedAt: new Date().toISOString(),
       };
+      state = clearFollowupScope(state);
       state = await this.store.appendArtifact(state, 'decision-log', `final review routed to planning:\n${route.reason}`);
       await this.store.saveState(state);
       return this.planTask(state.taskId);
     }
 
-    const prompt = renderFinalReviewUserDirectionPrompt(route.reason, route.userPrompt);
-    state = await this.pauseForUserDirection(state, prompt);
-    return { state, message: prompt };
+    state = await this.pauseForAssistantDecision(
+      state,
+      {
+        markdown: renderFinalReviewUserDirectionPrompt(route.reason, route.userPrompt),
+        ...(route.userPrompt ? { userPrompt: route.userPrompt } : {}),
+        ...(route.userDecision ? { userDecision: route.userDecision } : {}),
+      },
+      'final_review',
+    );
+    return { state, message: state.pendingUserPrompt ?? 'Final review needs a user direction decision.' };
   }
 
   async showArtifact(taskIdOrLatest: string, artifact: ArtifactName): Promise<string> {
@@ -709,33 +997,80 @@ export class WorkflowService {
     projectContext: string,
     scopedConfig: AssistantConfig,
   ): Promise<ExtraHighLoopResult> {
-    let currentPlan = await this.heavyAgents.createInitialPlan({
-      task,
-      projectContext,
-      difficulty: 'extra-high',
-      state,
-      config: scopedConfig,
-    });
-    state = await this.appendAgentPrompt(state, currentPlan.agentPrompt);
-    state = await this.store.writeArtifact(state, 'initial-plan', currentPlan.markdown);
-
+    const roundLimit = Math.max(state.extraHighRoundLimit ?? MAX_EXTRA_HIGH_PLANNING_ROUNDS, MAX_EXTRA_HIGH_PLANNING_ROUNDS);
+    const resumeFromReview = state.extraHighContinuationFromReview === true
+      && state.artifacts['revised-plan']
+      && state.artifacts.review
+      && state.reviewerRunCount > 0;
+    let currentPlan: PlanResult;
     let currentReview = '';
-    let currentRevisionInstructions = '';
+    let startRound = 1;
 
-    for (let round = 1; round <= MAX_EXTRA_HIGH_PLANNING_ROUNDS; round += 1) {
+    if (resumeFromReview) {
+      const latestPlan = await this.store.readArtifact(state, 'revised-plan');
+      const metadata = readPlanMetadata(latestPlan);
+      currentPlan = {
+        markdown: stripExtraHighCapNote(stripPlanMetadata(latestPlan)),
+        verificationCommands: metadata.verificationCommands,
+        ...(metadata.planPackDraft ? { planPackDraft: metadata.planPackDraft } : {}),
+      };
+      currentReview = await this.store.readArtifact(state, 'review');
+      state = { ...state, extraHighContinuationFromReview: false };
+      startRound = state.reviewerRunCount + 1;
+    } else {
+      const initialPlanResult = await this.runPlanAgent(state, 'extra-high initial plan', () => this.heavyAgents.createInitialPlan({
+        task,
+        projectContext,
+        difficulty: 'extra-high',
+        state,
+        config: scopedConfig,
+      }));
+      if (!initialPlanResult.ok) return { state: initialPlanResult.state, paused: true, message: initialPlanResult.message };
+      currentPlan = initialPlanResult.plan;
+      state = await this.appendAgentPrompt(state, currentPlan.agentPrompt);
+      if (currentPlan.decisionParseError) {
+        state = await this.pauseForInvalidAgentDecision(state, 'architect_plan', currentPlan.decisionParseError, currentPlan.markdown);
+        return { state, paused: true, message: state.pendingUserPrompt ?? 'Architect output needs a valid structured user decision block.' };
+      }
+      state = await this.store.writeArtifact(state, 'initial-plan', currentPlan.markdown);
+      if (currentPlan.userDecision) {
+        state = await this.pauseForAgentDecision(state, 'architect_plan', currentPlan.userDecision);
+        return { state, paused: true, message: state.pendingUserPrompt ?? 'Architect needs a user decision before planning can continue.' };
+      }
+    }
+
+    for (let round = startRound; round <= roundLimit; round += 1) {
       if (round > 1) {
-        currentPlan = await this.heavyAgents.revisePlan({
+        const revisedPlanResult = await this.runPlanAgent(state, `extra-high revised plan round ${round}`, () => this.heavyAgents.revisePlan({
           task,
           projectContext,
           initialPlan: currentPlan.markdown,
           review: currentReview,
-          revisionInstructions: currentRevisionInstructions,
+          requestedChanges: state.requestedChanges,
           difficulty: 'extra-high',
           state,
           config: scopedConfig,
-        });
+          ...(state.blockerLedger ? { blockerLedgerText: renderLedgerForArchitectPrompt(state.blockerLedger) } : {}),
+        }));
+        if (!revisedPlanResult.ok) return { state: revisedPlanResult.state, paused: true, message: revisedPlanResult.message };
+        currentPlan = revisedPlanResult.plan;
         state = await this.appendAgentPrompt(state, currentPlan.agentPrompt);
+        if (currentPlan.decisionParseError) {
+          state = await this.pauseForInvalidAgentDecision(state, 'architect_plan', currentPlan.decisionParseError, currentPlan.markdown);
+          return { state, paused: true, message: state.pendingUserPrompt ?? 'Architect output needs a valid structured user decision block.' };
+        }
+        const architectLedger = await this.applyArchitectLedgerOrPause(state, currentPlan, 'extra-high', round);
+        if (architectLedger.paused) return { state: architectLedger.state, paused: true, message: architectLedger.message };
+        state = architectLedger.state;
         state = await this.store.writeArtifact(state, 'initial-plan', currentPlan.markdown);
+        if (hasArchitectNeedsUserDecision(currentPlan) && !currentPlan.userDecision) {
+          state = await this.pauseForInvalidBlockerOutput(state, 'Architect', 'architect response status needs_user_decision requires an assistant-user-decision block');
+          return { state, paused: true, message: state.pendingUserPrompt ?? 'Architect blocker response needs a structured user decision block.' };
+        }
+        if (currentPlan.userDecision) {
+          state = await this.pauseForAgentDecision(state, 'architect_plan', currentPlan.userDecision);
+          return { state, paused: true, message: state.pendingUserPrompt ?? 'Architect needs a user decision before planning can continue.' };
+        }
       }
 
       const review = await this.heavyAgents.reviewPlan({
@@ -745,90 +1080,96 @@ export class WorkflowService {
         difficulty: 'extra-high',
         state,
         config: scopedConfig,
+        ...(state.blockerLedger ? { blockerLedgerText: renderLedgerForReviewerPrompt(state.blockerLedger) } : {}),
       });
       currentReview = review.markdown;
       state = await this.appendAgentPrompt(state, review.agentPrompt);
+      const reviewRound = state.reviewerRunCount + 1;
       state = {
         ...await this.store.writeArtifact(state, 'review', currentReview),
-        reviewerRunCount: state.reviewerRunCount + 1,
+        reviewerRunCount: reviewRound,
       };
+      if (review.decisionParseError) {
+        state = await this.pauseForInvalidAgentDecision(state, 'plan_review', review.decisionParseError, review.markdown);
+        return { state, paused: true, message: state.pendingUserPrompt ?? 'Plan Reviewer output needs a valid structured user decision block.' };
+      }
+      const reviewerLedger = await this.applyReviewerLedgerOrPause(state, review, 'extra-high', reviewRound);
+      if (reviewerLedger.paused) return { state: reviewerLedger.state, paused: true, message: reviewerLedger.message };
+      state = reviewerLedger.state;
+      if (review.userDecision) {
+        state = await this.pauseForAgentDecision(state, 'plan_review', review.userDecision);
+        return { state, paused: true, message: state.pendingUserPrompt ?? 'Plan Reviewer needs a user decision before revise can continue.' };
+      }
 
-      if (isReviewerApproval(currentReview)) {
-        const finalRevisionInstructions = EXTRA_HIGH_APPROVED_REVISION_INSTRUCTIONS;
+      const ledger = state.blockerLedger;
+      if (ledger && activeBlockers(ledger).length === 0) {
+        const finalNextRoundDirective = EXTRA_HIGH_APPROVED_NEXT_ROUND_DIRECTIVE;
         state = await this.appendPlanRoundLog(state, {
           round,
           planMarkdown: currentPlan.markdown,
           reviewMarkdown: currentReview,
           verdict: 'approved',
-          revisionInstructions: finalRevisionInstructions,
+          nextRoundDirective: finalNextRoundDirective,
+          ledgerSnapshot: renderRoundLedgerSnapshot(ledger, round),
+          ...(currentPlan.sourcePath ? { planSourcePath: currentPlan.sourcePath } : {}),
+          ...(currentPlan.stdoutSummary ? { plannerStdoutSummary: currentPlan.stdoutSummary } : {}),
         });
         state = await this.store.writeArtifact(state, 'revised-plan', currentPlan.markdown);
         return {
           state,
           finalPlan: currentPlan,
           finalReview: currentReview,
-          finalRevisionInstructions,
+          finalNextRoundDirective,
           rounds: round,
           capHitWithIssues: false,
         };
       }
 
-      if (round === MAX_EXTRA_HIGH_PLANNING_ROUNDS) {
-        const finalRevisionInstructions = EXTRA_HIGH_CAP_REVISION_INSTRUCTIONS;
+      if (round === roundLimit) {
+        const finalNextRoundDirective = EXTRA_HIGH_CAP_NEXT_ROUND_DIRECTIVE;
         state = await this.appendPlanRoundLog(state, {
           round,
           planMarkdown: currentPlan.markdown,
           reviewMarkdown: currentReview,
           verdict: 'issues_remain',
-          revisionInstructions: finalRevisionInstructions,
+          nextRoundDirective: finalNextRoundDirective,
+          ...(state.blockerLedger ? { ledgerSnapshot: renderRoundLedgerSnapshot(state.blockerLedger, round) } : {}),
+          ...(currentPlan.sourcePath ? { planSourcePath: currentPlan.sourcePath } : {}),
+          ...(currentPlan.stdoutSummary ? { plannerStdoutSummary: currentPlan.stdoutSummary } : {}),
         });
         state = await this.store.appendArtifact(state, 'plan-rounds-log', [
-          '## Outstanding Reviewer Concerns',
+          '## Outstanding Blocker Ledger',
           '',
-          currentReview,
+          state.blockerLedger ? renderUnclosedBlockerSummary(state.blockerLedger) : currentReview,
         ].join('\n'));
         state = await this.store.appendArtifact(
           state,
           'decision-log',
-          'extra-high planning hit 3-round cap; outstanding reviewer concerns recorded in plan-rounds-log.md',
+          `extra-high planning paused after round ${round}; active blocker ledger recorded in plan-rounds-log.md`,
         );
         const finalPlan = {
           ...currentPlan,
-          markdown: [EXTRA_HIGH_CAP_NOTE, '', currentPlan.markdown].join('\n'),
+          markdown: [renderExtraHighCapNote(round, state.blockerLedger), '', currentPlan.markdown].join('\n'),
         };
         state = await this.store.writeArtifact(state, 'revised-plan', finalPlan.markdown);
+        state = await this.pauseForUserDirection(state, makeExtraHighContinuationDecision(round, state.blockerLedger));
         return {
           state,
-          finalPlan,
-          finalReview: currentReview,
-          finalRevisionInstructions,
-          rounds: round,
-          capHitWithIssues: true,
+          paused: true,
+          message: state.pendingUserPrompt ?? `Extra High planning still has reviewer concerns after round ${round}.`,
         };
       }
 
-      const revisionInstructions = await this.assistant.createRevisionInstructions({
-        task,
-        projectContext,
-        initialPlan: currentPlan.markdown,
-        review: currentReview,
-        requestedChanges: state.requestedChanges,
-        state,
-        config: scopedConfig,
-      });
-      currentRevisionInstructions = revisionInstructions.markdown;
-      state = await this.store.writeArtifact(state, 'revision-instructions', currentRevisionInstructions);
       state = await this.appendPlanRoundLog(state, {
         round,
         planMarkdown: currentPlan.markdown,
         reviewMarkdown: currentReview,
         verdict: 'revision_requested',
-        revisionInstructions: currentRevisionInstructions,
+        nextRoundDirective: REVIEWER_AUTHORITATIVE_NEXT_ROUND_DIRECTIVE,
+        ...(state.blockerLedger ? { ledgerSnapshot: renderRoundLedgerSnapshot(state.blockerLedger, round) } : {}),
+        ...(currentPlan.sourcePath ? { planSourcePath: currentPlan.sourcePath } : {}),
+        ...(currentPlan.stdoutSummary ? { plannerStdoutSummary: currentPlan.stdoutSummary } : {}),
       });
-      if (revisionInstructions.needsUserDecision) {
-        state = await this.pauseForUserDirection(state, revisionInstructions.userPrompt ?? revisionInstructions.markdown);
-        return { state, paused: true, message: 'Assistant Elon Ma needs a product-level decision before the plan can be revised.' };
-      }
     }
 
     throw new Error('extra-high planning loop exited without a final plan.');
@@ -841,17 +1182,210 @@ export class WorkflowService {
       planMarkdown: string;
       reviewMarkdown: string;
       verdict: PlanRoundVerdict;
-      revisionInstructions: string;
+      nextRoundDirective: string;
+      planSourcePath?: string;
+      plannerStdoutSummary?: string;
+      ledgerSnapshot?: string;
     },
   ): Promise<TaskState> {
     return this.store.appendArtifact(state, 'plan-rounds-log', renderPlanRoundLogEntry(input));
   }
 
-  private async pauseForUserDirection(state: TaskState, prompt: string): Promise<TaskState> {
-    const next = {
-      ...state,
+  private async applyReviewerLedgerOrPause(
+    state: TaskState,
+    review: ReviewResult,
+    difficulty: WorkflowDifficulty,
+    round: number,
+  ): Promise<{ paused: false; state: TaskState } | { paused: true; state: TaskState; message: string }> {
+    if (!usesBlockerLedger(difficulty)) return { paused: false, state };
+    if (review.blockerLedgerParseError) {
+      const next = await this.pauseForInvalidBlockerOutput(state, 'Plan Reviewer', review.blockerLedgerParseError);
+      return { paused: true, state: next, message: next.pendingUserPrompt ?? 'Plan Reviewer blocker ledger output is invalid.' };
+    }
+    if (!review.reviewerBlockerOutput) {
+      const next = await this.pauseForInvalidBlockerOutput(state, 'Plan Reviewer', 'missing reviewer-blockers block');
+      return { paused: true, state: next, message: next.pendingUserPrompt ?? 'Plan Reviewer must output a reviewer-blockers block.' };
+    }
+    const validation = validateReviewerOutputAgainstLedger(review.reviewerBlockerOutput, state.blockerLedger, round);
+    if (!validation.ok) {
+      const next = await this.pauseForInvalidBlockerOutput(state, 'Plan Reviewer', validation.error);
+      return { paused: true, state: next, message: next.pendingUserPrompt ?? 'Plan Reviewer blocker ledger output is invalid.' };
+    }
+    const blockerLedger = applyReviewerOutput(state.blockerLedger, review.reviewerBlockerOutput, round);
+    let next: TaskState = { ...state, blockerLedger, updatedAt: new Date().toISOString() };
+    next = await this.store.writeArtifact(next, 'blocker-ledger', renderBlockerLedgerArtifact(blockerLedger));
+    return { paused: false, state: next };
+  }
+
+  private async applyArchitectLedgerOrPause(
+    state: TaskState,
+    plan: PlanResult,
+    difficulty: WorkflowDifficulty,
+    round: number,
+  ): Promise<{ paused: false; state: TaskState } | { paused: true; state: TaskState; message: string }> {
+    if (!usesBlockerLedger(difficulty)) return { paused: false, state };
+    if (plan.blockerResponseParseError) {
+      const next = await this.pauseForInvalidBlockerOutput(state, 'Architect', plan.blockerResponseParseError);
+      return { paused: true, state: next, message: next.pendingUserPrompt ?? 'Architect blocker response output is invalid.' };
+    }
+    const ledger = state.blockerLedger;
+    if (!ledger || activeBlockers(ledger).length === 0) return { paused: false, state };
+    if (!plan.architectBlockerResponses) {
+      const next = await this.pauseForInvalidBlockerOutput(state, 'Architect', 'missing architect-blocker-responses block');
+      return { paused: true, state: next, message: next.pendingUserPrompt ?? 'Architect must output an architect-blocker-responses block.' };
+    }
+    const validation = validateArchitectResponsesAgainstLedger(plan.architectBlockerResponses, ledger);
+    if (!validation.ok) {
+      const next = await this.pauseForInvalidBlockerOutput(state, 'Architect', validation.error);
+      return { paused: true, state: next, message: next.pendingUserPrompt ?? 'Architect blocker response output is invalid.' };
+    }
+    const blockerLedger = applyArchitectResponses(ledger, plan.architectBlockerResponses, round);
+    let next: TaskState = { ...state, blockerLedger, updatedAt: new Date().toISOString() };
+    next = await this.store.writeArtifact(next, 'blocker-ledger', renderBlockerLedgerArtifact(blockerLedger));
+    return { paused: false, state: next };
+  }
+
+  private async runPlanAgent(
+    state: TaskState,
+    phase: string,
+    run: () => Promise<PlanResult>,
+  ): Promise<{ ok: true; plan: PlanResult } | { ok: false; state: TaskState; message: string }> {
+    try {
+      const plan = await run();
+      if (!plan.userDecision && isDegeneratePlanBody(plan.markdown)) {
+        const paused = await this.pauseForPlanArtifactFailure(state, {
+          phase,
+          plan,
+          reason: 'agent returned an empty plan or only a plan-path status line',
+        });
+        return { ok: false, state: paused, message: paused.pendingUserPrompt ?? 'Heavy agent did not provide a usable plan artifact.' };
+      }
+      return { ok: true, plan };
+    } catch (error) {
+      if (error instanceof HeavyAgentArtifactError) {
+        const paused = await this.pauseForPlanArtifactFailure(state, {
+          phase,
+          error,
+          reason: error.message,
+        });
+        return { ok: false, state: paused, message: paused.pendingUserPrompt ?? 'Heavy agent did not provide a readable plan artifact.' };
+      }
+      throw error;
+    }
+  }
+
+  private async pauseForPlanArtifactFailure(
+    state: TaskState,
+    input: {
+      phase: string;
+      reason: string;
+      plan?: Pick<PlanResult, 'markdown' | 'sourcePath' | 'stdoutSummary'>;
+      error?: HeavyAgentArtifactError;
+    },
+  ): Promise<TaskState> {
+    let next = await this.store.appendArtifact(state, 'plan-rounds-log', renderPlanArtifactFailureLog(input));
+    next = await this.store.appendArtifact(next, 'decision-log', [
+      `plan artifact failure during ${input.phase}`,
+      `reason: ${input.reason}`,
+      `source: ${input.plan?.sourcePath ?? input.error?.sourcePath ?? 'stdout'}`,
+    ].join('\n'));
+    const prompt = renderPlanArtifactFailurePrompt(input);
+    const pendingUserDecision = makePlanArtifactFailureDecision(input);
+    next = {
+      ...withoutPendingPrompt(next),
+      status: 'waiting_user_direction',
+      pendingUserPrompt: prompt,
+      pendingUserDecision,
+      updatedAt: new Date().toISOString(),
+    };
+    await this.store.saveState(next);
+    return next;
+  }
+
+  private async pauseForInvalidAgentDecision(
+    state: TaskState,
+    source: PendingUserDecisionSource,
+    error: string,
+    fallbackMarkdown: string,
+  ): Promise<TaskState> {
+    const prompt = renderInvalidUserDecisionPause({
+      source,
+      error,
+      fallbackText: fallbackMarkdown,
+    });
+    let next: TaskState = {
+      ...withoutPendingPrompt(state),
       status: 'waiting_user_direction' as const,
       pendingUserPrompt: prompt,
+      updatedAt: new Date().toISOString(),
+    };
+    next = await this.store.appendArtifact(next, 'decision-log', `invalid user decision output (${source}): ${error}`);
+    await this.store.saveState(next);
+    return next;
+  }
+
+  private async pauseForInvalidBlockerOutput(
+    state: TaskState,
+    actor: 'Architect' | 'Plan Reviewer',
+    error: string,
+  ): Promise<TaskState> {
+    const prompt = [
+      `${actor} blocker ledger output is invalid.`,
+      `Validation failure: ${error}`,
+      '',
+      'Workflow paused before continuing planning. Ask the agent to output the required structured blocker ledger block, or restart planning.',
+    ].join('\n');
+    let next: TaskState = {
+      ...withoutPendingPrompt(state),
+      status: 'waiting_user_direction',
+      pendingUserPrompt: prompt,
+      updatedAt: new Date().toISOString(),
+    };
+    next = await this.store.appendArtifact(next, 'decision-log', `invalid blocker ledger output (${actor}): ${error}`);
+    await this.store.saveState(next);
+    return next;
+  }
+
+  private async pauseForAgentDecision(
+    state: TaskState,
+    source: PendingUserDecisionSource,
+    decision: PendingUserDecision,
+  ): Promise<TaskState> {
+    const next = await this.store.appendArtifact(state, 'decision-log', renderAgentDecisionRequestLog(source, decision));
+    return this.pauseForUserDirection(next, decision);
+  }
+
+  private async pauseForAssistantDecision(
+    state: TaskState,
+    result: { markdown: string; userPrompt?: string; userDecision?: PendingUserDecision },
+    source: PendingUserDecisionSource,
+  ): Promise<TaskState> {
+    const decision = normalizePendingUserDecision(result.userDecision, source);
+    if (!decision.ok) {
+      const prompt = renderInvalidUserDecisionPause({
+        source,
+        error: decision.error,
+        fallbackText: result.markdown,
+      });
+      let next: TaskState = {
+        ...withoutPendingPrompt(state),
+        status: 'waiting_user_direction' as const,
+        pendingUserPrompt: prompt,
+        updatedAt: new Date().toISOString(),
+      };
+      next = await this.store.appendArtifact(next, 'decision-log', `invalid user decision output (${source}): ${decision.error}`);
+      await this.store.saveState(next);
+      return next;
+    }
+    return this.pauseForUserDirection(state, decision.decision);
+  }
+
+  private async pauseForUserDirection(state: TaskState, decision: PendingUserDecision): Promise<TaskState> {
+    const next = {
+      ...withoutPendingPrompt(state),
+      status: 'waiting_user_direction' as const,
+      pendingUserDecision: decision,
+      pendingUserPrompt: renderPendingUserDecision(decision),
       updatedAt: new Date().toISOString(),
     };
     await this.store.saveState(next);
@@ -935,6 +1469,7 @@ export class WorkflowService {
       'review',
       'revision-instructions',
       'plan-rounds-log',
+      'blocker-ledger',
       'revised-plan',
       'assistant-explanation',
       'qa-log',
@@ -1105,6 +1640,7 @@ export class WorkflowService {
     const implementationLog = await this.store.readArtifact(state, 'implementation-log').catch(() => '');
     const verificationLog = await this.store.readArtifact(state, 'test-build-log').catch(() => '');
     const finalReview = await this.store.readArtifact(state, 'final-review').catch(() => '');
+    const deferredIssues = await this.store.readArtifact(state, 'deferred-issues').catch(() => '');
     const newStatusLines = diffStatusLines(before, after);
 
     return [
@@ -1137,6 +1673,10 @@ export class WorkflowService {
       '',
       finalReview,
       '',
+      deferredIssues ? '## Deferred Issues' : undefined,
+      deferredIssues ? '' : undefined,
+      deferredIssues || undefined,
+      deferredIssues ? '' : undefined,
     ].join('\n');
   }
 }
@@ -1173,14 +1713,20 @@ function renderPlanRoundLogEntry(input: {
   planMarkdown: string;
   reviewMarkdown: string;
   verdict: PlanRoundVerdict;
-  revisionInstructions: string;
+  nextRoundDirective: string;
+  planSourcePath?: string;
+  plannerStdoutSummary?: string;
+  ledgerSnapshot?: string;
 }): string {
-  const revisionInstructions = input.revisionInstructions.trim() || 'n/a';
+  const nextRoundDirective = input.nextRoundDirective.trim() || 'n/a';
+  const stdoutSummary = input.plannerStdoutSummary?.trim() || '(none)';
   return [
     `## Round ${input.round}`,
     '',
     `verdict: ${input.verdict}`,
-    `revision-instructions: ${revisionInstructions}`,
+    `Planner Output Source: ${input.planSourcePath ?? 'stdout'}`,
+    `Planner Stdout Summary: ${stdoutSummary}`,
+    `next-round-directive: ${nextRoundDirective}`,
     '',
     '### Planner Output',
     '',
@@ -1190,10 +1736,158 @@ function renderPlanRoundLogEntry(input: {
     '',
     input.reviewMarkdown,
     '',
-    '### Revision Instructions',
+    input.ledgerSnapshot ? '### Blocker Ledger Snapshot' : undefined,
+    input.ledgerSnapshot ? '' : undefined,
+    input.ledgerSnapshot,
+    input.ledgerSnapshot ? '' : undefined,
+    '### Next Round Directive',
     '',
-    revisionInstructions,
+    nextRoundDirective,
+  ].filter((line): line is string => line !== undefined).join('\n');
+}
+
+function renderPlanArtifactFailureLog(input: {
+  phase: string;
+  reason: string;
+  plan?: Pick<PlanResult, 'markdown' | 'sourcePath' | 'stdoutSummary'>;
+  error?: HeavyAgentArtifactError;
+}): string {
+  const source = input.plan?.sourcePath ?? input.error?.sourcePath ?? 'stdout';
+  return [
+    '## Plan Artifact Failure',
+    '',
+    `phase: ${input.phase}`,
+    `reason: ${input.reason}`,
+    `Planner Output Source: invalid (degenerate body, source=${source})`,
+    `Planner Stdout Summary: ${input.plan?.stdoutSummary?.trim() || '(none)'}`,
+    '',
+    '### Planner Output',
+    '',
+    input.plan?.markdown?.trim() || '(none)',
   ].join('\n');
+}
+
+function renderPlanArtifactFailurePrompt(input: {
+  phase: string;
+  reason: string;
+  plan?: Pick<PlanResult, 'markdown' | 'sourcePath' | 'stdoutSummary'>;
+  error?: HeavyAgentArtifactError;
+}): string {
+  const source = input.plan?.sourcePath ?? input.error?.sourcePath ?? 'stdout';
+  return [
+    'Heavy agent did not provide a usable plan artifact. Manager paused the workflow instead of sending an empty plan to Reviewer/Planner.',
+    `Phase: ${input.phase}`,
+    `Source: ${source}`,
+    `Reason: ${input.reason}`,
+    '',
+    'The task has not advanced to review or implementation. Re-run planning after fixing the agent output/artifact issue.',
+  ].join('\n');
+}
+
+function isPlanArtifactFailurePrompt(prompt: string | undefined): boolean {
+  return Boolean(prompt?.includes('Heavy agent did not provide a usable plan artifact'));
+}
+
+function makePlanArtifactFailureDecision(input: {
+  phase: string;
+  reason: string;
+  plan?: Pick<PlanResult, 'markdown' | 'sourcePath' | 'stdoutSummary'>;
+  error?: HeavyAgentArtifactError;
+}): PendingUserDecision {
+  const source = input.plan?.sourcePath ?? input.error?.sourcePath ?? 'stdout';
+  return {
+    id: `plan-artifact-failure:${slug(input.phase)}`,
+    source: 'plan_artifact_failure',
+    question: `The heavy agent did not provide a usable plan artifact during ${input.phase}. What should Manager do next?`,
+    rationale: `Manager paused before sending an empty or unusable plan onward. Source: ${source}. Reason: ${input.reason}`,
+    options: [
+      {
+        id: 'A',
+        label: 'Retry planning',
+        impact: 'Clears the failed attempt and reruns planning from the original task plus the recorded retry direction.',
+      },
+      {
+        id: 'B',
+        label: 'Stop task',
+        impact: 'Stops this task so you can inspect configuration or restart manually later.',
+      },
+    ],
+    recommendedOptionId: 'A',
+    recommendationReason: 'Retrying is appropriate after fixing the heavy-agent output path or prompt contract.',
+    allowFreeform: true,
+  };
+}
+
+function renderAgentDecisionRequestLog(source: PendingUserDecisionSource, decision: PendingUserDecision): string {
+  return [
+    `agent user decision requested (${source})`,
+    `decision id: ${decision.id}`,
+    `question: ${decision.question}`,
+    `options: ${decision.options.map((option) => `${option.id}. ${option.label}`).join(' | ')}`,
+    decision.recommendedOptionId ? `recommended: ${decision.recommendedOptionId}` : undefined,
+    decision.recommendationReason ? `recommendation reason: ${decision.recommendationReason}` : undefined,
+  ].filter((line): line is string => line !== undefined).join('\n');
+}
+
+function isDegeneratePlanBody(markdown: string): boolean {
+  const trimmed = markdown.trim();
+  if (!trimmed) return true;
+  const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  return lines.length === 1 && /^Plan written to\s+`?.+?\.md`?\.?$/i.test(lines[0] ?? '');
+}
+
+function slug(value: string): string {
+  const normalized = value
+    .toLocaleLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+  return normalized || 'plan-artifact-failure';
+}
+
+function renderExtraHighCapNote(round: number, ledger?: BlockerLedger): string {
+  const activeCount = ledger ? activeBlockers(ledger).length : 0;
+  return `> Note: Extra High planning paused after round ${round} with ${activeCount} active blocker(s). See blocker-ledger.md and plan-rounds-log.md.`;
+}
+
+function stripExtraHighCapNote(markdown: string): string {
+  return markdown
+    .replace(/^> Note: Reviewer still flagged issues at round \d+ — Extra High planning is paused for user direction\. See plan-rounds-log\.md\.\s*\n+/u, '')
+    .replace(/^> Note: Extra High planning paused after round \d+ with \d+ active blocker\(s\)\. See blocker-ledger\.md and plan-rounds-log\.md\.\s*\n+/u, '')
+    .trim();
+}
+
+function makeExtraHighContinuationDecision(round: number, ledger?: BlockerLedger): PendingUserDecision {
+  const activeCount = ledger ? activeBlockers(ledger).length : 0;
+  const summary = ledger ? renderUnclosedBlockerSummary(ledger) : 'No blocker ledger is available.';
+  return {
+    id: `extra-high-planning:round-${round}`,
+    source: 'extra_high_planning',
+    question: `Extra High still has ${activeCount} active blocker(s) after round ${round}. What should happen next?`,
+    rationale: [
+      'A plan with unresolved reviewer blockers should not enter normal approval automatically.',
+      'Active blockers:',
+      summary,
+    ].join('\n'),
+    options: [
+      {
+        id: 'A',
+        label: 'Continue one round',
+        impact: 'Runs one additional Planner/Reviewer round from the latest reviewed plan; Architect must respond to the active ledger.',
+      },
+      {
+        id: 'B',
+        label: 'Restart planning',
+        impact: 'Starts a fresh Extra High planning pass from the original task plus your direction and clears the current blocker ledger.',
+      },
+      {
+        id: 'C',
+        label: 'Execute current plan',
+        impact: `Approves and implements the latest plan despite ${activeCount} active blocker(s), recording this as a user override.`,
+      },
+    ],
+    allowFreeform: true,
+  };
 }
 
 export function isReviewerApproval(markdown: string): boolean {
@@ -1286,6 +1980,7 @@ export function renderStatus(state: TaskState): string {
     state.difficulty ? `Difficulty: ${state.difficulty}` : undefined,
     `Revision round: ${state.revisionRound}`,
     `Reviewer runs: ${state.reviewerRunCount}`,
+    state.implementationFollowup ? `Implementation follow-up: round ${state.implementationFollowup.round} (${state.implementationFollowup.source})` : undefined,
     state.pendingUserPrompt ? `Pending user prompt: ${state.pendingUserPrompt}` : undefined,
   ].filter(Boolean).join('\n');
 }
@@ -1296,7 +1991,7 @@ function renderDifficultyPrompt(): string {
     '- low: simple copy, text, color, or tiny changes. Runs the initial Architect plan, copies it to revised-plan, and skips only plan review and revision instructions.',
     '- medium: default flow. Codex plans, Claude reviews, Codex revises.',
     '- high: complex or risky work. Claude plans/revises, Codex reviews the plan.',
-    '- extra high: high 流程 + Planner ↔ Reviewer 最多 3 轮 plan 打磨.',
+    '- extra high: high 流程 + Planner ↔ Reviewer 初始最多 3 轮；如果仍有 blocking concerns，会先问你是否继续下一轮.',
     'Reply with exactly one of: low, medium, high, extra high.',
   ].join('\n');
 }
@@ -1316,7 +2011,7 @@ function renderOriginalTask(title: string, task: string): string {
 }
 
 function withoutPendingPrompt(state: TaskState): TaskState {
-  const { pendingUserPrompt: _pendingUserPrompt, ...rest } = state;
+  const { pendingUserPrompt: _pendingUserPrompt, pendingUserDecision: _pendingUserDecision, ...rest } = state;
   return rest;
 }
 
@@ -1324,8 +2019,12 @@ function isFinalReviewUserDirection(state: TaskState): boolean {
   return state.lastDecision === 'ask_user_direction' && Boolean(state.artifacts['final-review']);
 }
 
-function isAcceptCurrentWorktreeDirection(answer: string): boolean {
-  const normalized = answer.trim().toLocaleLowerCase();
+function isAcceptCurrentWorktreeDirection(answer: string, selectedOption?: PendingUserDecisionOption): boolean {
+  const normalized = [
+    answer,
+    selectedOption?.label,
+    selectedOption?.impact,
+  ].filter(Boolean).join('\n').trim().toLocaleLowerCase();
   return /^(?:1|option\s*1|选项\s*1|一)$/.test(normalized)
     || normalized.includes('接受现状')
     || normalized.includes('接受当前')
@@ -1333,6 +2032,30 @@ function isAcceptCurrentWorktreeDirection(answer: string): boolean {
     || normalized.includes('as-is')
     || normalized.includes('不用回退')
     || normalized.includes('不需要回退');
+}
+
+function isFinalReviewFollowupCapDirection(state: TaskState): boolean {
+  return state.status === 'waiting_user_direction'
+    && state.pendingUserDecision?.id.startsWith('final-review-followup-cap:') === true;
+}
+
+function isFinalReviewFollowupStopDirection(answer: string, selectedOption?: PendingUserDecisionOption): boolean {
+  if (selectedOption?.id === 'C') return true;
+  return /^(?:stop|c)$/i.test(answer.trim());
+}
+
+function isExtraHighExecuteCurrentPlanDirection(answer: string, selectedOption?: PendingUserDecisionOption): boolean {
+  if (selectedOption?.id === 'C') return true;
+  const normalized = answer.trim().replace(/\s+/g, ' ').toLocaleLowerCase();
+  const compact = normalized.replace(/\s+/g, '');
+  return /(?:execute|implement|run|use|approve).*(?:current|this|latest).*(?:plan|方案)/i.test(normalized)
+    || /(?:current|this|latest).*(?:plan|方案).*(?:execute|implement|run|use|approve)/i.test(normalized)
+    || /(?:直接|现在|马上)?(?:执行|实施|实现|批准|照做|按).*(?:当前|这个|這個|这版|最新版|latest)?(?:plan|方案|计划|計劃)/.test(compact)
+    || /(?:按|照)(?:当前|这个|這個|这版|最新版)?(?:plan|方案|计划|計劃)(?:执行|做|实施|实现)/.test(compact);
+}
+
+function hasArchitectNeedsUserDecision(plan: PlanResult): boolean {
+  return Boolean(plan.architectBlockerResponses?.some((response) => response.status === 'needs_user_decision'));
 }
 
 function appendWorkflowInstruction(state: TaskState, instruction?: string): TaskState {
@@ -1344,13 +2067,110 @@ function appendWorkflowInstruction(state: TaskState, instruction?: string): Task
   };
 }
 
+function clearFollowupScope(state: TaskState): TaskState {
+  const { implementationFollowup: _implementationFollowup, ...rest } = state;
+  return rest;
+}
+
+function makeFinalReviewFollowupScope(state: TaskState, reason: string): NonNullable<TaskState['implementationFollowup']> {
+  const completedRounds = state.implementationFollowupHistory?.map((entry) => entry.round) ?? [];
+  const nextRound = Math.max(0, ...completedRounds, state.implementationFollowup?.round ?? 0) + 1;
+  return {
+    source: 'final_review',
+    round: nextRound,
+    reason: reason.trim() || 'Final review found blocking implementation issues.',
+    createdAt: new Date().toISOString(),
+  };
+}
+
+function makeFinalReviewFollowupExecutionUnit(round: number): ExecutionUnitState {
+  return {
+    index: -1,
+    slug: 'final-review-followup',
+    name: `Final Review Follow-up (round ${round})`,
+    status: 'Not Started',
+    fileName: '',
+  };
+}
+
+function makeFinalReviewFollowupCapDecision(state: TaskState, reason: string): PendingUserDecision {
+  const trimmed = reason.trim() || 'Final review still found blocking implementation issues after a follow-up.';
+  const nextRound = makeFinalReviewFollowupScope(state, trimmed).round;
+  return {
+    id: `final-review-followup-cap:round-${nextRound}`,
+    source: 'final_review',
+    question: 'Final review still has implementation blockers after one follow-up. What should Manager do next?',
+    rationale: [
+      'Manager already ran one scoped Final Review Follow-up.',
+      'Another automatic retry could loop, so this needs explicit user direction.',
+      '',
+      'Latest final review reason:',
+      trimmed,
+    ].join('\n'),
+    options: [
+      {
+        id: 'A',
+        label: 'Run another follow-up',
+        impact: 'Creates one more scoped Final Review Follow-up unit, then runs verification and final review again.',
+      },
+      {
+        id: 'B',
+        label: 'Accept with deferred issues',
+        impact: 'Records the unresolved final-review issue in deferred-issues.md and moves to user acceptance.',
+      },
+      {
+        id: 'C',
+        label: 'Stop task',
+        impact: 'Stops the task without recording acceptance.',
+      },
+    ],
+    recommendedOptionId: 'A',
+    recommendationReason: 'A second scoped follow-up is reasonable only with explicit user approval after the first retry failed.',
+    allowFreeform: true,
+  };
+}
+
+function finalReviewFollowupReasonFromDecision(decision: PendingUserDecision | undefined): string | undefined {
+  const rationale = decision?.rationale;
+  if (!rationale) return undefined;
+  const marker = 'Latest final review reason:';
+  const index = rationale.indexOf(marker);
+  if (index < 0) return undefined;
+  return rationale.slice(index + marker.length).trim() || undefined;
+}
+
+function renderDeferredFinalReviewIssues(state: TaskState, userDirection: string): string {
+  const reason = finalReviewFollowupReasonFromDecision(state.pendingUserDecision)
+    ?? state.pendingUserPrompt
+    ?? 'Final review issue deferred by user direction.';
+  return [
+    '# Deferred Issues',
+    '',
+    'The user chose to accept the current worktree with unresolved final-review issues recorded.',
+    '',
+    '## User Direction',
+    '',
+    userDirection,
+    '',
+    '## Deferred Final Review Issue',
+    '',
+    reason,
+  ].join('\n');
+}
+
 function restartFromPlanningState(state: TaskState, instruction: string, reply: string): TaskState {
   const {
     acceptedAt: _acceptedAt,
     approvedAt: _approvedAt,
+    blockerLedger: _blockerLedger,
     currentExecutionIndex: _currentExecutionIndex,
     executionMode: _executionMode,
+    implementationFollowup: _implementationFollowup,
+    implementationFollowupHistory: _implementationFollowupHistory,
+    extraHighContinuationFromReview: _extraHighContinuationFromReview,
+    extraHighRoundLimit: _extraHighRoundLimit,
     pendingUserPrompt: _pendingUserPrompt,
+    pendingUserDecision: _pendingUserDecision,
     planSummary: _planSummary,
     stoppedReason: _stoppedReason,
     ...rest
@@ -1362,6 +2182,34 @@ function restartFromPlanningState(state: TaskState, instruction: string, reply: 
     reviewerRunCount: 0,
     executionQueue: [],
     requestedChanges: [...state.requestedChanges, `Restart/redesign prompt:\n${instruction}`],
+    lastDecision: reply,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function resetPlanningAfterUserDecision(state: TaskState, instruction: string, reply: string): TaskState {
+  const {
+    acceptedAt: _acceptedAt,
+    approvedAt: _approvedAt,
+    blockerLedger: _blockerLedger,
+    currentExecutionIndex: _currentExecutionIndex,
+    executionMode: _executionMode,
+    implementationFollowup: _implementationFollowup,
+    extraHighContinuationFromReview: _extraHighContinuationFromReview,
+    extraHighRoundLimit: _extraHighRoundLimit,
+    pendingUserPrompt: _pendingUserPrompt,
+    pendingUserDecision: _pendingUserDecision,
+    planSummary: _planSummary,
+    stoppedReason: _stoppedReason,
+    ...rest
+  } = state;
+  return {
+    ...rest,
+    status: 'planning_requested',
+    revisionRound: 0,
+    reviewerRunCount: 0,
+    executionQueue: [],
+    requestedChanges: [...state.requestedChanges, instruction],
     lastDecision: reply,
     updatedAt: new Date().toISOString(),
   };
@@ -1391,7 +2239,7 @@ function renderFinalReviewUserDirectionPrompt(reason: string, userPrompt?: strin
   const trimmedReason = reason.trim() || 'Final review needs a user decision before the workflow can continue.';
   const trimmedPrompt = userPrompt?.trim();
   return [
-    'Final review 未通过：Assistant final review 发现需要你决定的产品/范围问题。',
+    'Final review 需要你做一个产品/范围/方向决定。',
     `原因：${trimmedReason}`,
     trimmedPrompt ? `需要你确认：${trimmedPrompt}` : undefined,
   ].filter(Boolean).join('\n');
