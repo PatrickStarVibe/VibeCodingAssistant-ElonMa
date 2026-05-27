@@ -244,7 +244,12 @@ function optionIdValue(value: unknown): UserDecisionOptionId | undefined {
 
 function exactOptionIdFromAnswer(answer: string): UserDecisionOptionId | undefined {
   const normalized = answer.trim().toUpperCase().replace(/[。.!！?？]\s*$/, '').trim();
-  return optionIdValue(normalized);
+  const exact = optionIdValue(normalized);
+  if (exact) return exact;
+  const asciiPrefixed = normalized.match(/^([ABCD])\s*[:.)-]\s*\S/);
+  if (asciiPrefixed) return optionIdValue(asciiPrefixed[1]);
+  const prefixed = normalized.match(/^([ABCD])\s*[:：.)、。-]\s*\S/);
+  return optionIdValue(prefixed?.[1]);
 }
 
 function sourceLabel(source: PendingUserDecisionSource): string {

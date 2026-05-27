@@ -895,7 +895,9 @@ function renderExtraHighDirectionStartedMessage(state: TaskState, answer: string
 
 function isExtraHighExecuteCurrentPlanDirection(answer: string, selectedOptionId?: string): boolean {
   if (selectedOptionId === 'C') return true;
+  if (selectedOptionId) return false;
   const normalized = answer.trim().replace(/\s+/g, ' ').toLocaleLowerCase();
+  if (normalized.length > 160) return false;
   const compact = normalized.replace(/\s+/g, '');
   return /(?:execute|implement|run|use|approve).*(?:current|this|latest).*(?:plan|方案)/i.test(normalized)
     || /(?:current|this|latest).*(?:plan|方案).*(?:execute|implement|run|use|approve)/i.test(normalized)

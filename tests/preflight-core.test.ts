@@ -239,8 +239,8 @@ describe('preflightCore parseEnvFile', () => {
     const configPath = await writeConfigFixture(dir);
     await writePackageFixture(dir);
     await writeFile(envPath, [
-      'export ASSISTANT_API_KEY=sk-export-assistant-secret',
-      'export ROLE_AGENT_API_KEY=sk-export-role-secret',
+      'export ASSISTANT_API_KEY=fixture-export-assistant-secret',
+      'export ROLE_AGENT_API_KEY=fixture-export-role-secret',
       'export LARK_APP_ID="cli_real_export"',
       "export LARK_APP_SECRET='secret export value'",
     ].join('\n'), 'utf8');
@@ -266,7 +266,7 @@ describe('preflightCore parseEnvFile', () => {
     });
 
     expect(result.status).toBe(0);
-    expect(`${result.stdout}\n${result.stderr}`).not.toContain('sk-export-assistant-secret');
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain('fixture-export-assistant-secret');
     expect(`${result.stdout}\n${result.stderr}`).not.toContain('secret export value');
   });
 });
@@ -383,7 +383,7 @@ describe('preflightCore config-derived contracts', () => {
     });
     const loaded = await core.loadConfig({ explicitPath: configPath, cwd: dir });
 
-    expect(JSON.stringify(loaded.normalized)).not.toContain('E:/GameDeveloping/IReader/my-reader');
+    expect(loaded.normalized.workspace.targetDir).toBeUndefined();
     expect(core.validateWorkspacePaths(loaded.normalized).errors).not.toEqual([]);
   });
 });
@@ -404,7 +404,7 @@ describe('preflightCore validation helpers', () => {
     ]) {
       expect(core.isPlaceholderValue(value), value).toBe(true);
     }
-    expect(core.isPlaceholderValue('sk-realistic-test-value')).toBe(false);
+    expect(core.isPlaceholderValue('realistic-test-value')).toBe(false);
   });
 
   it('accepts normalized deepseek assistant and command-backed workflow roles', async () => {

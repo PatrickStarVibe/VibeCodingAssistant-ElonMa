@@ -40,6 +40,7 @@ import type {
   ExecutionUnitState,
   GitSnapshot,
   AssistantConfig,
+  AssistantRouteResult,
   BlockerLedger,
   PlanResult,
   ReviewResult,
@@ -642,6 +643,14 @@ export class WorkflowService {
       }
 
       if (selectedOption?.id === 'B') {
+        state = resetPlanningAfterUserDecision(state, `Final review requested planning reconsideration:\n${plannerDirection}`, decision);
+        state = clearFollowupScope(state);
+        state = await this.store.appendArtifact(state, 'decision-log', `${directionLog}\nfinal-review follow-up sent back to planning`);
+        await this.store.saveState(state);
+        return this.planTask(state.taskId);
+      }
+
+      if (selectedOption?.id === 'C') {
         const deferredIssues = renderDeferredFinalReviewIssues(state, plannerDirection);
         state = clearFollowupScope({
           ...withoutPendingPrompt(state),
@@ -675,6 +684,62 @@ export class WorkflowService {
       return { state, message: state.pendingUserPrompt ?? 'Final review follow-up is ready. Reply approve A to run it.' };
     }
 
+    if (state.pendingUserDecision?.id === 'final-review-routing:fallback') {
+      if (isFinalReviewFollowupStopDirection(trimmed, selectedOption)) {
+        state = clearFollowupScope({
+          ...withoutPendingPrompt(state),
+          status: 'stopped',
+          stoppedReason: 'Final-review routing needed user direction; user chose to stop.',
+          lastDecision: decision,
+          updatedAt: new Date().toISOString(),
+        });
+        state = await this.store.appendArtifact(state, 'decision-log', directionLog);
+        await this.store.saveState(state);
+        return { state, message: 'Task stopped after final-review routing decision.' };
+      }
+
+      if (selectedOption?.id === 'B') {
+        state = resetPlanningAfterUserDecision(state, `Final review routing sent back to planning:\n${plannerDirection}`, decision);
+        state = clearFollowupScope(state);
+        state = await this.store.appendArtifact(state, 'decision-log', `${directionLog}\nfinal-review routing sent back to planning`);
+        await this.store.saveState(state);
+        return this.planTask(state.taskId);
+      }
+
+      if (selectedOption?.id === 'C') {
+        const deferredIssues = renderDeferredFinalReviewIssues(state, plannerDirection);
+        state = clearFollowupScope({
+          ...withoutPendingPrompt(state),
+          status: 'awaiting_user_acceptance',
+          lastDecision: decision,
+          pendingUserPrompt: "Deferred issues recorded. Reply 'accept' to finalize the task record, or stop to pause.",
+          updatedAt: new Date().toISOString(),
+        });
+        state = await this.store.writeArtifact(state, 'deferred-issues', deferredIssues);
+        state = await this.store.appendArtifact(state, 'decision-log', `${directionLog}\nfinal-review routing deferred issues recorded`);
+        await this.store.saveState(state);
+        await this.refreshParentTaskReadme(state, 'Deferred final-review issues recorded; awaiting user acceptance.');
+        return { state, message: state.pendingUserPrompt ?? 'Deferred issues recorded; awaiting user acceptance.' };
+      }
+
+      const reason = finalReviewFollowupReasonFromDecision(pendingDecision) ?? plannerDirection;
+      const followup = makeFinalReviewFollowupScope(state, reason);
+      state = {
+        ...withoutPendingPrompt(state),
+        status: 'implementation_approved',
+        implementationFollowup: followup,
+        requestedChanges: selectedOption?.id === 'A'
+          ? state.requestedChanges
+          : [...state.requestedChanges, `Final review routing continuation direction:\n${plannerDirection}`],
+        lastDecision: decision,
+        pendingUserPrompt: renderFinalReviewImplementationReroutePrompt(reason),
+        updatedAt: new Date().toISOString(),
+      };
+      state = await this.store.appendArtifact(state, 'decision-log', `${directionLog}\nfinal-review routing approved implementation follow-up`);
+      await this.store.saveState(state);
+      return { state, message: state.pendingUserPrompt ?? 'Final review follow-up is ready. Reply approve A to run it.' };
+    }
+
     if (isFinalReviewUserDirection(state)) {
       if (isAcceptCurrentWorktreeDirection(trimmed, selectedOption)) {
         state = {
@@ -690,9 +755,11 @@ export class WorkflowService {
       }
 
       const continuePrompt = '已记录你的方向。如果要系统按这个方向继续处理，请回复 approve A、yes 或「继续修复」；也可以回复 stop 暂停。';
+      const followup = makeFinalReviewFollowupScope(state, plannerDirection);
       state = {
         ...withoutPendingPrompt(state),
         status: 'implementation_approved',
+        implementationFollowup: followup,
         requestedChanges: [...state.requestedChanges, `User direction after final review:\n${plannerDirection}`],
         lastDecision: decision,
         pendingUserPrompt: continuePrompt,
@@ -902,13 +969,18 @@ export class WorkflowService {
     state = await this.store.writeArtifact(state, 'final-review', finalReview.markdown);
     await this.taskRecords.writeFinalReview(this.projectForState(state), state, finalReview.markdown);
 
-    const route = await this.assistant.routeAfterFinalReview({
+    const assistantRoute = await this.assistant.routeAfterFinalReview({
       finalReview: finalReview.markdown,
       verificationLog,
       state,
       config: this.configForState(state),
     });
+    const routeNormalization = normalizeFinalReviewRoute(assistantRoute, finalReview.markdown, verificationLog);
+    const route = routeNormalization.route;
     state = { ...state, status: 'final_review_routing', lastDecision: route.route, updatedAt: new Date().toISOString() };
+    if (routeNormalization.decisionLogNote) {
+      state = await this.store.appendArtifact(state, 'decision-log', routeNormalization.decisionLogNote);
+    }
     await this.store.saveState(state);
 
     if (route.route === 'complete') {
@@ -957,15 +1029,22 @@ export class WorkflowService {
       return this.planTask(state.taskId);
     }
 
-    state = await this.pauseForAssistantDecision(
-      state,
-      {
-        markdown: renderFinalReviewUserDirectionPrompt(route.reason, route.userPrompt),
-        ...(route.userPrompt ? { userPrompt: route.userPrompt } : {}),
-        ...(route.userDecision ? { userDecision: route.userDecision } : {}),
-      },
-      'final_review',
-    );
+    if (route.userDecision) {
+      state = await this.pauseForAssistantDecision(
+        state,
+        {
+          markdown: renderFinalReviewUserDirectionPrompt(route.reason, route.userPrompt),
+          ...(route.userPrompt ? { userPrompt: route.userPrompt } : {}),
+          userDecision: route.userDecision,
+        },
+        'final_review',
+      );
+      return { state, message: state.pendingUserPrompt ?? 'Final review needs a user direction decision.' };
+    }
+
+    state = await this.pauseForAgentDecision(state, 'final_review', makeFinalReviewRoutingFallbackDecision(route.reason, route.userPrompt));
+    state = await this.store.appendArtifact(state, 'decision-log', 'final review routing requested user direction without structured options; Manager generated fallback options');
+    await this.store.saveState(state);
     return { state, message: state.pendingUserPrompt ?? 'Final review needs a user direction decision.' };
   }
 
@@ -2015,6 +2094,53 @@ function withoutPendingPrompt(state: TaskState): TaskState {
   return rest;
 }
 
+function normalizeFinalReviewRoute(
+  route: AssistantRouteResult,
+  finalReview: string,
+  verificationLog: string,
+): { route: AssistantRouteResult; decisionLogNote?: string } {
+  if (route.route !== 'ask_user_direction') return { route };
+  const routeText = [route.reason, route.userPrompt].filter(Boolean).join('\n');
+  if (!looksLikeTechnicalFinalReviewSignal(routeText) && !looksLikeContainedFinalReviewImplementationDefect([
+    finalReview,
+    verificationLog,
+    routeText,
+  ].filter(Boolean).join('\n'))) return { route };
+  return {
+    route: {
+      route: 'route_to_implementer',
+      reason: route.reason,
+    },
+    decisionLogNote: [
+      'final review routing normalized: ask_user_direction -> route_to_implementer',
+      'reason: final review described a contained technical/test/build implementation defect, not a product/scope/direction decision',
+      `advisor reason: ${route.reason}`,
+    ].join('\n'),
+  };
+}
+
+function looksLikeContainedFinalReviewImplementationDefect(context: string): boolean {
+  const text = context.toLocaleLowerCase();
+  const hasTechnicalFailure = looksLikeTechnicalFinalReviewSignal(text);
+  if (!hasTechnicalFailure) return false;
+
+  const asksForProductDecision = [
+    /\b(?:product decision|scope decision|scope tradeoff|ux decision|pricing|cost|policy|business|user-facing tradeoff)\b/,
+    /产品|范围|方向|取舍|定价|成本|策略|用户体验/,
+  ].some((pattern) => pattern.test(text));
+  return !asksForProductDecision;
+}
+
+function looksLikeTechnicalFinalReviewSignal(context: string): boolean {
+  const text = context.toLocaleLowerCase();
+  const hasTechnicalFailure = [
+    /\b(?:test|tests|unit|integration|playwright|vitest|eslint|lint|build|typecheck|tsc)\b/,
+    /\b(?:fail|fails|failed|failing|failure|assertionerror|error|regression|bug|defect|broken|runtime|cleanup)\b/,
+    /测试|失败|构建|类型检查|回归|缺陷|实现问题/,
+  ].some((pattern) => pattern.test(text));
+  return hasTechnicalFailure;
+}
+
 function isFinalReviewUserDirection(state: TaskState): boolean {
   return state.lastDecision === 'ask_user_direction' && Boolean(state.artifacts['final-review']);
 }
@@ -2040,13 +2166,15 @@ function isFinalReviewFollowupCapDirection(state: TaskState): boolean {
 }
 
 function isFinalReviewFollowupStopDirection(answer: string, selectedOption?: PendingUserDecisionOption): boolean {
-  if (selectedOption?.id === 'C') return true;
-  return /^(?:stop|c)$/i.test(answer.trim());
+  if (selectedOption?.id === 'D') return true;
+  return /^(?:stop|d)$/i.test(answer.trim());
 }
 
 function isExtraHighExecuteCurrentPlanDirection(answer: string, selectedOption?: PendingUserDecisionOption): boolean {
   if (selectedOption?.id === 'C') return true;
+  if (selectedOption) return false;
   const normalized = answer.trim().replace(/\s+/g, ' ').toLocaleLowerCase();
+  if (normalized.length > 160) return false;
   const compact = normalized.replace(/\s+/g, '');
   return /(?:execute|implement|run|use|approve).*(?:current|this|latest).*(?:plan|方案)/i.test(normalized)
     || /(?:current|this|latest).*(?:plan|方案).*(?:execute|implement|run|use|approve)/i.test(normalized)
@@ -2115,17 +2243,66 @@ function makeFinalReviewFollowupCapDecision(state: TaskState, reason: string): P
       },
       {
         id: 'B',
+        label: 'Send back to planning',
+        impact: 'Reopens planning so the plan can address the final-review concern before more implementation work.',
+      },
+      {
+        id: 'C',
         label: 'Accept with deferred issues',
         impact: 'Records the unresolved final-review issue in deferred-issues.md and moves to user acceptance.',
       },
       {
-        id: 'C',
+        id: 'D',
         label: 'Stop task',
         impact: 'Stops the task without recording acceptance.',
       },
     ],
     recommendedOptionId: 'A',
     recommendationReason: 'A second scoped follow-up is reasonable only with explicit user approval after the first retry failed.',
+    allowFreeform: true,
+  };
+}
+
+function makeFinalReviewRoutingFallbackDecision(reason: string, userPrompt?: string): PendingUserDecision {
+  const trimmed = reason.trim() || 'Final review needs a user direction before the workflow can continue.';
+  return {
+    id: 'final-review-routing:fallback',
+    source: 'final_review',
+    question: 'Final review needs a next-step decision. What should Manager do?',
+    rationale: [
+      'The final-review routing step asked for user direction but did not provide structured options.',
+      'Manager generated safe fallback options instead of exposing the internal formatting failure.',
+      '',
+      'Latest final review reason:',
+      trimmed,
+      userPrompt?.trim() ? '' : undefined,
+      userPrompt?.trim() ? 'Advisor prompt:' : undefined,
+      userPrompt?.trim(),
+    ].filter((line): line is string => line !== undefined).join('\n'),
+    options: [
+      {
+        id: 'A',
+        label: 'Run implementation follow-up',
+        impact: 'Creates a scoped Final Review Follow-up unit and asks the implementer to fix the issue.',
+      },
+      {
+        id: 'B',
+        label: 'Send back to planning',
+        impact: 'Reopens planning if the final-review issue shows the plan itself needs redesign.',
+      },
+      {
+        id: 'C',
+        label: 'Accept with deferred issues',
+        impact: 'Records the unresolved final-review issue in deferred-issues.md and moves to user acceptance.',
+      },
+      {
+        id: 'D',
+        label: 'Stop task',
+        impact: 'Stops the task without recording acceptance.',
+      },
+    ],
+    recommendedOptionId: 'A',
+    recommendationReason: 'For implementation or verification failures, another scoped follow-up is usually the safest next step.',
     allowFreeform: true,
   };
 }

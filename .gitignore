@@ -1,8 +1,10 @@
-node_modules
+node_modules/
 dist
 coverage
 logs/
 project-docs
+task/
+tasks/
 .env
 .env.local
 .env.*.local

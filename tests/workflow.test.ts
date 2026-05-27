@@ -561,6 +561,45 @@ describe('WorkflowService', () => {
     }
   });
 
+  it('turns legacy invalid final-review user direction into an executable follow-up scope', async () => {
+    const { root, targetDir, service, store, heavy } = await makeService();
+    try {
+      const created = await service.createTask({ title: 'Legacy final review direction task', task: 'Ship it.' });
+      let state = await store.writeArtifact(created.state, 'implementation-log', 'implemented');
+      state = await store.writeArtifact(state, 'test-build-log', 'tests passed');
+      state = await store.writeArtifact(state, 'revised-plan', '# Revised Plan\n\n- Build it.\n\n## Verification Commands\n- npm test');
+      state = await store.writeArtifact(state, 'final-review', 'Final review found B1.');
+      state = {
+        ...state,
+        status: 'waiting_user_direction',
+        difficulty: 'high',
+        lastDecision: 'ask_user_direction',
+        pendingUserPrompt: 'Final Review Advisor output is invalid: missing userDecision object.',
+        implementationFollowupHistory: [
+          { round: 1, reason: 'First follow-up.', completedAt: '2026-05-26T00:00:00.000Z' },
+        ],
+        updatedAt: new Date().toISOString(),
+      };
+      await store.saveState(state);
+
+      const ready = await service.answerUserDirection(state.taskId, '继续修复 B1');
+      expect(ready.state.status).toBe('implementation_approved');
+      expect(ready.state.implementationFollowup).toMatchObject({
+        round: 2,
+        source: 'final_review',
+      });
+
+      const followed = await service.reply(ready.state.taskId, 'approve A');
+      expect(followed.state.status).toBe('awaiting_user_acceptance');
+      expect(heavy.implementInputs.at(-1)).toMatchObject({
+        mode: 'final_review_followup',
+        executionUnitName: 'Final Review Follow-up (round 2)',
+      });
+    } finally {
+      await cleanup([root, targetDir]);
+    }
+  });
+
   it('persists approved plan artifacts, runs decomposed execution units sequentially, and waits for user acceptance', async () => {
     const { root, targetDir, service, heavy } = await makeService();
     try {
@@ -735,18 +774,88 @@ describe('WorkflowService', () => {
       expect(capped.state.pendingUserDecision?.id).toContain('final-review-followup-cap');
       expect(capped.state.pendingUserDecision?.options.map((option) => option.label)).toEqual([
         'Run another follow-up',
+        'Send back to planning',
         'Accept with deferred issues',
         'Stop task',
       ]);
       expect(heavy.implementRuns).toBe(2);
 
-      const deferred = await service.answerUserDirection(capped.state.taskId, 'B');
+      const deferred = await service.answerUserDirection(capped.state.taskId, 'C');
       expect(deferred.state.status).toBe('awaiting_user_acceptance');
       expect(deferred.state.implementationFollowup).toBeUndefined();
       await expect(service.showArtifact(deferred.state.taskId, 'deferred-issues')).resolves.toContain('Still broken after follow-up.');
 
       const accepted = await service.reply(deferred.state.taskId, 'accept');
       expect(accepted.state.status).toBe('completed');
+    } finally {
+      await cleanup([root, targetDir]);
+    }
+  });
+
+  it('normalizes technical final-review ask-user routing into the follow-up cap decision', async () => {
+    const { root, targetDir, service, assistant, heavy } = await makeService({
+      route: 'route_to_implementer',
+      reason: 'First contained defect.',
+    });
+    try {
+      const created = await service.createTask({ title: 'Technical final review routing task', task: 'Build tooling.' });
+      const planned = await planThroughDifficulty(service, created.state.taskId);
+      const failedReview = await service.reply(planned.state.taskId, 'approve A');
+      expect(failedReview.state.status).toBe('implementation_approved');
+
+      heavy.finalReviewResult = {
+        markdown: [
+          '## Final Review',
+          '',
+          'Blocking issue: Reader integration test fails reliably.',
+          'The cleanup test reports AssertionError because a relocated event is swallowed by a 100ms suppression window.',
+        ].join('\n'),
+        passed: false,
+      };
+      assistant.route = {
+        route: 'ask_user_direction',
+        reason: 'Final review found a blocking integration test failure that breaks cleanup.',
+        userPrompt: 'How should we handle the 100ms suppression-window failure?',
+      };
+
+      const capped = await service.reply(failedReview.state.taskId, 'approve A');
+
+      expect(capped.state.status).toBe('waiting_user_direction');
+      expect(capped.state.pendingUserPrompt).not.toContain('output is invalid');
+      expect(capped.state.pendingUserDecision?.id).toContain('final-review-followup-cap');
+      expect(capped.state.pendingUserDecision?.options.map((option) => option.label)).toEqual([
+        'Run another follow-up',
+        'Send back to planning',
+        'Accept with deferred issues',
+        'Stop task',
+      ]);
+      await expect(service.showArtifact(capped.state.taskId, 'decision-log')).resolves.toContain('final review routing normalized: ask_user_direction -> route_to_implementer');
+    } finally {
+      await cleanup([root, targetDir]);
+    }
+  });
+
+  it('generates fallback final-review routing options when ask-user output lacks structured options', async () => {
+    const { root, targetDir, service } = await makeService({
+      route: 'ask_user_direction',
+      reason: 'The final review found a product scope tradeoff.',
+      userPrompt: 'Should the first release include the larger scope?',
+    });
+    try {
+      const created = await service.createTask({ title: 'Fallback final review routing task', task: 'Build tooling.' });
+      const planned = await planThroughDifficulty(service, created.state.taskId);
+      const paused = await service.reply(planned.state.taskId, 'approve A');
+
+      expect(paused.state.status).toBe('waiting_user_direction');
+      expect(paused.state.pendingUserPrompt).not.toContain('output is invalid');
+      expect(paused.state.pendingUserDecision?.id).toBe('final-review-routing:fallback');
+      expect(paused.state.pendingUserDecision?.options.map((option) => option.label)).toEqual([
+        'Run implementation follow-up',
+        'Send back to planning',
+        'Accept with deferred issues',
+        'Stop task',
+      ]);
+      await expect(service.showArtifact(paused.state.taskId, 'decision-log')).resolves.toContain('Manager generated fallback options');
     } finally {
       await cleanup([root, targetDir]);
     }
@@ -1721,6 +1830,71 @@ describe('WorkflowService', () => {
 
       const decisionLog = await service.showArtifact(continued.state.taskId, 'decision-log');
       expect(decisionLog).toContain('extra-high planning paused after round 4');
+    } finally {
+      await cleanup([root, targetDir]);
+    }
+  });
+
+  it('treats A-prefixed Extra High guidance as continuation, not current-plan execution', async () => {
+    const { root, targetDir, service, assistant, heavy } = await makeService();
+    try {
+      assistant.revisionInstructionsMarkdown = 'Address the latest reviewer blocker.';
+      heavy.initialPlanResults = [{
+        markdown: '# Extra Plan Round 1\n\n- Initial approach.',
+        verificationCommands: ['npm test'],
+      }];
+      heavy.revisedPlanResults = [
+        { markdown: '# Extra Plan Round 2\n\n- First revision.', verificationCommands: ['npm test'] },
+        { markdown: '# Extra Plan Round 3\n\n- Latest capped plan.', verificationCommands: ['npm test'] },
+        { markdown: '# Extra Plan Round 4\n\n- Continued plan.', verificationCommands: ['npm test'] },
+      ];
+      heavy.revisedPlanResults[0] = {
+        ...heavy.revisedPlanResults[0],
+        architectBlockerResponses: architectRespondsB1({ status: 'partially_addressed', summary: 'Added partial migration notes.', planAnchor: '## Migration' }),
+      };
+      heavy.revisedPlanResults[1] = {
+        ...heavy.revisedPlanResults[1],
+        architectBlockerResponses: architectRespondsB1({ status: 'partially_addressed', summary: 'Added partial final review notes.', planAnchor: '## Final Review' }),
+      };
+      heavy.revisedPlanResults[2] = {
+        ...heavy.revisedPlanResults[2],
+        architectBlockerResponses: architectRespondsB1({ status: 'partially_addressed', summary: 'Continuation still leaves cleanup thin.', planAnchor: '## Cleanup' }),
+      };
+      heavy.reviewResults = [
+        {
+          markdown: 'Must fix: missing migration path.',
+          reviewerBlockerOutput: reviewerIntroducesB1({ category: 'risk', title: 'Missing migration path' }),
+        },
+        {
+          markdown: 'Blocking issue: verification is underspecified.',
+          reviewerBlockerOutput: reviewerVerdictsB1('still_open', 'Verification is still underspecified.'),
+        },
+        {
+          markdown: 'Blocking issue: final review handoff remains unclear.',
+          reviewerBlockerOutput: reviewerVerdictsB1('still_open', 'Final review handoff remains unclear.'),
+        },
+        {
+          markdown: 'Still blocked.',
+          reviewerBlockerOutput: reviewerVerdictsB1('still_open', 'The current plan still needs a real integration anchor.'),
+        },
+      ];
+
+      const created = await service.createTask({ title: 'Extra high A-prefixed task', task: 'Build a careful feature.' });
+      const paused = await planThroughDifficulty(service, created.state.taskId, 'extra-high');
+      const answer = [
+        'A: Continue one more round, and carry this guidance into the next Extra High planning/reviewer round.',
+        'Use an existing real integration point in the current codebase, or add a minimal testable harness as part of the plan.',
+      ].join(' ');
+
+      const continued = await service.answerUserDirection(paused.state.taskId, answer);
+
+      expect(continued.state.status).toBe('waiting_user_direction');
+      expect(continued.state.reviewerRunCount).toBe(4);
+      expect(heavy.implementRuns).toBe(0);
+      expect(heavy.finalReviewRuns).toBe(0);
+      const decisionLog = await service.showArtifact(continued.state.taskId, 'decision-log');
+      expect(decisionLog).toContain('selected option: A. Continue one round');
+      expect(decisionLog).not.toContain('extra-high override: execute current plan');
     } finally {
       await cleanup([root, targetDir]);
     }

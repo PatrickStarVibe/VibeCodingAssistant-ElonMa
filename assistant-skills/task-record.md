@@ -12,10 +12,10 @@ If it is missing, Assistant Elon Ma uses:
 <project.targetDir>/task
 ```
 
-For IReader, this is:
+For example, this may be:
 
 ```text
-E:/GameDeveloping/IReader/my-reader/task
+C:/path/to/your/project/task
 ```
 
 ## Folder Shape

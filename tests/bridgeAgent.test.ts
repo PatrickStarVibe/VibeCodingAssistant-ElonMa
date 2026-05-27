@@ -652,6 +652,37 @@ describe('BridgeAgentService', () => {
     }
   });
 
+  it('labels A-prefixed Extra High guidance as planning instead of implementation', async () => {
+    const harness = await makeHarness();
+    try {
+      const taskId = await createExtraHighPlanningPause(harness);
+      const answer = [
+        'A: Continue one more round, and carry this guidance into the next Extra High planning/reviewer round.',
+        'Use an existing real integration point in the current codebase, or add a minimal testable harness as part of the plan.',
+      ].join(' ');
+      harness.assistant.decisions.push({
+        kind: 'tool_call',
+        toolCall: { name: 'answer_user_direction', arguments: { answer } },
+      });
+
+      const turn = await harness.agent.handleMessage({
+        chatId: 'task-chat',
+        senderOpenId: 'user-open-id',
+        text: answer,
+        ...activeTaskChat(taskId),
+      });
+
+      expect(turn.kind).toBe('background');
+      if (turn.kind === 'background') {
+        expect(turn.label).toBe('extra-high planning');
+        expect(turn.startedMessage.text).toContain('继续 Extra High planning 一轮');
+        expect(turn.startedMessage.text).not.toContain('直接执行当前 Extra High plan');
+      }
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
   it('starts Extra High option C as a background implementation override', async () => {
     const harness = await makeHarness();
     try {

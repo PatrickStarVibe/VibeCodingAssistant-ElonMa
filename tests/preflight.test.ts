@@ -62,7 +62,7 @@ async function writePackageFixture(cwd: string, scripts: Record<string, string> 
 async function writeEnvFile(cwd: string, fileName = '.env.local') {
   const envPath = path.join(cwd, fileName);
   await writeFile(envPath, [
-    'ASSISTANT_API_KEY=sk-assistant-fixture',
+    'ASSISTANT_API_KEY=fixture-assistant-secret',
     'ROLE_AGENT_API_KEY=sk-role-fixture',
     'LARK_APP_ID=cli_real_fixture',
     'LARK_APP_SECRET=secret-fixture',
@@ -278,7 +278,7 @@ describe('preflight.mjs env-file behavior', () => {
     expect(result.status).toBe(1);
     expect(result.stdout).toContain('Environment file');
     expect(result.stdout).toContain(path.basename(missingPath));
-    expect(allOutput(result)).not.toContain('sk-assistant-fixture');
+    expect(allOutput(result)).not.toContain('fixture-assistant-secret');
   });
 
   it('fails with parseable JSON when --env-file points to a missing file', async () => {
@@ -492,7 +492,7 @@ describe('setup.mjs non-interactive mode', () => {
     await writePackageFixture(dir);
     await writeFile(path.join(dir, '.env.example'), [
       'ASSISTANT_API_KEY=sk-setup-secret',
-      'ROLE_AGENT_API_KEY=sk-setup-role-secret',
+      'ROLE_AGENT_API_KEY=fixture-setup-role-secret',
       'LARK_APP_ID=cli_setup_secret',
       'LARK_APP_SECRET=setup-secret-value',
       '',

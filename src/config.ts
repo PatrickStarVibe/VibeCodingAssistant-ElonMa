@@ -54,16 +54,17 @@ export function getDefaultAssistantRoot(): string {
 }
 
 export function defaultConfig(): AssistantConfig {
+  const defaultTargetDir = process.cwd();
   return {
     workspace: {
-      targetDir: 'E:/GameDeveloping/IReader/my-reader',
+      targetDir: defaultTargetDir,
     },
     defaultProjectId: 'default',
     projects: [
       {
         id: 'default',
         name: 'Default',
-        targetDir: 'E:/GameDeveloping/IReader/my-reader',
+        targetDir: defaultTargetDir,
         docsDir: 'project-docs/default',
         alwaysRead: [],
       },

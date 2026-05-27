@@ -1266,7 +1266,7 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
         role: 'system',
         content: [
           'You route after final review.',
-          'Return JSON only: {"route":"complete|route_to_implementer|route_to_planner|ask_user_direction","reason":"...","userPrompt":"optional","userDecision":"optional"}',
+          'Return JSON only: {"route":"complete|route_to_implementer|route_to_planner|ask_user_direction","reason":"...","userPrompt":"optional","userDecision":"required only when route is ask_user_direction"}',
           'Route to implementer for contained implementation defects, planner for plan/design mismatch, ask user for product/scope/direction decisions.',
           'If route=ask_user_direction, userDecision is REQUIRED with question, rationale, 1 to 4 A/B/C/D options, allowFreeform=true, and any recommendation explanation from the advisor.',
         ].join(' '),
