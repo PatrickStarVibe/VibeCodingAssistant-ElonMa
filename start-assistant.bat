@@ -1,5 +1,5 @@
-@REM Purpose: Windows double-click launcher for the Manager assistant startup flow.
-@REM Author: Manager distribution tooling
+@REM Purpose: Windows double-click launcher for the VibeCodingAssistant-ElonMa assistant startup flow.
+@REM Author: VibeCodingAssistant-ElonMa distribution tooling
 @echo off
 setlocal
 
@@ -7,7 +7,7 @@ chcp 65001 >nul
 cd /d "%~dp0"
 
 echo ===============================================
-echo Manager Assistant Launcher
+echo VibeCodingAssistant-ElonMa Assistant Launcher
 echo ===============================================
 echo This launcher checks Node.js and npm, then runs:
 echo   npm run assistant:start

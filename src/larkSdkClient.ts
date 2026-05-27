@@ -43,7 +43,7 @@ export class LarkSdkClient implements LarkClientPort {
       domain,
       appType: lark.AppType.SelfBuild,
       loggerLevel: lark.LoggerLevel.warn,
-      source: 'assistant-ai-workflow',
+      source: 'vibecodingassistant-elonma',
     };
     this.client = new lark.Client(baseConfig) as unknown as LarkApiClient;
     this.wsClient = new lark.WSClient(baseConfig) as unknown as LarkWsClient;

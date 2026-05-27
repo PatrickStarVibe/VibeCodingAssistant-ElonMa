@@ -1,9 +1,9 @@
 # Assistant Workflow
 
-Assistant Elon Ma is now a thin workflow helper plus advisor.
+VibeCodingAssistant-ElonMa is now a thin workflow helper plus advisor.
 
-The user prompt is the source of truth. Assistant Elon Ma does not rewrite it before planning.
-Architect and Reviewer can directly request user decisions with a structured `assistant-user-decision` markdown block. Manager parses that block, pauses, and forwards the options without rewriting them.
+The user prompt is the source of truth. VibeCodingAssistant-ElonMa does not rewrite it before planning.
+Architect and Reviewer can directly request user decisions with a structured `assistant-user-decision` markdown block. VibeCodingAssistant-ElonMa parses that block, pauses, and forwards the options without rewriting them.
 
 ## Flow
 
@@ -24,7 +24,7 @@ user prompt
 
 - `awaiting_difficulty_selection`: choose `low`, `medium`, `high`, or `extra high`.
 - `ready_for_decision`: approve, revise, reject, restart, ask, status, or summary.
-- `waiting_user_direction`: answer a product/scope question raised by Architect, Reviewer, Assistant Elon Ma, or the extra-high planning gate.
+- `waiting_user_direction`: answer a product/scope question raised by Architect, Reviewer, VibeCodingAssistant-ElonMa, or the extra-high planning gate.
 - `awaiting_user_acceptance`: accept, revise, or add a note.
 
 ## Difficulty
@@ -38,7 +38,7 @@ user prompt
 
 High and Extra High use a structured blocker ledger. Reviewer must include exactly one fenced `reviewer-blockers` JSON block. Architect revise must include exactly one fenced `architect-blocker-responses` JSON block whenever the ledger has active blockers.
 
-Manager does not judge whether a blocker is technically solved. It only parses, validates, records, and forwards the ledger. In High, Architect response coverage is enough to continue to `ready_for_decision`; the ledger may still show active blockers that have not had a second Reviewer closure pass. In Extra High, Reviewer must explicitly close every active blocker before planning is approved.
+VibeCodingAssistant-ElonMa does not judge whether a blocker is technically solved. It only parses, validates, records, and forwards the ledger. In High, Architect response coverage is enough to continue to `ready_for_decision`; the ledger may still show active blockers that have not had a second Reviewer closure pass. In Extra High, Reviewer must explicitly close every active blocker before planning is approved.
 
 ## Extra High Difficulty
 
@@ -57,7 +57,7 @@ If Reviewer finds issues, Reviewer markdown and the active ledger are sent back 
 - `original-task.md`: exact user prompt.
 - `initial-plan.md`: first planner output.
 - `review.md`: plan review when the difficulty uses one.
-- `revision-instructions.md`: legacy Assistant Elon Ma planner-facing revision instructions. Standard planning no longer writes this artifact; Reviewer markdown is the authoritative input to Architect revise.
+- `revision-instructions.md`: legacy VibeCodingAssistant-ElonMa planner-facing revision instructions. Standard planning no longer writes this artifact; Reviewer markdown is the authoritative input to Architect revise.
 - `plan-rounds-log.md`: extra high planning-round transcript plus blocker ledger snapshots.
 - `blocker-ledger.md`: current High / Extra High blocker ledger, including Reviewer verdicts and Architect responses.
 - `revised-plan.md`: plan shown for approval.
@@ -80,5 +80,5 @@ If Reviewer finds issues, Reviewer markdown and the active ledger are sent back 
 
 ## Principle
 
-Assistant Elon Ma can advise, explain, and route, but it no longer transforms the user's prompt into a separate requirement artifact before the planner sees it.
-Manager does not infer user decisions from ordinary prose. The formal planning decision protocol is a fenced `assistant-user-decision` JSON block; explicit unstructured decision markers without that block are treated as invalid agent output and pause the workflow.
+VibeCodingAssistant-ElonMa can advise, explain, and route, but it no longer transforms the user's prompt into a separate requirement artifact before the planner sees it.
+VibeCodingAssistant-ElonMa does not infer user decisions from ordinary prose. The formal planning decision protocol is a fenced `assistant-user-decision` JSON block; explicit unstructured decision markers without that block are treated as invalid agent output and pause the workflow.

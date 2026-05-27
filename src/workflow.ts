@@ -1043,7 +1043,7 @@ export class WorkflowService {
     }
 
     state = await this.pauseForAgentDecision(state, 'final_review', makeFinalReviewRoutingFallbackDecision(route.reason, route.userPrompt));
-    state = await this.store.appendArtifact(state, 'decision-log', 'final review routing requested user direction without structured options; Manager generated fallback options');
+    state = await this.store.appendArtifact(state, 'decision-log', 'final review routing requested user direction without structured options; VibeCodingAssistant-ElonMa generated fallback options');
     await this.store.saveState(state);
     return { state, message: state.pendingUserPrompt ?? 'Final review needs a user direction decision.' };
   }
@@ -1854,7 +1854,7 @@ function renderPlanArtifactFailurePrompt(input: {
 }): string {
   const source = input.plan?.sourcePath ?? input.error?.sourcePath ?? 'stdout';
   return [
-    'Heavy agent did not provide a usable plan artifact. Manager paused the workflow instead of sending an empty plan to Reviewer/Planner.',
+    'Heavy agent did not provide a usable plan artifact. VibeCodingAssistant-ElonMa paused the workflow instead of sending an empty plan to Reviewer/Planner.',
     `Phase: ${input.phase}`,
     `Source: ${source}`,
     `Reason: ${input.reason}`,
@@ -1877,8 +1877,8 @@ function makePlanArtifactFailureDecision(input: {
   return {
     id: `plan-artifact-failure:${slug(input.phase)}`,
     source: 'plan_artifact_failure',
-    question: `The heavy agent did not provide a usable plan artifact during ${input.phase}. What should Manager do next?`,
-    rationale: `Manager paused before sending an empty or unusable plan onward. Source: ${source}. Reason: ${input.reason}`,
+    question: `The heavy agent did not provide a usable plan artifact during ${input.phase}. What should VibeCodingAssistant-ElonMa do next?`,
+    rationale: `VibeCodingAssistant-ElonMa paused before sending an empty or unusable plan onward. Source: ${source}. Reason: ${input.reason}`,
     options: [
       {
         id: 'A',
@@ -2227,9 +2227,9 @@ function makeFinalReviewFollowupCapDecision(state: TaskState, reason: string): P
   return {
     id: `final-review-followup-cap:round-${nextRound}`,
     source: 'final_review',
-    question: 'Final review still has implementation blockers after one follow-up. What should Manager do next?',
+    question: 'Final review still has implementation blockers after one follow-up. What should VibeCodingAssistant-ElonMa do next?',
     rationale: [
-      'Manager already ran one scoped Final Review Follow-up.',
+      'VibeCodingAssistant-ElonMa already ran one scoped Final Review Follow-up.',
       'Another automatic retry could loop, so this needs explicit user direction.',
       '',
       'Latest final review reason:',
@@ -2268,10 +2268,10 @@ function makeFinalReviewRoutingFallbackDecision(reason: string, userPrompt?: str
   return {
     id: 'final-review-routing:fallback',
     source: 'final_review',
-    question: 'Final review needs a next-step decision. What should Manager do?',
+    question: 'Final review needs a next-step decision. What should VibeCodingAssistant-ElonMa do?',
     rationale: [
       'The final-review routing step asked for user direction but did not provide structured options.',
-      'Manager generated safe fallback options instead of exposing the internal formatting failure.',
+      'VibeCodingAssistant-ElonMa generated safe fallback options instead of exposing the internal formatting failure.',
       '',
       'Latest final review reason:',
       trimmed,

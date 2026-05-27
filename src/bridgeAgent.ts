@@ -72,7 +72,7 @@ const BRIDGE_TOOL_USER_LABELS: Record<BridgeToolName, string> = {
   approve_plan: '批准计划并启动实现（approve_plan）',
   run_followup: '运行 Final Review follow-up（run_followup）',
   accept_task: '验收当前 task（accept_task）',
-  answer_user_direction: '回答 Architect/Reviewer/Assistant Elon Ma 的 pending 问题（answer_user_direction，可回 A/B/C/D 或自由文本）',
+  answer_user_direction: '回答 Architect/Reviewer/VibeCodingAssistant-ElonMa 的 pending 问题（answer_user_direction，可回 A/B/C/D 或自由文本）',
   revise_plan: '要求修改计划或返工（revise_plan）',
   stop_task: '停止当前 task（stop_task）',
   ask_task_question: '围绕当前 task 提问（ask_task_question）',
@@ -935,7 +935,7 @@ function renderBridgeStatus(state: TaskState, runningLabel?: string, liveProcess
     pendingPrompt ? '待你决定：' : undefined,
     pendingPrompt,
     missingBackgroundWorker
-      ? '后台任务未运行：可能是上次 Manager 重启或进程中断后的残留状态；当前没有可恢复的 worker。'
+      ? '后台任务未运行：可能是上次 VibeCodingAssistant-ElonMa 重启或进程中断后的残留状态；当前没有可恢复的 worker。'
       : undefined,
     ...executionLines,
     ...(liveLines.length > 0 ? ['', '实时观察：', ...liveLines] : []),

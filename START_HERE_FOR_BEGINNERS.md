@@ -1,27 +1,27 @@
-# Manager Beginner Setup Guide
+# VibeCodingAssistant-ElonMa Beginner Setup Guide
 
-This guide is for users who are new to command-line setup. It explains what to edit, what each file means, and how to check that Manager can see your own project.
+This guide is for users who are new to command-line setup. It explains what to edit, what each file means, and how to check that VibeCodingAssistant-ElonMa can see your own project.
 
 If you already know how to configure local developer tools, use the shorter [START_HERE.md](START_HERE.md). If you want an AI coding agent to do the setup for you, give it [docs/agent-setup-guide.md](docs/agent-setup-guide.md).
 
 ## What This Project Is
 
-Manager is the local workflow repo for Assistant Elon Ma. It helps you run a structured AI coding workflow around your own project:
+VibeCodingAssistant-ElonMa is the local workflow repo for VibeCodingAssistant-ElonMa. It helps you run a structured AI coding workflow around your own project:
 
-- You tell Assistant Elon Ma what you want changed.
-- Manager creates a task record and routes planning, implementation, review, and final acceptance.
-- Manager can send prompts to your configured LLM provider or local coding-agent command.
-- Manager can optionally connect to Lark / Feishu so you can drive the workflow from chat.
+- You tell VibeCodingAssistant-ElonMa what you want changed.
+- VibeCodingAssistant-ElonMa creates a task record and routes planning, implementation, review, and final acceptance.
+- VibeCodingAssistant-ElonMa can send prompts to your configured LLM provider or local coding-agent command.
+- VibeCodingAssistant-ElonMa can optionally connect to Lark / Feishu so you can drive the workflow from chat.
 
-Manager is not the project you want to edit. Manager needs to know the path to that project, then it can pass the right workspace and project-memory files to the agents.
+VibeCodingAssistant-ElonMa is not the project you want to edit. VibeCodingAssistant-ElonMa needs to know the path to that project, then it can pass the right workspace and project-memory files to the agents.
 
 ## What You Need Before Setup
 
 Prepare these items first:
 
 - Node.js and npm installed on your computer.
-- This Manager repo downloaded locally.
-- The local path of the project you want Manager to operate on, for example `<YOUR_PROJECT_PATH>`.
+- This VibeCodingAssistant-ElonMa repo downloaded locally.
+- The local path of the project you want VibeCodingAssistant-ElonMa to operate on, for example `<YOUR_PROJECT_PATH>`.
 - A provider account, API key, or local provider command for your AI workflow.
 - The environment variable names you want to use for secrets, for example `<YOUR_API_KEY_ENV>`.
 - Optional: Lark / Feishu app credentials if you want to use the Lark bridge.
@@ -29,11 +29,11 @@ Prepare these items first:
 
 Do not paste real API keys into docs, chat messages, screenshots, or committed files. Real secrets belong only in `.env.local` or your system environment variables.
 
-## Open A Terminal In The Manager Folder
+## Open A Terminal In The VibeCodingAssistant-ElonMa Folder
 
-On Windows, open File Explorer, go to the Manager folder, click the address bar, type `powershell`, then press Enter.
+On Windows, open File Explorer, go to the VibeCodingAssistant-ElonMa folder, click the address bar, type `powershell`, then press Enter.
 
-You should now see a PowerShell window opened in the Manager folder. All commands below assume that window is already in the Manager folder.
+You should now see a PowerShell window opened in the VibeCodingAssistant-ElonMa folder. All commands below assume that window is already in the VibeCodingAssistant-ElonMa folder.
 
 Check that Node and npm are installed:
 
@@ -42,7 +42,7 @@ node -v
 npm -v
 ```
 
-If either command says it is not recognized, install Node.js, close PowerShell, open it again in the Manager folder, and retry the two commands.
+If either command says it is not recognized, install Node.js, close PowerShell, open it again in the VibeCodingAssistant-ElonMa folder, and retry the two commands.
 
 Install project dependencies if `node_modules` is missing or you just downloaded the repo:
 
@@ -52,12 +52,12 @@ npm install
 
 ## Copy The Local Config Files
 
-Manager keeps shareable examples separate from your private local setup:
+VibeCodingAssistant-ElonMa keeps shareable examples separate from your private local setup:
 
 - `.env.example` is the safe example for environment variables.
-- `assistant.config.example.json` is the safe example for Manager configuration.
+- `assistant.config.example.json` is the safe example for VibeCodingAssistant-ElonMa configuration.
 - `.env.local` is your private secret file.
-- `assistant.config.local.json` is your private local Manager config.
+- `assistant.config.local.json` is your private local VibeCodingAssistant-ElonMa config.
 - `assistant.projects.local.json` is an optional private place to add project entries.
 
 Create local copies:
@@ -67,7 +67,7 @@ Copy-Item .\assistant.config.example.json .\assistant.config.local.json
 Copy-Item .\.env.example .\.env.local
 ```
 
-If PowerShell asks whether to overwrite a file, stop and check whether you already configured Manager before replacing it.
+If PowerShell asks whether to overwrite a file, stop and check whether you already configured VibeCodingAssistant-ElonMa before replacing it.
 
 ## Fill In `.env.local`
 
@@ -102,17 +102,17 @@ Keep these rules:
 - Do not commit `.env.local`.
 - Do not ask an AI agent to print the real values back to you.
 
-If your provider works through a local command instead of an API key, keep any secrets required by that command in `.env.local` or your system environment. Put only the command name or command path in the Manager profile.
+If your provider works through a local command instead of an API key, keep any secrets required by that command in `.env.local` or your system environment. Put only the command name or command path in the VibeCodingAssistant-ElonMa profile.
 
 ## Fill In Your Project Path
 
 Open `assistant.config.local.json`. The most important project fields are:
 
-- `workspace.targetDir`: the default project folder Manager should use.
-- `defaultProjectId`: the project id Manager uses when no project is specified.
-- `projects[]`: the list of projects Manager can operate on.
+- `workspace.targetDir`: the default project folder VibeCodingAssistant-ElonMa should use.
+- `defaultProjectId`: the project id VibeCodingAssistant-ElonMa uses when no project is specified.
+- `projects[]`: the list of projects VibeCodingAssistant-ElonMa can operate on.
 - `projects[].targetDir`: the real local path of one project.
-- `projects[].docsDir`: the project-memory folder for Manager to read.
+- `projects[].docsDir`: the project-memory folder for VibeCodingAssistant-ElonMa to read.
 - `projects[].taskRecordRoot`: where task records should be written.
 - `projects[].alwaysRead`: Markdown files inside `docsDir` that should always be loaded.
 
@@ -141,7 +141,7 @@ Replace:
 
 - `<PROJECT_ID>` with a short id such as `my-app`.
 - `<PROJECT_NAME>` with a human-readable name.
-- `<YOUR_PROJECT_PATH>` with the folder path of the project you want Manager to edit.
+- `<YOUR_PROJECT_PATH>` with the folder path of the project you want VibeCodingAssistant-ElonMa to edit.
 
 Windows paths can use either forward slashes or escaped backslashes:
 
@@ -173,7 +173,7 @@ If you do not want to edit the main config file for projects, add project entrie
 
 ## Fill In Provider Profiles
 
-In `assistant.config.local.json`, `profiles` describes how Manager reaches each LLM provider or coding agent. `workflowRoles` tells Manager which profile to use for each role.
+In `assistant.config.local.json`, `profiles` describes how VibeCodingAssistant-ElonMa reaches each LLM provider or coding agent. `workflowRoles` tells VibeCodingAssistant-ElonMa which profile to use for each role.
 
 API-backed profile shape:
 
@@ -203,7 +203,7 @@ Keep this provider-agnostic:
 - Do not hard-code one provider into every profile unless you really want all roles to use it.
 - Make sure every name in `workflowRoles` exists under `profiles`.
 
-## Verify Manager Can Read Your Project
+## Verify VibeCodingAssistant-ElonMa Can Read Your Project
 
 First list configured projects:
 
@@ -211,12 +211,12 @@ First list configured projects:
 npm run assistant -- projects --config assistant.config.local.json
 ```
 
-You want to see your `<PROJECT_ID>` and `<YOUR_PROJECT_PATH>` in the output. If you do, Manager can load the project entry.
+You want to see your `<PROJECT_ID>` and `<YOUR_PROJECT_PATH>` in the output. If you do, VibeCodingAssistant-ElonMa can load the project entry.
 
 Next create a tiny smoke task:
 
 ```powershell
-npm run assistant -- create --config assistant.config.local.json --project <PROJECT_ID> --title "setup-smoke-test" --task "Check whether this Manager setup can read the configured project root and project docs."
+npm run assistant -- create --config assistant.config.local.json --project <PROJECT_ID> --title "setup-smoke-test" --task "Check whether this VibeCodingAssistant-ElonMa setup can read the configured project root and project docs."
 ```
 
 The command returns a task id. Use that id in the next commands:
@@ -226,7 +226,7 @@ npm run assistant -- plan --config assistant.config.local.json --task <TASK_ID>
 npm run assistant -- show --config assistant.config.local.json --task <TASK_ID> --artifact agent-prompt-preview
 ```
 
-In the preview, check that `Target workspace` points to your project path, not the Manager repo path unless Manager itself is the project you are testing.
+In the preview, check that `Target workspace` points to your project path, not the VibeCodingAssistant-ElonMa repo path unless VibeCodingAssistant-ElonMa itself is the project you are testing.
 
 When the task asks for difficulty, reply with one of `low`, `medium`, `high`, or `extra high`:
 
@@ -238,7 +238,7 @@ For a setup smoke test, `low` is usually enough.
 
 ## Start The Lark Bridge
 
-Use this only if you want to control Assistant Elon Ma from Lark / Feishu.
+Use this only if you want to control VibeCodingAssistant-ElonMa from Lark / Feishu.
 
 Before starting, confirm:
 
@@ -266,7 +266,7 @@ More detail is in [docs/lark-bridge.md](docs/lark-bridge.md).
 `node` or `npm` is not recognized:
 Install Node.js, close and reopen PowerShell, then run `node -v` and `npm -v` again.
 
-`config missing` or Manager cannot find `assistant.config.local.json`:
+`config missing` or VibeCodingAssistant-ElonMa cannot find `assistant.config.local.json`:
 Copy `assistant.config.example.json` to `assistant.config.local.json`, or pass the correct path with `--config assistant.config.local.json`.
 
 `missing API key`:

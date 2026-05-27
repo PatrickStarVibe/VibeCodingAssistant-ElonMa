@@ -1,7 +1,7 @@
 /*
- * Repo hygiene checker for Manager distribution and publish readiness.
+ * Repo hygiene checker for VibeCodingAssistant-ElonMa distribution and publish readiness.
  * Runs git, ignore-file, lockfile, and package version checks without external dependencies.
- * Author: Manager distribution tooling
+ * Author: VibeCodingAssistant-ElonMa distribution tooling
  */
 
 import { spawnSync } from "node:child_process";
@@ -301,7 +301,7 @@ function humanStatus(status) {
 function formatHuman(payload) {
   if (payload.help) {
     return [
-      "Manager repo hygiene checker",
+      "VibeCodingAssistant-ElonMa repo hygiene checker",
       "",
       "Usage: node scripts/repo-hygiene.mjs [--json]",
       "",
@@ -309,7 +309,7 @@ function formatHuman(payload) {
     ].join("\n");
   }
 
-  const lines = ["Manager repo hygiene check", ""];
+  const lines = ["VibeCodingAssistant-ElonMa repo hygiene check", ""];
   for (const check of payload.checks) {
     lines.push(`${humanStatus(check.status)} ${check.label} - ${check.detail}`);
   }

@@ -1,6 +1,6 @@
 <#
-Purpose: Windows PowerShell launcher for the Manager assistant startup flow.
-Author: Manager distribution tooling
+Purpose: Windows PowerShell launcher for the VibeCodingAssistant-ElonMa assistant startup flow.
+Author: VibeCodingAssistant-ElonMa distribution tooling
 #>
 
 $ErrorActionPreference = "Stop"
@@ -38,7 +38,7 @@ function Resolve-RequiredCommand {
 try {
   Set-Location -LiteralPath $PSScriptRoot
 
-  Write-Host "Manager Assistant Launcher" -ForegroundColor Green
+  Write-Host "VibeCodingAssistant-ElonMa Assistant Launcher" -ForegroundColor Green
   Write-Host "This launcher checks Node.js and npm, then runs npm run assistant:start."
   Write-Host "Preflight is executed by assistant:start before launch."
 

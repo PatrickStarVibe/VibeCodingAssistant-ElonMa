@@ -1,6 +1,6 @@
 # AI Agent Setup Guide
 
-Use this guide when a coding agent is asked to configure Manager for a user's local Assistant Elon Ma workflow.
+Use this guide when a coding agent is asked to configure VibeCodingAssistant-ElonMa for a user's local VibeCodingAssistant-ElonMa workflow.
 
 This guide is intentionally provider-agnostic. Do not assume a specific LLM provider, model, API endpoint, or coding-agent CLI unless the user gives that information.
 
@@ -86,7 +86,7 @@ When you need to confirm `.env.local`, report only non-secret facts:
 
 ## Setup Workflow
 
-1. Confirm the Manager repo root and whether local config files already exist.
+1. Confirm the VibeCodingAssistant-ElonMa repo root and whether local config files already exist.
 2. If needed, copy `.env.example` to `.env.local` and `assistant.config.example.json` to `assistant.config.local.json`.
 3. Fill `workspace.targetDir`, `defaultProjectId`, and `projects[]` or `assistant.projects.local.json`.
 4. Fill `profiles` and `workflowRoles` using the user's provider/profile details.
@@ -104,7 +104,7 @@ For CI or scripted smoke checks, `npm run assistant:setup -- --non-interactive` 
 
 ## Validation Commands
 
-Run these from the Manager repo root:
+Run these from the VibeCodingAssistant-ElonMa repo root:
 
 ```powershell
 npm run assistant:preflight
@@ -154,7 +154,7 @@ Windows launchers:
 Optional smoke task:
 
 ```powershell
-npm run assistant -- create --config assistant.config.local.json --project <PROJECT_ID> --title "setup-smoke-test" --task "Check whether this Manager setup can read the configured project root and project docs."
+npm run assistant -- create --config assistant.config.local.json --project <PROJECT_ID> --title "setup-smoke-test" --task "Check whether this VibeCodingAssistant-ElonMa setup can read the configured project root and project docs."
 npm run assistant -- plan --config assistant.config.local.json --task <TASK_ID>
 npm run assistant -- show --config assistant.config.local.json --task <TASK_ID> --artifact agent-prompt-preview
 ```

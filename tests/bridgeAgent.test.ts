@@ -220,8 +220,8 @@ function makePlanArtifactFailureDecision(): PendingUserDecision {
   return {
     id: 'plan-artifact-failure:extra-high-initial-plan',
     source: 'plan_artifact_failure',
-    question: 'The heavy agent did not provide a usable plan artifact. What should Manager do next?',
-    rationale: 'Manager paused before sending an empty plan onward.',
+    question: 'The heavy agent did not provide a usable plan artifact. What should VibeCodingAssistant-ElonMa do next?',
+    rationale: 'VibeCodingAssistant-ElonMa paused before sending an empty plan onward.',
     options: [
       { id: 'A', label: 'Retry planning', impact: 'Reruns planning from the original task.' },
       { id: 'B', label: 'Stop task', impact: 'Stops this task for manual inspection.' },
@@ -990,7 +990,7 @@ describe('BridgeAgentService', () => {
       if (turn.kind === 'reply') {
         const text = turn.messages[0]?.text ?? '';
         expect(text).toContain('后台任务未运行');
-        expect(text).toContain('可能是上次 Manager 重启或进程中断');
+        expect(text).toContain('可能是上次 VibeCodingAssistant-ElonMa 重启或进程中断');
         expect(text).toContain('restart');
         expect(text).not.toContain('后台任务：implementing');
       }
@@ -1025,14 +1025,14 @@ describe('BridgeAgentService', () => {
 
   it('adds a project via add_project and makes it active for the current chat', async () => {
     const harness = await makeHarness();
-    const projectDir = join(harness.root, 'Assistant Manager');
+    const projectDir = join(harness.root, 'Assistant VibeCodingAssistant-ElonMa');
     try {
       await mkdir(projectDir);
       harness.assistant.decisions.push({
         kind: 'tool_call',
         toolCall: {
           name: 'add_project',
-          arguments: { targetDir: projectDir, name: 'Manager' },
+          arguments: { targetDir: projectDir, name: 'VibeCodingAssistant-ElonMa' },
         },
       });
 
@@ -1046,13 +1046,13 @@ describe('BridgeAgentService', () => {
 
       expect(turn.kind).toBe('reply');
       if (turn.kind !== 'reply') return;
-      expect(turn.activeProjectId).toBe('assistant-manager');
+      expect(turn.activeProjectId).toBe('assistant-vibecodingassistant-elonma');
       expect(turn.messages[0]?.text).toContain('项目已添加');
-      expect(harness.config.projects?.some((project) => project.id === 'assistant-manager')).toBe(true);
+      expect(harness.config.projects?.some((project) => project.id === 'assistant-vibecodingassistant-elonma')).toBe(true);
       const registry = JSON.parse(await readFile(join(harness.root, 'assistant.projects.local.json'), 'utf8')) as {
         projects: Array<{ id: string; targetDir: string }>;
       };
-      expect(registry.projects[0]).toMatchObject({ id: 'assistant-manager', targetDir: projectDir });
+      expect(registry.projects[0]).toMatchObject({ id: 'assistant-vibecodingassistant-elonma', targetDir: projectDir });
     } finally {
       await cleanup([harness.root, harness.targetDir, projectDir]);
     }
@@ -1060,14 +1060,14 @@ describe('BridgeAgentService', () => {
 
   it('creates the next task in the project added during the same process', async () => {
     const harness = await makeHarness();
-    const projectDir = join(harness.root, 'Assistant Manager');
+    const projectDir = join(harness.root, 'Assistant VibeCodingAssistant-ElonMa');
     try {
       await mkdir(projectDir);
       harness.assistant.decisions.push({
         kind: 'tool_call',
         toolCall: {
           name: 'add_project',
-          arguments: { targetDir: projectDir, name: 'Manager' },
+          arguments: { targetDir: projectDir, name: 'VibeCodingAssistant-ElonMa' },
         },
       });
       const addTurn = await harness.agent.handleMessage({
@@ -1084,13 +1084,13 @@ describe('BridgeAgentService', () => {
         kind: 'tool_call',
         toolCall: {
           name: 'create_task',
-          arguments: { title: 'Manager task', prompt: 'Create a small Manager task.' },
+          arguments: { title: 'VibeCodingAssistant-ElonMa task', prompt: 'Create a small VibeCodingAssistant-ElonMa task.' },
         },
       });
       const createTurn = await harness.agent.handleMessage({
         chatId: 'control-chat',
         senderOpenId: 'user-open-id',
-        text: '创建一个 Manager task',
+        text: '创建一个 VibeCodingAssistant-ElonMa task',
         chatKind: 'control',
         activeProjectId: addTurn.activeProjectId ?? undefined,
         canCreateTask: true,
@@ -1098,12 +1098,12 @@ describe('BridgeAgentService', () => {
 
       expect(createTurn.kind).toBe('task_created');
       if (createTurn.kind !== 'task_created') return;
-      expect(createTurn.projectId).toBe('assistant-manager');
-      expect(createTurn.projectName).toBe('Manager');
+      expect(createTurn.projectId).toBe('assistant-vibecodingassistant-elonma');
+      expect(createTurn.projectName).toBe('VibeCodingAssistant-ElonMa');
       const state = await harness.store.loadState(createTurn.taskId);
-      expect(state.projectId).toBe('assistant-manager');
+      expect(state.projectId).toBe('assistant-vibecodingassistant-elonma');
       await expect(readFile(join(projectDir, 'task', createTurn.taskId, 'README.md'), 'utf8'))
-        .resolves.toContain('Manager task');
+        .resolves.toContain('VibeCodingAssistant-ElonMa task');
     } finally {
       await cleanup([harness.root, harness.targetDir, projectDir]);
     }

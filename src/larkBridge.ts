@@ -94,7 +94,7 @@ export class LarkTransport {
 
   private async notifyOrphanedRunningJob(chatId: string, job: LarkRunningJob): Promise<void> {
     const message = [
-      '检测到上次 Manager 启动留下的后台任务标记，但当前进程没有对应 worker。',
+      '检测到上次 VibeCodingAssistant-ElonMa 启动留下的后台任务标记，但当前进程没有对应 worker。',
       `任务 ID：${job.taskId}`,
       `后台任务：${job.label}`,
       `开始时间：${job.startedAt}`,

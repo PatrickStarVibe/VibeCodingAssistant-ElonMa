@@ -297,7 +297,7 @@ export class AssistantConversationService {
         turn: {
           kind: 'reply',
           auditAction: 'intent:missing_manager',
-        messages: [{ text: '当前没有配置 Assistant Elon Ma 对话分类器，所以我没有推进 workflow。' }],
+        messages: [{ text: '当前没有配置 VibeCodingAssistant-ElonMa 对话分类器，所以我没有推进 workflow。' }],
         },
       };
     }

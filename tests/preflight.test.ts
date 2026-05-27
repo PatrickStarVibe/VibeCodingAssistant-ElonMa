@@ -1,7 +1,7 @@
 /*
- * CLI tests for Manager distribution preflight, setup, and Windows launcher entry points.
+ * CLI tests for VibeCodingAssistant-ElonMa distribution preflight, setup, and Windows launcher entry points.
  * Uses temporary fixture workspaces and spawned Node processes to verify user-facing behavior.
- * Author: Manager distribution tooling
+ * Author: VibeCodingAssistant-ElonMa distribution tooling
  */
 
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';

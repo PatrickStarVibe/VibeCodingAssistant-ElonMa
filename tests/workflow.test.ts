@@ -855,7 +855,7 @@ describe('WorkflowService', () => {
         'Accept with deferred issues',
         'Stop task',
       ]);
-      await expect(service.showArtifact(paused.state.taskId, 'decision-log')).resolves.toContain('Manager generated fallback options');
+      await expect(service.showArtifact(paused.state.taskId, 'decision-log')).resolves.toContain('VibeCodingAssistant-ElonMa generated fallback options');
     } finally {
       await cleanup([root, targetDir]);
     }

@@ -1,7 +1,7 @@
 /**
- * Interactive first-run setup wizard for Manager assistant distribution.
+ * Interactive first-run setup wizard for VibeCodingAssistant-ElonMa assistant distribution.
  * Creates local env/config files, fills missing launch settings, and runs preflight.
- * Author: Manager distribution tooling
+ * Author: VibeCodingAssistant-ElonMa distribution tooling
  */
 
 import { spawnSync } from 'node:child_process';
@@ -64,7 +64,7 @@ function parseArgs(argv) {
 }
 
 function printHelp() {
-  console.log(`Manager assistant setup
+  console.log(`VibeCodingAssistant-ElonMa assistant setup
 
 Usage:
   node scripts/setup.mjs [--non-interactive]

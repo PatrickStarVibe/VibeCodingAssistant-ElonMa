@@ -1,8 +1,8 @@
 /**
- * Shared helpers for Manager distribution preflight, setup, and repo hygiene scripts.
+ * Shared helpers for VibeCodingAssistant-ElonMa distribution preflight, setup, and repo hygiene scripts.
  * Exports pure ESM utilities for config loading, env parsing, profile validation,
  * executable probing, git status, and JSON/human output coordination.
- * Author: Manager distribution tooling
+ * Author: VibeCodingAssistant-ElonMa distribution tooling
  */
 
 import { accessSync, existsSync, readFileSync } from 'node:fs';

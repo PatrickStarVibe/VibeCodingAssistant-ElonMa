@@ -631,7 +631,7 @@ function bridgeTools(input?: BridgeAgentInput): ChatCompletionTool[] {
           targetDir: string('本地项目文件夹路径。用户没提供时不要调用此工具，先询问项目位置。'),
           id: string('可选项目 id；缺省时从文件夹名自动生成。'),
           name: string('可选项目显示名；缺省时从文件夹名自动生成。'),
-          docsDir: string('可选项目文档目录；缺省为 Manager 内的 project-docs/<id>。'),
+          docsDir: string('可选项目文档目录；缺省为 VibeCodingAssistant-ElonMa 内的 project-docs/<id>。'),
           taskRecordRoot: string('可选 task record 根目录；缺省为 <targetDir>/task。'),
         }, ['targetDir']),
       },
@@ -653,7 +653,7 @@ function bridgeTools(input?: BridgeAgentInput): ChatCompletionTool[] {
           projectId: string('Required project id. If the user did not make the project clear, ask a clarification question instead of calling this tool.'),
           prompt: string('The original user task prompt, preserved as much as possible.'),
           title: string('Optional short task title.'),
-          targetChatId: string('Optional Project Chat id. If omitted, Manager picks the earliest idle Project Chat for the project.'),
+          targetChatId: string('Optional Project Chat id. If omitted, VibeCodingAssistant-ElonMa picks the earliest idle Project Chat for the project.'),
         }, ['projectId', 'prompt']),
       },
     },
@@ -664,7 +664,7 @@ function bridgeTools(input?: BridgeAgentInput): ChatCompletionTool[] {
         description: 'Create a new long-lived Project Chat / Project Group for a registered project. Do not use this automatically just because all groups are busy; ask the user first.',
         parameters: object({
           projectId: string('Required project id.'),
-          name: string('Optional group name. If omitted, Manager uses the project name and sequence number.'),
+          name: string('Optional group name. If omitted, VibeCodingAssistant-ElonMa uses the project name and sequence number.'),
         }, ['projectId']),
       },
     },
@@ -904,7 +904,7 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
     });
     const responseText = await response.text();
     if (!response.ok) {
-      throw new Error(`Assistant Elon Ma request failed: HTTP ${response.status} ${responseText.slice(0, 500)}`);
+      throw new Error(`VibeCodingAssistant-ElonMa request failed: HTTP ${response.status} ${responseText.slice(0, 500)}`);
     }
     const payload = record(parseMaybeJson(responseText));
     const choices = Array.isArray(payload.choices) ? payload.choices : [];
@@ -933,7 +933,7 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
     });
     const responseText = await response.text();
     if (!response.ok) {
-      throw new Error(`Assistant Elon Ma request failed: HTTP ${response.status} ${responseText.slice(0, 500)}`);
+      throw new Error(`VibeCodingAssistant-ElonMa request failed: HTTP ${response.status} ${responseText.slice(0, 500)}`);
     }
 
     const payload = record(parseMaybeJson(responseText));
@@ -954,13 +954,13 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
         role: 'system',
         content: [
           'You are Elon Ma, the agent for a local AI coding workflow.',
-          'Your display name is Assistant Elon Ma. If asked your name, answer that you are Assistant Elon Ma; do not use provider names or generic assistant names.',
+          'Your display name is VibeCodingAssistant-ElonMa. If asked your name, answer that you are VibeCodingAssistant-ElonMa; do not use provider names or generic assistant names.',
           'Return JSON only with keys markdown, needsUserDecision, optional userPrompt, and optional userDecision.',
           'Ask the user only for product, logic, cost, UX, scope, or direction decisions.',
           'Never ask for low-level file/helper/test implementation permission.',
           'When needsUserDecision=true, userDecision is REQUIRED and must contain question, rationale, options, and allowFreeform=true.',
           'userDecision.options must contain 1 to 4 choices with ids A, B, C, D in order; each option needs label and impact.',
-          'If Architect, Reviewer, or Assistant Elon Ma recommends an option, include recommendedOptionId and recommendationReason. Do not invent a Manager-side recommendation.',
+          'If Architect, Reviewer, or VibeCodingAssistant-ElonMa recommends an option, include recommendedOptionId and recommendationReason. Do not invent a VibeCodingAssistant-ElonMa-side recommendation.',
           'The user may answer with A/B/C/D or free-form instructions.',
         ].join(' '),
       },
@@ -983,7 +983,7 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
           'If you do not call a tool, your text MUST NOT claim that anything was recorded, advanced, accepted, approved, stopped, started, routed, or fed back to the workflow. Plain replies are explanation, translation, Q&A, or clarification only.',
           'If the user asks for an action that has no available tool in the current state, do not pretend to do it. Say plainly that you cannot execute it, name what you would have done, and list the available tools for the current state.',
           'If task.status is `waiting_user_direction`, any reply that addresses the pending question, including an A/B/C/D option letter or a sentence explaining the choice, **MUST be sent via `answer_user_direction`**. Plain text is allowed only when you are genuinely asking the user a clarifying question back; in that case do not claim you will record, forward, or feed anything to the workflow.',
-          'When Control/Private Chat receives a task prompt, identify the project. If the project is unclear, ask a short clarification question. If the project is clear, use schedule_task_to_project_chat so Manager can place it into an idle Project Chat.',
+          'When Control/Private Chat receives a task prompt, identify the project. If the project is unclear, ask a short clarification question. If the project is clear, use schedule_task_to_project_chat so VibeCodingAssistant-ElonMa can place it into an idle Project Chat.',
           'If every Project Chat for a clear project is busy, explain that and ask whether to create a new Project Chat; do not auto-create one without user confirmation.',
           'Use create_project_chat only after the user asks for a new Project Chat or confirms that they want one.',
           'Use add_project only when the user provided a local targetDir. If targetDir is missing, ask for the project location. id, name, docsDir, and taskRecordRoot are optional.',
@@ -1012,7 +1012,7 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
       {
         role: 'system',
         content: [
-          '你是 Assistant Elon Ma 的 workflow advisor/orchestrator.',
+          '你是 VibeCodingAssistant-ElonMa 的 workflow advisor/orchestrator.',
           '只能选择 allowedActions 内允许的 intent；action 只能是 respond, approve_implementation, forward_to_workflow, show_artifact, ask_clarification, wait_for_user.',
           'awaiting_difficulty_selection 阶段，如果用户明确选择 low/medium/high/extra-high，返回 action=forward_to_workflow, intent=difficulty, difficulty=<level>. extra-high 表示 high 流程加 Planner/Reviewer 初始最多 3 轮；若仍有 blocking concerns，系统会询问用户是否再跑一轮。',
           'awaiting_difficulty_selection 阶段不是表单监狱；如果用户在提问、吐槽、补充上下文、要求解释或表达想暂停/取消，就像助理一样理解并选择 respond、wait_for_user、ask_clarification 或合法的 stop，不要机械复读 low/medium/high/extra-high.',
@@ -1051,7 +1051,7 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
       {
         role: 'system',
         content: [
-          '你是 Assistant Elon Ma 工作流的对话意图分类器。',
+          '你是 VibeCodingAssistant-ElonMa 工作流的对话意图分类器。',
           '状态机负责流程正确性；你只负责理解用户自然语言。',
           '只返回 JSON object，不要输出 markdown。',
           'JSON keys: intent, difficulty, instruction, note, artifact, confidence, requiresClarification, userFacingInterpretation.',
@@ -1101,7 +1101,7 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
       {
         role: 'system',
         content: [
-          '你是 Assistant Elon Ma 的中文回复润色器。',
+          '你是 VibeCodingAssistant-ElonMa 的中文回复润色器。',
           '把 raw workflow result 改写成自然、简洁、中文优先的聊天回复。',
           '不要 dump Task ID / Status / Pending 这种状态块。',
           '不要暴露英文路由词或类似 "User explicitly selected" 的内部措辞。',
@@ -1145,7 +1145,7 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
     return this.structuredText([
       priorityNote,
       'Do not ask the user unless there is a product/direction-level decision that the user has not already answered.',
-      'If you need a user decision, provide userDecision with A/B/C/D structured options and include any Assistant Elon Ma recommendation with its explanation.',
+      'If you need a user decision, provide userDecision with A/B/C/D structured options and include any VibeCodingAssistant-ElonMa recommendation with its explanation.',
       `Project context:\n${input.projectContext}`,
       `Task:\n${input.task}`,
       `Initial plan:\n${input.initialPlan}`,
@@ -1182,7 +1182,7 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
         role: 'system',
         content: [
           'Answer as Elon Ma using only the provided project, task, plan, review, Q&A, and decision context.',
-          'Your display name is Assistant Elon Ma. If asked your name, answer that you are Assistant Elon Ma; do not use provider names or generic assistant names.',
+          'Your display name is VibeCodingAssistant-ElonMa. If asked your name, answer that you are VibeCodingAssistant-ElonMa; do not use provider names or generic assistant names.',
           'Keep the answer clear and practical.',
         ].join(' '),
       },
@@ -1220,7 +1220,7 @@ export class OpenAICompatibleAssistantAdapter implements AssistantAdapter {
         role: 'system',
         content: [
           '你是未绑定 Lark control chat 里的 Elon Ma。',
-          '如果用户问你是谁，回答你是 Assistant Elon Ma；不要使用供应商名字或泛泛的 assistant 名称。',
+          '如果用户问你是谁，回答你是 VibeCodingAssistant-ElonMa；不要使用供应商名字或泛泛的 assistant 名称。',
           '你首先是一个正常聊天助手：可以回答问题、解释概念、帮用户思考，也可以在用户要求时整理 prompt。',
           '默认使用简体中文回复。即使用户消息、prompt 或规格文档是英文，所有用户可见的解释、标签、确认语、下一步提示都必须是中文。',
           '可以保留必要的代码、命令、文件名、库名、产品名、英文原文片段；但不要用英文模板包装回复。',
@@ -1381,13 +1381,13 @@ export function buildInitialPlanPrompt(input: {
     'Act as the Architect. Create an initial implementation plan. Do not edit files.',
     'Every approved plan is one parent task. If decomposition is useful, describe execution units; otherwise treat it as one execution unit.',
     'When you decompose, format each execution unit as its own Markdown heading exactly like: "## Execution Unit 01: <name>".',
-    'Do not use only a numbered list under "Execution units" for decomposed plans; Manager can read the heading format reliably.',
+    'Do not use only a numbered list under "Execution units" for decomposed plans; VibeCodingAssistant-ElonMa can read the heading format reliably.',
     'Suggest exactly one lightweight Category if obvious. Supported categories are: Reader Core, Selection / Popup, Vocabulary Algorithm, Translation / LLM, Feedback / User Model, Storage / Persistence, Backend / API, Data / Dictionary Pipeline, Evaluation / Benchmark, Assistant / Workflow, Docs / Task Record, UI / Frontend, Other.',
     'Do not create category folders or tags.',
     `Workflow difficulty: ${input.difficulty}`,
     `Project context:\n${input.projectContext}`,
     'Planning input mode: authoritative original prompt',
-    'Reason: Assistant Elon Ma no longer rewrites or ranks the user prompt. The original user prompt is always the planning source of truth.',
+    'Reason: VibeCodingAssistant-ElonMa no longer rewrites or ranks the user prompt. The original user prompt is always the planning source of truth.',
     `AUTHORITATIVE USER PROMPT, VERBATIM:\n${input.task}`,
     `User workflow directives and requested changes:\n${input.state.requestedChanges.join('\n\n') || 'none'}`,
     'When user workflow directives conflict with anything else, follow the user workflow directives.',
@@ -1426,9 +1426,9 @@ function reviewerBlockerProtocolPrompt(difficulty: WorkflowDifficulty, ledgerTex
     'If there are no blockers, output `"blockers": []`.',
     isExtraHigh
       ? 'For the first ledger review, previousBlockerVerdicts MUST be []. For later reviews, previousBlockerVerdicts MUST cover every active prior blocker from the ledger context. Use closed only when the latest plan truly resolves it; use still_open if it remains; use changed only when you update the same blocker id and include that id in blockers with updated fields.'
-      : 'For high planning, this is a single-pass ledger. previousBlockerVerdicts should be [] unless Manager provides an active prior ledger.',
+      : 'For high planning, this is a single-pass ledger. previousBlockerVerdicts should be [] unless VibeCodingAssistant-ElonMa provides an active prior ledger.',
     'New blocker ids must look like B1, B2, B3 and must be greater than any existing blocker id. Do not renumber existing blockers.',
-    'Do not repeat still_open blockers in blockers; Manager carries them forward automatically. If changed, repeat the same id in blockers with updated detail.',
+    'Do not repeat still_open blockers in blockers; VibeCodingAssistant-ElonMa carries them forward automatically. If changed, repeat the same id in blockers with updated detail.',
     'Ledger context for this review:',
     ledgerText,
   ].join('\n');
@@ -1461,7 +1461,7 @@ export function buildRevisedPlanPrompt(input: {
     'Act as the Architect. Create the revised plan. Do not edit files.',
     'Every approved plan is one parent task. If decomposition is useful, describe execution units; otherwise treat it as one execution unit.',
     'When you decompose, format each execution unit as its own Markdown heading exactly like: "## Execution Unit 01: <name>".',
-    'Do not use only a numbered list under "Execution units" for decomposed plans; Manager can read the heading format reliably.',
+    'Do not use only a numbered list under "Execution units" for decomposed plans; VibeCodingAssistant-ElonMa can read the heading format reliably.',
     'Suggest exactly one lightweight Category if obvious. Use Other when unsure. Do not create category folders or tags.',
     `Workflow difficulty: ${input.difficulty}`,
     `Project context:\n${input.projectContext}`,
@@ -1958,7 +1958,7 @@ function buildFinalReviewFollowupImplementationPrompt(input: {
     '- Do NOT re-implement units that are already Done.',
     '- Do NOT revert existing implementation unless the final reviewer called it defective.',
     '- ONLY make the minimal changes required to address the final-review reason below.',
-    '- Manager will run verification commands automatically; do not run them yourself unless needed for local diagnosis.',
+    '- VibeCodingAssistant-ElonMa will run verification commands automatically; do not run them yourself unless needed for local diagnosis.',
     '',
     `Project context:\n${input.projectContext}`,
     `Task:\n${input.task}`,

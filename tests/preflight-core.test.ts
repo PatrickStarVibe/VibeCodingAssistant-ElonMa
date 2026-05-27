@@ -1,7 +1,7 @@
 /*
- * Tests for the Manager distribution preflight core helpers.
+ * Tests for the VibeCodingAssistant-ElonMa distribution preflight core helpers.
  * Covers config-derived env contracts, runtime-mirrored parsing, profile validation, and command probing.
- * Author: Manager distribution tooling
+ * Author: VibeCodingAssistant-ElonMa distribution tooling
  */
 
 import { spawnSync } from 'node:child_process';

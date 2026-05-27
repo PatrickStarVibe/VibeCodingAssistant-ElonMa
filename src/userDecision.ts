@@ -255,9 +255,9 @@ function exactOptionIdFromAnswer(answer: string): UserDecisionOptionId | undefin
 function sourceLabel(source: PendingUserDecisionSource): string {
   switch (source) {
     case 'plan_revision':
-      return 'Assistant Elon Ma plan revision';
+      return 'VibeCodingAssistant-ElonMa plan revision';
     case 'plan_explanation':
-      return 'Assistant Elon Ma plan explanation';
+      return 'VibeCodingAssistant-ElonMa plan explanation';
     case 'final_review':
       return 'Final Review Advisor';
     case 'extra_high_planning':
@@ -285,7 +285,7 @@ function decisionSourceActor(source: PendingUserDecisionSource): string {
       return 'Plan artifact failure';
     case 'plan_revision':
     case 'plan_explanation':
-      return 'Assistant Elon Ma';
+      return 'VibeCodingAssistant-ElonMa';
   }
 }
 

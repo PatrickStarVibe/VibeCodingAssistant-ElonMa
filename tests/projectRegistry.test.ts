@@ -54,14 +54,14 @@ describe('project registry', () => {
   it('adds a project from targetDir, persists it, and mutates config.projects', async () => {
     const root = await mkdtemp(join(tmpdir(), 'assistant-root-'));
     const defaultTarget = await mkdtemp(join(tmpdir(), 'assistant-default-'));
-    const targetDir = join(root, 'Manager Project With Spaces');
+    const targetDir = join(root, 'VibeCodingAssistant-ElonMa Project With Spaces');
     const config = makeConfig(defaultTarget);
     try {
       await mkdir(targetDir);
       const result = await addProjectToRegistry(root, config, { targetDir });
 
       expect(result.created).toBe(true);
-      expect(result.project.id).toBe('manager-project-with-spaces');
+      expect(result.project.id).toBe('vibecodingassistant-elonma-project-with-spaces');
       expect(result.project.name).toBe(targetDir.split(/[\\/]/).pop());
       expect(config.projects?.some((project) => project.id === result.project.id)).toBe(true);
 

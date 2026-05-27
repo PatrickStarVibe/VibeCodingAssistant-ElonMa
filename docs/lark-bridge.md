@@ -10,7 +10,7 @@ It keeps only:
 - task chat creation when Elon Ma calls the tool
 - minimal inbound/outbound audit logs
 
-It does not parse `low`, `approve`, `status`, `summary`, or normal chat text by itself. Authorized messages go to the configured Assistant Elon Ma chat profile, which either replies naturally or calls a workflow tool.
+It does not parse `low`, `approve`, `status`, `summary`, or normal chat text by itself. Authorized messages go to the configured VibeCodingAssistant-ElonMa chat profile, which either replies naturally or calls a workflow tool.
 
 ## Setup
 
@@ -36,7 +36,7 @@ It does not parse `low`, `approve`, `status`, `summary`, or normal chat text by 
 }
 ```
 
-The assistant chat profile uses an OpenAI-compatible `/chat/completions` endpoint. Set `baseUrl`, `model`, and `apiKeyEnv` for your provider. For command-backed workflow roles, set an explicit `command`; Manager does not assume a default CLI. Existing shell environment variables take precedence over values in `.env.local`.
+The assistant chat profile uses an OpenAI-compatible `/chat/completions` endpoint. Set `baseUrl`, `model`, and `apiKeyEnv` for your provider. For command-backed workflow roles, set an explicit `command`; VibeCodingAssistant-ElonMa does not assume a default CLI. Existing shell environment variables take precedence over values in `.env.local`.
 
 5. Set local environment variables or put the same names in `.env.local`:
 

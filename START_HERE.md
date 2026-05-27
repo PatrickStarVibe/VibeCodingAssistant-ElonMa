@@ -1,6 +1,6 @@
-# Manager Setup / START HERE
+# VibeCodingAssistant-ElonMa Setup / START HERE
 
-这个文件面向用户自己的 AI coding assistant：下载 Manager repo 后，用它把本地项目、chat bridge 和模型 profile 配好。真实密钥只放在 `.env.local` 或系统环境变量里，不要提交到 git。
+这个文件面向用户自己的 AI coding assistant：下载 VibeCodingAssistant-ElonMa repo 后，用它把本地项目、chat bridge 和模型 profile 配好。真实密钥只放在 `.env.local` 或系统环境变量里，不要提交到 git。
 
 如果你不熟悉命令行，先看更慢、更细的 [START_HERE_FOR_BEGINNERS.md](START_HERE_FOR_BEGINNERS.md)。如果你准备把配置工作交给 AI coding agent，请把 [docs/agent-setup-guide.md](docs/agent-setup-guide.md) 一起交给它。项目概览见 [README.md](README.md)。
 
@@ -60,7 +60,7 @@ npm run assistant:hygiene
 
 ## 2. 复制 example config 到 local config
 
-在 Manager repo 根目录执行：
+在 VibeCodingAssistant-ElonMa repo 根目录执行：
 
 ```powershell
 Copy-Item .\assistant.config.example.json .\assistant.config.local.json
@@ -93,8 +93,8 @@ Copy-Item .\.env.example .\.env.local
 
 - `workspace.targetDir`：默认项目路径。通常设成主要项目的 `<YOUR_PROJECT_PATH>`。
 - `defaultProjectId`：没有显式指定项目时使用的项目 id。
-- `projects[]`：Manager 可访问的项目列表。每个项目应包含 `id`、`name`、`targetDir`、`docsDir`，可选 `taskRecordRoot` 和 `alwaysRead`。
-- `projects[].docsDir`：Manager repo 内的项目记忆目录，例如 `project-docs/<PROJECT_ID>`；也可以是绝对路径。
+- `projects[]`：VibeCodingAssistant-ElonMa 可访问的项目列表。每个项目应包含 `id`、`name`、`targetDir`、`docsDir`，可选 `taskRecordRoot` 和 `alwaysRead`。
+- `projects[].docsDir`：VibeCodingAssistant-ElonMa repo 内的项目记忆目录，例如 `project-docs/<PROJECT_ID>`；也可以是绝对路径。
 - `projects[].taskRecordRoot`：task record 输出位置。未填写时默认是 `<targetDir>/task`。
 - `projects[].alwaysRead`：每次构造项目上下文时都读取的 Markdown 文件，相对于 `docsDir`。
 - `lark.allowedOpenIds`：允许与 bridge 对话的用户 open ID。
@@ -148,7 +148,7 @@ API 型 assistant profile 需要填写 `model`、`baseUrl` 和 `apiKeyEnv`；`ap
 }
 ```
 
-然后确认 Manager 能加载项目：
+然后确认 VibeCodingAssistant-ElonMa 能加载项目：
 
 ```powershell
 npm run assistant -- projects --config assistant.config.local.json
@@ -183,7 +183,7 @@ npm run assistant -- projects --config assistant.config.local.json
 再创建一个小测试任务：
 
 ```powershell
-npm run assistant -- create --config assistant.config.local.json --project <PROJECT_ID> --title "setup-smoke-test" --task "Check whether this Manager setup can read the configured project root and project docs."
+npm run assistant -- create --config assistant.config.local.json --project <PROJECT_ID> --title "setup-smoke-test" --task "Check whether this VibeCodingAssistant-ElonMa setup can read the configured project root and project docs."
 ```
 
 命令会返回 task id。先进入规划流程：
@@ -252,7 +252,7 @@ npm run assistant -- reply --config assistant.config.local.json --task <TASK_ID>
 把下面内容发给你的 coding agent，让它替你完成本地配置：
 
 ```text
-Please configure this Manager repo for my local AI coding workflow.
+Please configure this VibeCodingAssistant-ElonMa repo for my local AI coding workflow.
 
 Repo path:
 <MANAGER_REPO_PATH>

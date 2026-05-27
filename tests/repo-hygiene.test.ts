@@ -1,7 +1,7 @@
 /*
- * CLI tests for the Manager repo hygiene checker.
+ * CLI tests for the VibeCodingAssistant-ElonMa repo hygiene checker.
  * Verifies JSON-only output and named publish-readiness checks for local distribution safeguards.
- * Author: Manager distribution tooling
+ * Author: VibeCodingAssistant-ElonMa distribution tooling
  */
 
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';

@@ -1,11 +1,11 @@
 /**
- * Manager assistant launch preflight checker.
+ * VibeCodingAssistant-ElonMa assistant launch preflight checker.
  *
  * Runs dependency-free readiness checks before starting the Lark assistant:
  * Node.js version, config source, env names, workspace paths, profile commands,
  * npm script references, and optional doctor diagnostics.
  *
- * Author: Manager distribution tooling
+ * Author: VibeCodingAssistant-ElonMa distribution tooling
  */
 
 import { existsSync } from 'node:fs';
