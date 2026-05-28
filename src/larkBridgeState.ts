@@ -1,6 +1,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 
+import { listProjects } from './projects.js';
 import type { AssistantConfig } from './types.js';
 
 export interface ProjectChatRegistration {
@@ -74,7 +75,8 @@ export class LarkBridgeStateStore {
     try {
       const raw = JSON.parse(await readFile(this.statePath(), 'utf8')) as unknown;
       const state = normalizeState(raw);
-      if (hasLegacyOrUnknownKeys(raw)) {
+      const normalizedConfigReferences = normalizeConfigReferences(state, this.config);
+      if (hasLegacyOrUnknownKeys(raw) || normalizedConfigReferences) {
         await this.save(state);
       }
       return state;
@@ -252,6 +254,43 @@ function normalizeState(raw: unknown): LarkBridgeState {
     chatSummariesByChatId: recordOfChatSummaries(value.chatSummariesByChatId),
     processedEventIds: stringArray(value.processedEventIds).slice(0, 200),
   };
+}
+
+function normalizeConfigReferences(state: LarkBridgeState, config: AssistantConfig): boolean {
+  const projects = listProjects(config);
+  const projectNamesById = new Map(projects.map((project) => [project.id, project.name]));
+  let changed = false;
+
+  for (const [chatId, projectId] of Object.entries(state.activeProjectIdByChatId)) {
+    if (projectNamesById.has(projectId)) continue;
+    delete state.activeProjectIdByChatId[chatId];
+    changed = true;
+  }
+
+  for (const chat of Object.values(state.projectChatsByChatId)) {
+    const projectName = projectNamesById.get(chat.projectId);
+    if (!projectName || !chat.name) continue;
+    const renamed = renamedAutoProjectChatName(chat.name, projectName);
+    if (!renamed || renamed === chat.name) continue;
+    chat.name = renamed;
+    changed = true;
+  }
+
+  return changed;
+}
+
+function renamedAutoProjectChatName(name: string, projectName: string): string | undefined {
+  const match = /^Assistant - \[(.+)\] #(\d+)$/.exec(name.trim());
+  if (!match) return undefined;
+  const legacyName = match[1];
+  const sequence = match[2];
+  if (!legacyName || !sequence || !isLegacyAssistantProjectName(legacyName)) return undefined;
+  return `Assistant - [${projectName}] #${sequence}`;
+}
+
+function isLegacyAssistantProjectName(name: string): boolean {
+  return ['Manager', 'Assistant Elon Ma', 'VibeCoding Assistant', 'vibeCoding Assistant', 'Elon Ma']
+    .some((legacyName) => legacyName.toLowerCase() === name.toLowerCase());
 }
 
 function hasLegacyOrUnknownKeys(raw: unknown): boolean {

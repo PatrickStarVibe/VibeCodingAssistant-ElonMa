@@ -48,6 +48,20 @@ function makeConfig(targetDir: string): AssistantConfig {
   };
 }
 
+function makeRenamedProjectConfig(targetDir: string): AssistantConfig {
+  return {
+    ...makeConfig(targetDir),
+    defaultProjectId: 'assistant',
+    projects: [{
+      id: 'assistant',
+      name: 'VibeCodingAssistant-ElonMa',
+      targetDir,
+      docsDir: 'project-docs/assistant',
+      alwaysRead: [],
+    }],
+  };
+}
+
 function emptyState(): LarkBridgeState {
   return {
     projectChatsByChatId: {},
@@ -125,6 +139,60 @@ describe('chat memory state', () => {
       const persisted = JSON.parse(await readFile(store.statePath(), 'utf8')) as Record<string, unknown>;
       expect(persisted.recentMessagesByChatId).toEqual({});
       expect(persisted.chatSummariesByChatId).toEqual({});
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(targetDir, { recursive: true, force: true });
+    }
+  });
+
+  it('renames only legacy auto-generated Project Chat names on load', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'assistant-root-'));
+    const targetDir = await mkdtemp(join(tmpdir(), 'assistant-target-'));
+    try {
+      const config = makeRenamedProjectConfig(targetDir);
+      const store = new LarkBridgeStateStore(root, config);
+      await mkdir(join(root, 'logs', 'ai-workflow'), { recursive: true });
+      await writeFile(
+        store.statePath(),
+        JSON.stringify({
+          projectChatsByChatId: {
+            'chat-auto': {
+              chatId: 'chat-auto',
+              projectId: 'assistant',
+              name: 'Assistant - [Assistant Elon Ma] #2',
+              createdAt: '2025-01-01T00:00:00Z',
+              updatedAt: '2025-01-01T00:00:00Z',
+            },
+            'chat-custom': {
+              chatId: 'chat-custom',
+              projectId: 'assistant',
+              name: 'My Elon project room',
+              createdAt: '2025-01-01T00:00:00Z',
+              updatedAt: '2025-01-01T00:00:00Z',
+            },
+          },
+          activeTaskByChatId: {},
+          activeProjectIdByChatId: {
+            'control-chat': 'missing-project',
+            'valid-chat': 'assistant',
+          },
+          runningJobsByTaskId: {},
+          recentMessagesByChatId: {},
+          chatSummariesByChatId: {},
+          processedEventIds: [],
+        }),
+        'utf8',
+      );
+
+      const loaded = await store.load();
+      expect(loaded.projectChatsByChatId['chat-auto']?.name).toBe('Assistant - [VibeCodingAssistant-ElonMa] #2');
+      expect(loaded.projectChatsByChatId['chat-custom']?.name).toBe('My Elon project room');
+      expect(loaded.activeProjectIdByChatId).toEqual({ 'valid-chat': 'assistant' });
+
+      const persisted = JSON.parse(await readFile(store.statePath(), 'utf8')) as LarkBridgeState;
+      expect(persisted.projectChatsByChatId['chat-auto']?.name).toBe('Assistant - [VibeCodingAssistant-ElonMa] #2');
+      expect(persisted.projectChatsByChatId['chat-custom']?.name).toBe('My Elon project room');
+      expect(persisted.activeProjectIdByChatId).toEqual({ 'valid-chat': 'assistant' });
     } finally {
       await rm(root, { recursive: true, force: true });
       await rm(targetDir, { recursive: true, force: true });

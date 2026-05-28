@@ -135,7 +135,8 @@ function parseContent(content: string | undefined): string | undefined {
   if (!content) return undefined;
   try {
     const payload = JSON.parse(content) as unknown;
-    const text = stringValue(record(payload).text);
+    const body = record(payload);
+    const text = stringValue(body.text) ?? postPlainText(body);
     return stripLarkMentions(text ?? '').trim() || undefined;
   } catch {
     return stripLarkMentions(content).trim() || undefined;
@@ -143,7 +144,34 @@ function parseContent(content: string | undefined): string | undefined {
 }
 
 export function stripLarkMentions(text: string): string {
-  return text.replace(/@_user_\d+|<at[^>]*>.*?<\/at>|@\S+/g, ' ').replace(/\s+/g, ' ').trim();
+  return text
+    .replace(/@_user_\d+|<at[^>]*>.*?<\/at>/g, ' ')
+    .replace(/@(vibeCoding Assistant|VibeCodingAssistant-ElonMa|Assistant Elon Ma|Elon Ma|Manager)\b/gi, ' ')
+    .replace(/@\S+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function postPlainText(body: Record<string, unknown>): string | undefined {
+  const localized = [record(body.zh_cn), record(body.en_us)]
+    .find((entry) => Array.isArray(entry.content));
+  const paragraphs = Array.isArray(localized?.content) ? localized.content : Array.isArray(body.content) ? body.content : undefined;
+  if (!paragraphs) return undefined;
+
+  const lines = paragraphs
+    .map((paragraph) => Array.isArray(paragraph)
+      ? paragraph.map(postElementText).filter(Boolean).join('')
+      : postElementText(paragraph))
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return lines.join('\n') || undefined;
+}
+
+function postElementText(value: unknown): string {
+  const element = record(value);
+  const tag = stringValue(element.tag);
+  if (tag === 'at') return '';
+  return stringValue(element.text) ?? stringValue(element.content) ?? '';
 }
 
 function assertOk(result: { code?: number; msg?: string } | null, action: string): void {

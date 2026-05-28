@@ -70,5 +70,6 @@ describe('parseUserDecisionBlock', () => {
 
     expect(parseUserDecisionBlock('This does not require a user decision.', 'architect_plan')).toBeUndefined();
     expect(parseUserDecisionBlock('No user decision is needed.', 'plan_review')).toBeUndefined();
+    expect(parseUserDecisionBlock('非阻塞但建议处理；没有需要用户决策的产品/范围问题。', 'plan_review')).toBeUndefined();
   });
 });

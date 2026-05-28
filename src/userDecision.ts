@@ -230,6 +230,7 @@ function isNegatedUserDecisionLine(line: string): boolean {
     || /\bnot\s+require\s+(?:a\s+)?user decision\b/i.test(line)
     || /\bdoes\s+not\s+require\s+(?:a\s+)?user decision\b/i.test(line)
     || /\bdoesn't\s+require\s+(?:a\s+)?user decision\b/i.test(line)
+    || /(?:没有|并无|无).*(?:需要|须要).*(?:用户)?(?:决定|决策|拍板)/.test(line)
     || /(?:不需要|无需).*(?:用户)?(?:决定|决策|拍板)/.test(line);
 }
 

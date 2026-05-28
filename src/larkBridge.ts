@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { ArtifactStore } from './artifacts.js';
 import { BridgeAgentService, type BridgeAgentTurn, type BridgeOutboundMessage } from './bridgeAgent.js';
 import { isStopCommand } from './conversation.js';
+import { listProjects } from './projects.js';
 import type { ArtifactName, AssistantConfig, TaskState } from './types.js';
 import type { WorkflowResult } from './workflow.js';
 import {
@@ -161,6 +162,17 @@ export class LarkTransport {
     await this.recordUserMessage(message);
 
     let projectChat = current.projectChatsByChatId[message.chatId];
+    if (projectChat && !hasConfiguredProject(this.config, projectChat.projectId)) {
+      await this.auditInbound(message, { projectId: projectChat.projectId, outcome: 'stale_project_chat_released' });
+      const staleTaskId = current.activeTaskByChatId[message.chatId]?.taskId ?? projectChat.activeTaskId;
+      if (staleTaskId) {
+        delete current.runningJobsByTaskId[staleTaskId];
+      }
+      delete current.projectChatsByChatId[message.chatId];
+      delete current.activeTaskByChatId[message.chatId];
+      await this.saveState(current);
+      projectChat = undefined;
+    }
     const chatKind = projectChat ? 'project' : 'control';
     let activeTask = projectChat ? await this.resolveActiveTaskBinding(current, projectChat) : undefined;
 
@@ -592,6 +604,10 @@ function projectChatsSummary(state: LarkBridgeState): Array<{ chatId: string; pr
       idle: !chat.activeTaskId && !state.activeTaskByChatId[chat.chatId],
       ...(chat.name ? { name: chat.name } : {}),
     }));
+}
+
+function hasConfiguredProject(config: AssistantConfig, projectId: string): boolean {
+  return listProjects(config).some((project) => project.id === projectId);
 }
 
 function findChatIdForTask(state: LarkBridgeState, taskId: string): string | undefined {

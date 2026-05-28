@@ -374,6 +374,45 @@ describe('LarkTransport', () => {
     }
   });
 
+  it('treats Project Chats for removed projects as control chats', async () => {
+    const harness = await makeHarness();
+    try {
+      const state = await harness.stateStore.load();
+      registerProjectChat(state, {
+        chatId: 'old-assistant-chat',
+        projectId: 'aelonma',
+        name: 'Assistant - [Assistant Elon Ma] #1',
+      });
+      state.activeProjectIdByChatId['control-chat'] = 'aelonma';
+      await harness.stateStore.save(state);
+
+      harness.assistant.decisions.push({
+        kind: 'tool_call',
+        toolCall: {
+          name: 'create_task',
+          arguments: { prompt: 'Build this in the current project.', title: 'Fresh task' },
+        },
+      });
+
+      await harness.transport.handleMessage(message({
+        eventId: 'removed-project-chat',
+        chatId: 'old-assistant-chat',
+        text: 'Build this in the current project.',
+      }));
+
+      const input = harness.assistant.bridgeInputs[0];
+      expect(input?.chat.chatKind).toBe('control');
+      expect(input?.chat.projectChat).toBeUndefined();
+      expect(harness.client.createdChats[0]?.name).toBe('Assistant - [Default] #1');
+      const saved = await harness.stateStore.load();
+      expect(saved.projectChatsByChatId['old-assistant-chat']).toBeUndefined();
+      expect(saved.activeTaskByChatId['old-assistant-chat']).toBeUndefined();
+      expect(saved.activeProjectIdByChatId['control-chat']).toBeUndefined();
+    } finally {
+      await cleanup([harness.root, harness.targetDir]);
+    }
+  });
+
   it('passes running task messages to DeepSeek instead of blocking in transport', async () => {
     const harness = await makeHarness();
     try {
